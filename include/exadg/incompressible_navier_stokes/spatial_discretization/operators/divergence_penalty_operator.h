@@ -194,6 +194,12 @@ public:
     return tau * integrator.get_divergence(q);
   }
 
+  scalar
+  get_tau() const
+  {
+    return tau;
+  }
+
 private:
   dealii::MatrixFree<dim, Number> const * matrix_free;
 

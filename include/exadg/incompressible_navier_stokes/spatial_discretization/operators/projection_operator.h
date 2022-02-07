@@ -113,6 +113,17 @@ public:
   void
   update(VectorType const & velocity, double const & dt);
 
+  void
+  vmult_hdiv(VectorType & dst, VectorType const & src) const;
+
+  void
+  vmult_invmass_hdiv(VectorType & dst, VectorType const & src) const;
+
+  unsigned int
+  solve_hdiv(VectorType & velocity);
+
+  dealii::AffineConstraints<Number> constraints_continuity;
+
 private:
   void
   reinit_cell(unsigned int const cell) const;
@@ -152,6 +163,13 @@ private:
 
   std::shared_ptr<Operators::DivergencePenaltyKernel<dim, Number>> div_kernel;
   std::shared_ptr<Operators::ContinuityPenaltyKernel<dim, Number>> conti_kernel;
+
+  std::shared_ptr<dealii::FiniteElement<dim>>        fe_penalty;
+  dealii::DoFHandler<dim>                            dof_handler_penalty;
+  std::vector<std::array<unsigned int, 2 * dim + 1>> compressed_dof_indices;
+  dealii::AlignedVector<std::array<dealii::VectorizedArray<Number>, 2 * dim>> inverse_touch_count;
+  VectorType                                                                  velocity_hdiv;
+  std::vector<unsigned int>                                                   interior_dofs;
 };
 
 } // namespace IncNS

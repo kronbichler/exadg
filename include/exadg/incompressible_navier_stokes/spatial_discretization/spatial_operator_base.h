@@ -620,9 +620,11 @@ protected:
   /*
    * Projection operator.
    */
+public:
   typedef ProjectionOperator<dim, Number> ProjOperator;
   std::shared_ptr<ProjOperator>           projection_operator;
 
+protected:
   /*
    * Projection solver.
    */

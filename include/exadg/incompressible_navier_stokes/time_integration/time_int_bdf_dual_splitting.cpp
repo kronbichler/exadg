@@ -757,6 +757,58 @@ TimeIntBDFDualSplitting<dim, Number>::rhs_viscous(VectorType & rhs) const
   pde_operator->rhs_add_viscous_term(rhs, this->get_next_time());
 }
 
+
+template<int dim, typename Number>
+void
+compute_normal_jump(const dealii::MatrixFree<dim, Number> &                    mf,
+                    const dealii::LinearAlgebra::distributed::Vector<Number> & velocity)
+{
+  dealii::FEEvaluation<dim, -1, 0, dim, Number> eval(mf);
+  Number                                        max_div = 0, int_div = 0, volume = 0;
+  for(unsigned int c = 0; c < mf.n_cell_batches(); ++c)
+  {
+    eval.reinit(c);
+    eval.gather_evaluate(velocity, dealii::EvaluationFlags::gradients);
+    for(unsigned int q = 0; q < eval.n_q_points; ++q)
+    {
+      const dealii::VectorizedArray<Number> div = eval.get_divergence(q);
+      for(unsigned int v = 0; v < mf.n_active_entries_per_cell_batch(c); ++v)
+      {
+        max_div = std::max(std::abs(div[v]), max_div);
+        int_div += div[v] * div[v] * eval.JxW(q)[v];
+        volume += eval.JxW(q)[v];
+      }
+    }
+  }
+
+  dealii::FEFaceEvaluation<dim, -1, 0, dim, Number> eval_m(mf, true);
+  dealii::FEFaceEvaluation<dim, -1, 0, dim, Number> eval_p(mf, false);
+  velocity.update_ghost_values();
+  Number max_jump = 0, int_jump = 0, area = 0;
+  for(unsigned int f = 0; f < mf.n_inner_face_batches(); ++f)
+  {
+    eval_m.reinit(f);
+    eval_m.gather_evaluate(velocity, dealii::EvaluationFlags::values);
+    eval_p.reinit(f);
+    eval_p.gather_evaluate(velocity, dealii::EvaluationFlags::values);
+    for(unsigned int q = 0; q < eval_m.n_q_points; ++q)
+    {
+      const dealii::VectorizedArray<Number> normal_jump =
+        eval_m.get_normal_vector(q) * (eval_m.get_value(q) - eval_p.get_value(q));
+      for(unsigned int v = 0; v < mf.n_active_entries_per_face_batch(f); ++v)
+      {
+        max_jump = std::max(std::abs(normal_jump[v]), max_jump);
+        int_jump += normal_jump[v] * normal_jump[v] * eval_m.JxW(q)[v];
+        area += eval_m.JxW(q)[v];
+      }
+    }
+  }
+  velocity.zero_out_ghost_values();
+  if(dealii::Utilities::MPI::this_mpi_process(velocity.get_mpi_communicator()) == 0)
+    std::cout << "Jump in velocity: " << max_jump << " " << std::sqrt(int_jump / area)
+              << " divergence: " << max_div << " " << std::sqrt(int_div / volume) << std::endl;
+}
+
 template<int dim, typename Number>
 void
 TimeIntBDFDualSplitting<dim, Number>::penalty_step()
@@ -769,6 +821,14 @@ TimeIntBDFDualSplitting<dim, Number>::penalty_step()
     // compute right-hand-side vector
     VectorType rhs(velocity_np);
     pde_operator->apply_mass_operator(rhs, velocity_np);
+    // std::cout << "Start analysis" << std::endl;
+    compute_normal_jump(pde_operator->get_matrix_free(), velocity_np);
+    // VectorType velocity_cpy(velocity_np);
+    // pde_operator->projection_operator->constraints_continuity.distribute(velocity_cpy);
+    // compute_normal_jump(pde_operator->get_matrix_free(), velocity_cpy);
+    // velocity_cpy.copy_locally_owned_data_from(velocity_np);
+    // pde_operator->projection_operator->solve_hdiv(velocity_cpy);
+    // compute_normal_jump(pde_operator->get_matrix_free(), velocity_cpy);
 
     // extrapolate velocity to time t_n+1 and use this velocity field to
     // calculate the penalty parameter for the divergence and continuity penalty term
@@ -781,34 +841,55 @@ TimeIntBDFDualSplitting<dim, Number>::penalty_step()
 
     // right-hand side term: add inhomogeneous contributions of continuity penalty operator to
     // rhs-vector if desired
-    if(this->param.use_continuity_penalty && this->param.continuity_penalty_use_boundary_data)
-      pde_operator->rhs_add_projection_operator(rhs, this->get_next_time());
+    if(false)
+    {
+      if(this->param.use_continuity_penalty && this->param.continuity_penalty_use_boundary_data)
+        pde_operator->rhs_add_projection_operator(rhs, this->get_next_time());
 
-    // solve linear system of equations
-    bool const update_preconditioner =
-      this->param.update_preconditioner_projection &&
-      ((this->time_step_number - 1) %
-         this->param.update_preconditioner_projection_every_time_steps ==
-       0);
+      // solve linear system of equations
+      bool const update_preconditioner =
+        this->param.update_preconditioner_projection &&
+        ((this->time_step_number - 1) %
+           this->param.update_preconditioner_projection_every_time_steps ==
+         0);
 
-    if(this->use_extrapolation == false)
-      velocity_np = velocity_projection_last_iter;
+      if(this->use_extrapolation == false)
+        velocity_np = velocity_projection_last_iter;
 
-    unsigned int const n_iter =
-      pde_operator->solve_projection(velocity_np, rhs, update_preconditioner);
+      unsigned int const n_iter =
+        pde_operator->solve_projection(velocity_np, rhs, update_preconditioner);
 
-    iterations_penalty.first += 1;
-    iterations_penalty.second += n_iter;
+      compute_normal_jump(pde_operator->get_matrix_free(), velocity_np);
+      // velocity_cpy.copy_locally_owned_data_from(velocity_np);
+      // pde_operator->projection_operator->constraints_continuity.distribute(velocity_cpy);
+      // compute_normal_jump(pde_operator->get_matrix_free(), velocity_cpy);
+
+      iterations_penalty.first += 1;
+      iterations_penalty.second += n_iter;
+
+      // write output
+      if(this->print_solver_info() and not(this->is_test))
+      {
+        this->pcout << std::endl << "Solve penalty step:";
+        print_solver_info_linear(this->pcout, n_iter, timer.wall_time());
+      }
+    }
+    else
+    {
+      unsigned int const n_iter = pde_operator->projection_operator->solve_hdiv(velocity_np);
+      compute_normal_jump(pde_operator->get_matrix_free(), velocity_np);
+      iterations_penalty.first += 1;
+      iterations_penalty.second += n_iter;
+      // write output
+      if(this->print_solver_info() and not(this->is_test))
+      {
+        this->pcout << std::endl << "Solve penalty step:";
+        print_solver_info_linear(this->pcout, n_iter, timer.wall_time());
+      }
+    }
 
     if(this->store_solution)
       velocity_projection_last_iter = velocity_np;
-
-    // write output
-    if(this->print_solver_info() and not(this->is_test))
-    {
-      this->pcout << std::endl << "Solve penalty step:";
-      print_solver_info_linear(this->pcout, n_iter, timer.wall_time());
-    }
 
     this->timer_tree->insert({"Timeloop", "Penalty step"}, timer.wall_time());
   }
