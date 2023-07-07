@@ -1,4 +1,5 @@
 var searchData=
 [
-  ['update_673',['update',['../classExaDG_1_1MovingMeshBase.html#a3ce22c74a136392363df0fed5edafb70',1,'ExaDG::MovingMeshBase::update()'],['../classExaDG_1_1MovingMeshElasticity.html#ae837ec6197e0ceb99136717d86f19cf8',1,'ExaDG::MovingMeshElasticity::update()'],['../classExaDG_1_1MovingMeshFunction.html#a34ba46c509524e9768104460b5be7942',1,'ExaDG::MovingMeshFunction::update()'],['../classExaDG_1_1MovingMeshPoisson.html#af5a644357d69f0be104a61ec172d05de',1,'ExaDG::MovingMeshPoisson::update()']]]
+  ['write_5fdata_0',['write_data',['../classExaDG_1_1preCICE_1_1CouplingBase.html#a83aad103204352b21981fe858a85b250',1,'ExaDG::preCICE::CouplingBase::write_data()'],['../classExaDG_1_1preCICE_1_1DoFCoupling.html#aa80ab1d61f925ec4ca2ff26303194486',1,'ExaDG::preCICE::DoFCoupling::write_data()'],['../classExaDG_1_1preCICE_1_1ExaDGCoupling.html#a73e4610c201ff663be650e3568b58dbe',1,'ExaDG::preCICE::ExaDGCoupling::write_data()'],['../classExaDG_1_1preCICE_1_1QuadCoupling.html#af2ee46af2435f1ec83e2349cd8c8673b',1,'ExaDG::preCICE::QuadCoupling::write_data()']]],
+  ['writeheader_1',['writeHeader',['../classdealspectrum_1_1Setup.html#a8b27d3d9eb4ff3fdec1899fb859def14',1,'dealspectrum::Setup']]]
 ];

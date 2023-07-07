@@ -1,8 +1,7 @@
 var searchData=
 [
-  ['mappingdofvector_659',['MappingDoFVector',['../classExaDG_1_1MappingDoFVector.html#a02610a355efa9e0350be9647356e570b',1,'ExaDG::MappingDoFVector']]],
-  ['movingmeshbase_660',['MovingMeshBase',['../classExaDG_1_1MovingMeshBase.html#ad82efb4e43882160c3140e98311c0f94',1,'ExaDG::MovingMeshBase']]],
-  ['movingmeshelasticity_661',['MovingMeshElasticity',['../classExaDG_1_1MovingMeshElasticity.html#a19d93a6068a0705c9144383b436722ee',1,'ExaDG::MovingMeshElasticity']]],
-  ['movingmeshfunction_662',['MovingMeshFunction',['../classExaDG_1_1MovingMeshFunction.html#a0c7fcce0d5f97806a0e800bf42c262f4',1,'ExaDG::MovingMeshFunction']]],
-  ['movingmeshpoisson_663',['MovingMeshPoisson',['../classExaDG_1_1MovingMeshPoisson.html#ae2a426f06e82d87f2380e9ae0a086523',1,'ExaDG::MovingMeshPoisson']]]
+  ['readheader_0',['readHeader',['../classdealspectrum_1_1Setup.html#a398598d40bbb1da95cde226559de2fe9',1,'dealspectrum::Setup']]],
+  ['refine_5flocal_1',['refine_local',['../namespaceExaDG.html#ac26ac75e95c9fbc45eaa00fa0c05a2b7',1,'ExaDG']]],
+  ['reinit_2',['reinit',['../classExaDG_1_1SolutionField.html#a11a769db2ab15d1be7a96acc1a2cd23b',1,'ExaDG::SolutionField::reinit()'],['../classExaDG_1_1SolutionInterpolationBetweenTriangulations.html#a6e7d1f14bedd4b51c35525417a1feb20',1,'ExaDG::SolutionInterpolationBetweenTriangulations::reinit()']]],
+  ['reload_5fold_5fstate_5fif_5frequired_3',['reload_old_state_if_required',['../classExaDG_1_1preCICE_1_1Adapter.html#a0ce4e88f107c66747490f6747705f4d7',1,'ExaDG::preCICE::Adapter']]]
 ];

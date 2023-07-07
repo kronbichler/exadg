@@ -1,8 +1,6 @@
 var searchData=
 [
-  ['serialize_668',['serialize',['../classdealspectrum_1_1Interpolator.html#a8283a193758ed7bc6fd68fd2f3cd9847',1,'dealspectrum::Interpolator::serialize(char const *filename)'],['../classdealspectrum_1_1Interpolator.html#a6b09f98b6b45095290fa3ea8269f0c16',1,'dealspectrum::Interpolator::serialize(char const *filename, double const *&amp;src)'],['../classdealspectrum_1_1SpectralAnalysis.html#a5823986be9b1e140e8a408cdcdd5b59c',1,'dealspectrum::SpectralAnalysis::serialize()']]],
-  ['setup_669',['Setup',['../classdealspectrum_1_1Setup.html#ae48fcc6968bba36f4300ec7e88009717',1,'dealspectrum::Setup']]],
-  ['spectralanalysis_670',['SpectralAnalysis',['../classdealspectrum_1_1SpectralAnalysis.html#a34a974fb314f0807d96902741be6e156',1,'dealspectrum::SpectralAnalysis']]],
-  ['start_671',['start',['../classdealspectrum_1_1DealSpectrumTimer.html#a140b943f9881e4a1d917941f896cb472',1,'dealspectrum::DealSpectrumTimer']]],
-  ['stop_672',['stop',['../classdealspectrum_1_1DealSpectrumTimer.html#ac7f6fa0118b49c8c58f1b8357cc2a371',1,'dealspectrum::DealSpectrumTimer']]]
+  ['update_0',['update',['../classExaDG_1_1ConvDiff_1_1MultigridPreconditioner.html#acbbe7647874c74b57098abfdadedea75',1,'ExaDG::ConvDiff::MultigridPreconditioner::update()'],['../classExaDG_1_1DeformedMappingBase.html#aeb01c0b585f4e754650f62f124d23864',1,'ExaDG::DeformedMappingBase::update()'],['../classExaDG_1_1DeformedMappingFunction.html#a544907f4f6e7e6a034eefe8bd0c3a7d3',1,'ExaDG::DeformedMappingFunction::update()'],['../classExaDG_1_1Poisson_1_1DeformedMapping.html#a981a179b56236b8d45da5bd3d9eca32c',1,'ExaDG::Poisson::DeformedMapping::update()'],['../classExaDG_1_1Structure_1_1DeformedMapping.html#a7c7d6ac13e31296a7b00d0000a36076f',1,'ExaDG::Structure::DeformedMapping::update()']]],
+  ['update_5fcoarse_5fsolver_1',['update_coarse_solver',['../classExaDG_1_1MultigridPreconditionerBase.html#a08945d6d587246217b77ab3d56b31bb2',1,'ExaDG::MultigridPreconditionerBase']]],
+  ['update_5fsmoothers_2',['update_smoothers',['../classExaDG_1_1MultigridPreconditionerBase.html#a0ba9a82ba61f882ce17031d0c178f26d',1,'ExaDG::MultigridPreconditionerBase']]]
 ];

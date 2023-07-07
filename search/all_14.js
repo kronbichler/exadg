@@ -1,5 +1,8 @@
 var searchData=
 [
-  ['update_317',['update',['../classExaDG_1_1MovingMeshBase.html#a3ce22c74a136392363df0fed5edafb70',1,'ExaDG::MovingMeshBase::update()'],['../classExaDG_1_1MovingMeshElasticity.html#ae837ec6197e0ceb99136717d86f19cf8',1,'ExaDG::MovingMeshElasticity::update()'],['../classExaDG_1_1MovingMeshFunction.html#a34ba46c509524e9768104460b5be7942',1,'ExaDG::MovingMeshFunction::update()'],['../classExaDG_1_1MovingMeshPoisson.html#af5a644357d69f0be104a61ec172d05de',1,'ExaDG::MovingMeshPoisson::update()']]],
-  ['updatedata_318',['UpdateData',['../structExaDG_1_1Newton_1_1UpdateData.html',1,'ExaDG::Newton']]]
+  ['update_0',['update',['../classExaDG_1_1ConvDiff_1_1MultigridPreconditioner.html#acbbe7647874c74b57098abfdadedea75',1,'ExaDG::ConvDiff::MultigridPreconditioner::update()'],['../classExaDG_1_1DeformedMappingBase.html#aeb01c0b585f4e754650f62f124d23864',1,'ExaDG::DeformedMappingBase::update()'],['../classExaDG_1_1DeformedMappingFunction.html#a544907f4f6e7e6a034eefe8bd0c3a7d3',1,'ExaDG::DeformedMappingFunction::update()'],['../classExaDG_1_1Poisson_1_1DeformedMapping.html#a981a179b56236b8d45da5bd3d9eca32c',1,'ExaDG::Poisson::DeformedMapping::update()'],['../classExaDG_1_1Structure_1_1DeformedMapping.html#a7c7d6ac13e31296a7b00d0000a36076f',1,'ExaDG::Structure::DeformedMapping::update()']]],
+  ['update_5fcoarse_5fsolver_1',['update_coarse_solver',['../classExaDG_1_1MultigridPreconditionerBase.html#a08945d6d587246217b77ab3d56b31bb2',1,'ExaDG::MultigridPreconditionerBase']]],
+  ['update_5fpde_5foperator_5fafter_5fgrid_5fmotion_2',['update_pde_operator_after_grid_motion',['../classExaDG_1_1HelpersALE.html#a9978fd3202aa07445be088688b7a704a',1,'ExaDG::HelpersALE']]],
+  ['update_5fsmoothers_3',['update_smoothers',['../classExaDG_1_1MultigridPreconditionerBase.html#a0ba9a82ba61f882ce17031d0c178f26d',1,'ExaDG::MultigridPreconditionerBase']]],
+  ['updatedata_4',['UpdateData',['../structExaDG_1_1Newton_1_1UpdateData.html',1,'ExaDG::Newton']]]
 ];

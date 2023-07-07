@@ -1,5 +1,6 @@
 var searchData=
 [
-  ['dealspectrumtimer_636',['DealSpectrumTimer',['../classdealspectrum_1_1DealSpectrumTimer.html#a24dd975c3bb6abc4544899ca144c8847',1,'dealspectrum::DealSpectrumTimer']]],
-  ['deserialize_637',['deserialize',['../classdealspectrum_1_1Interpolator.html#abf5f310c4036f825328ad8dd924f775a',1,'dealspectrum::Interpolator::deserialize(char const *filename)'],['../classdealspectrum_1_1Interpolator.html#a29da807cd1fe3ae6775e3e303b61896a',1,'dealspectrum::Interpolator::deserialize(char const *filename, double *&amp;src)'],['../classdealspectrum_1_1SpectralAnalysis.html#a4f6dd67f9c9aa0df92244eeb1c78169c',1,'dealspectrum::SpectralAnalysis::deserialize()']]]
+  ['enum_5fto_5fstring_0',['enum_to_string',['../namespaceExaDG_1_1Utilities.html#ae64d79cc4a7f0b1f68c9d6bee85d8118',1,'ExaDG::Utilities']]],
+  ['execute_1',['execute',['../classdealspectrum_1_1SpectralAnalysis.html#ac21233c7093355407629bb6ffcca780a',1,'dealspectrum::SpectralAnalysis']]],
+  ['extract_5fcomponent_5ffrom_5ftensors_2',['extract_component_from_tensors',['../namespaceExaDG.html#a6e2a55562723b53f986666ed277cf29e',1,'ExaDG::extract_component_from_tensors(dealii::Vector&lt; Number &gt; &amp;dst, std::vector&lt; dealii::Tensor&lt; n_components1, n_components2, Number &gt; &gt; const &amp;values, unsigned int const comp1, unsigned int const comp2)'],['../namespaceExaDG.html#ac2d3af52a3837e6d1d32060f1f6655bd',1,'ExaDG::extract_component_from_tensors(dealii::Vector&lt; Number &gt; &amp;dst, std::vector&lt; dealii::Tensor&lt; 1, n_components, Number &gt; &gt; const &amp;values, unsigned int const comp)']]]
 ];
