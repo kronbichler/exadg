@@ -447,6 +447,8 @@ private:
     pp_data.output_data.write_q_criterion         = true;
     pp_data.output_data.degree                    = this->param.degree_u;
     pp_data.output_data.write_higher_order        = true;
+    pp_data.output_data.write_aspect_ratio        = true;
+    pp_data.output_data.write_processor_id        = true;
 
     MyPostProcessorData<dim> my_pp_data;
     my_pp_data.pp_data = pp_data;
