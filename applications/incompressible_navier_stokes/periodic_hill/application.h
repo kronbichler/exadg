@@ -199,7 +199,7 @@ private:
     this->param.solver_info_data.interval_time = flow_through_time / 10.0;
 
     // SPATIAL DISCRETIZATION
-    this->param.spatial_discretization      = SpatialDiscretization::L2; // HDIV;
+    this->param.spatial_discretization      = SpatialDiscretization::HDIV;
     this->param.grid.triangulation_type     = TriangulationType::Distributed;
     this->param.mapping_degree              = this->param.degree_u;
     this->param.mapping_degree_coarse_grids = this->param.mapping_degree;

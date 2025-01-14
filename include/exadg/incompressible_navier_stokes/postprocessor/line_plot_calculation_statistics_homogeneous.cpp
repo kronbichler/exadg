@@ -23,7 +23,6 @@
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/grid/grid_tools.h>
 #include <deal.II/matrix_free/fe_point_evaluation.h>
-#include <deal.II/dofs/dof_tools.h>
 
 // ExaDG
 #include <exadg/grid/grid_data.h>
@@ -396,12 +395,6 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate_velocity(
                                                   dealii::update_quadrature_points |
                                                   dealii::update_gradients);
 
-  dealii::IndexSet locally_relevant_dofs = dealii::DoFTools::extract_locally_relevant_dofs(dof_handler_velocity);
-  VectorType rel_velocity = VectorType(dof_handler_velocity.locally_owned_dofs(),
-  	  	  	  	  	  	  	  	  	  locally_relevant_dofs,
-									  mpi_comm);
-  rel_velocity = velocity;
-
   for(unsigned int p = 0; p < line.n_points; ++p)
   {
     for(typename TYPE::const_iterator cell_and_ref_point =
@@ -420,11 +413,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate_velocity(
 
       for(unsigned int j = 0; j < dof_indices.size(); ++j)
       {
-    	// The `VectorType velocity` was initialized with
-    	// 'matrix_free->initialize_dof_vector(src, get_dof_index_velocity());'
-    	// hence we have all locally active DoFs and the locally relevant DoFs
-    	// the constraints expand into.
-        velocity_on_cell[j] = rel_velocity(dof_indices[j]);
+        velocity_on_cell[j] = velocity(dof_indices[j]);
       }
       evaluator.evaluate(velocity_on_cell,
                          dealii::EvaluationFlags::values | dealii::EvaluationFlags::gradients);
