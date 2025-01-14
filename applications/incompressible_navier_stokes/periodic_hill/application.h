@@ -131,6 +131,8 @@ public:
                         points_per_line,
                         "Points per line in vertical direction.",
                         dealii::Patterns::Integer(1, 10000));
+      prm.add_parameter("WriteRestart", write_restart, "Should restart files be written?");
+      prm.add_parameter("ReadRestart", read_restart, "Is this a restarted simulation?");
     }
     prm.leave_subsection();
   }
@@ -166,12 +168,10 @@ private:
     this->param.formulation_convective_term = FormulationConvectiveTerm::DivergenceFormulation;
     this->param.right_hand_side             = true;
 
-
     // PHYSICAL QUANTITIES
     this->param.start_time = start_time;
     this->param.end_time   = end_time;
     this->param.viscosity  = viscosity;
-
 
     // TEMPORAL DISCRETIZATION
     this->param.solver_type                     = SolverType::Unsteady;
@@ -185,6 +185,15 @@ private:
     this->param.time_step_size                  = 1.0e-1;
     this->param.order_time_integrator           = 2;
     this->param.start_with_low_order            = true;
+
+    // restart
+    this->param.restarted_simulation             = read_restart;
+    this->param.restart_data.write_restart       = write_restart;
+    this->param.restart_data.interval_time       = end_time / 20.0;
+    this->param.restart_data.interval_wall_time  = 1.e6;
+    this->param.restart_data.interval_time_steps = 1e8;
+    this->param.restart_data.filename =
+      this->output_parameters.directory + this->output_parameters.filename + "restart";
 
     // output of solver information
     this->param.solver_info_data.interval_time = flow_through_time / 10.0;
@@ -243,7 +252,6 @@ private:
     this->param.preconditioner_projection        = PreconditionerProjection::InverseMassMatrix;
     this->param.update_preconditioner_projection = true;
 
-
     // HIGH-ORDER DUAL SPLITTING SCHEME
 
     // formulations
@@ -255,7 +263,7 @@ private:
     this->param.preconditioner_momentum = MomentumPreconditioner::PointJacobi;
 
     this->param.inverse_mass_operator_hdiv.preconditioner = PreconditionerMass::PointJacobi;
-    this->param.inverse_mass_operator_hdiv.solver_data = SolverData(1000, 1e-12, 1e-4);
+    this->param.inverse_mass_operator_hdiv.solver_data    = SolverData(1000, 1e-12, 1e-4);
   }
 
   void
@@ -439,6 +447,8 @@ private:
     pp_data.output_data.write_q_criterion         = true;
     pp_data.output_data.degree                    = this->param.degree_u;
     pp_data.output_data.write_higher_order        = true;
+    pp_data.output_data.write_aspect_ratio        = true;
+    pp_data.output_data.write_processor_id        = true;
 
     MyPostProcessorData<dim> my_pp_data;
     my_pp_data.pp_data = pp_data;
@@ -572,14 +582,17 @@ private:
       .trigger_every_time_steps = sample_every_timesteps;
     my_pp_data.line_plot_data.time_control_data_statistics
       .write_preliminary_results_every_nth_time_step = sample_every_timesteps * 1000;
+    //    my_pp_data.line_plot_data.time_control_data_statistics.clear_file = not read_restart; //
+    //    maybe needed
 
     // calculation of flow rate (use volume-based computation)
     my_pp_data.mean_velocity_data.calculate = true;
     my_pp_data.mean_velocity_data.directory = this->output_parameters.directory;
     my_pp_data.mean_velocity_data.filename  = this->output_parameters.filename + "_flow_rate";
     dealii::Tensor<1, dim, double> direction;
-    direction[0]                                = 1.0;
-    my_pp_data.mean_velocity_data.direction     = direction;
+    direction[0]                            = 1.0;
+    my_pp_data.mean_velocity_data.direction = direction;
+    //    my_pp_data.mean_velocity_data.clear_file    = not read_restart; // maybe needed
     my_pp_data.mean_velocity_data.write_to_file = true;
 
     std::shared_ptr<PostProcessorBase<dim, Number>> pp;
@@ -618,6 +631,10 @@ private:
   double grid_stretch_factor = 1.6;
 
   // postprocessing
+
+  // restart
+  bool write_restart = false;
+  bool read_restart  = false;
 
   // sampling
   bool         calculate_statistics        = true;

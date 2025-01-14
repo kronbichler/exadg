@@ -373,6 +373,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate_velocity(
   Line<dim> const &  line,
   unsigned int const line_iterator)
 {
+  velocity.update_ghost_values();
+
   // Local variables for specific line
   std::vector<double>                         length_local(line.n_points);
   std::vector<dealii::Tensor<1, dim, double>> velocity_local(line.n_points);

@@ -22,7 +22,9 @@
         "CalculateStatistics": "true",
         "SampleStartTime": "0",
         "SampleEveryTimeSteps": "1",
-        "PointsPerLine": "16"
+        "PointsPerLine": "16",
+        "WriteRestart": "false",
+        "ReadRestart": "false"
     },
     "Output": {
         "OutputDirectory": "output/periodic_hill/",
