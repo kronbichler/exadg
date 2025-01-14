@@ -263,7 +263,7 @@ private:
     this->param.preconditioner_momentum = MomentumPreconditioner::PointJacobi;
 
     this->param.inverse_mass_operator_hdiv.preconditioner = PreconditionerMass::PointJacobi;
-    this->param.inverse_mass_operator_hdiv.solver_data = SolverData(1000, 1e-12, 1e-4);
+    this->param.inverse_mass_operator_hdiv.solver_data    = SolverData(1000, 1e-12, 1e-4);
   }
 
   void
@@ -582,17 +582,18 @@ private:
       .trigger_every_time_steps = sample_every_timesteps;
     my_pp_data.line_plot_data.time_control_data_statistics
       .write_preliminary_results_every_nth_time_step = sample_every_timesteps * 1000;
-//    my_pp_data.line_plot_data.time_control_data_statistics.clear_file = not read_restart; // maybe needed
+    //    my_pp_data.line_plot_data.time_control_data_statistics.clear_file = not read_restart; //
+    //    maybe needed
 
     // calculation of flow rate (use volume-based computation)
     my_pp_data.mean_velocity_data.calculate = true;
     my_pp_data.mean_velocity_data.directory = this->output_parameters.directory;
     my_pp_data.mean_velocity_data.filename  = this->output_parameters.filename + "_flow_rate";
     dealii::Tensor<1, dim, double> direction;
-    direction[0]                                = 1.0;
-    my_pp_data.mean_velocity_data.direction     = direction;
-//    my_pp_data.mean_velocity_data.clear_file    = not read_restart; // maybe needed
-    my_pp_data.mean_velocity_data.write_to_file = true;    
+    direction[0]                            = 1.0;
+    my_pp_data.mean_velocity_data.direction = direction;
+    //    my_pp_data.mean_velocity_data.clear_file    = not read_restart; // maybe needed
+    my_pp_data.mean_velocity_data.write_to_file = true;
 
     std::shared_ptr<PostProcessorBase<dim, Number>> pp;
     pp.reset(
