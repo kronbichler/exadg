@@ -131,6 +131,8 @@ public:
                         points_per_line,
                         "Points per line in vertical direction.",
                         dealii::Patterns::Integer(1, 10000));
+      prm.add_parameter("WriteRestart", write_restart, "Should restart files be written?");
+      prm.add_parameter("ReadRestart", read_restart, "Is this a restarted simulation?");
     }
     prm.leave_subsection();
   }
@@ -184,7 +186,7 @@ private:
     this->param.cfl_exponent_fe_degree_velocity = 1.5;
     this->param.time_step_size                  = 1.0e-1;
     this->param.order_time_integrator           = 2;
-    this->param.start_with_low_order            = true;
+    this->param.start_with_low_order            = read_restart ? false : true;
 
     // output of solver information
     this->param.solver_info_data.interval_time = flow_through_time / 10.0;
@@ -255,7 +257,7 @@ private:
     this->param.preconditioner_momentum = MomentumPreconditioner::PointJacobi;
 
     this->param.inverse_mass_operator_hdiv.preconditioner = PreconditionerMass::PointJacobi;
-    this->param.inverse_mass_operator_hdiv.solver_data = SolverData(1000, 1e-12, 1e-4);
+    this->param.inverse_mass_operator_hdiv.solver_data    = SolverData(1000, 1e-12, 1e-4);
   }
 
   void
@@ -427,9 +429,10 @@ private:
     PostProcessorData<dim> pp_data;
 
     // write output for visualization of results
-    pp_data.output_data.time_control_data.is_active        = this->output_parameters.write;
-    pp_data.output_data.time_control_data.start_time       = start_time;
-    pp_data.output_data.time_control_data.trigger_interval = (end_time - start_time) / 50.0;
+    pp_data.output_data.time_control_data.is_active  = this->output_parameters.write;
+    pp_data.output_data.time_control_data.start_time = start_time;
+    pp_data.output_data.time_control_data.trigger_interval =
+      (end_time - start_time) / (50.0 * 100000.0);
     pp_data.output_data.directory                 = this->output_parameters.directory + "vtu/";
     pp_data.output_data.filename                  = this->output_parameters.filename;
     pp_data.output_data.write_velocity_magnitude  = false;
@@ -439,6 +442,8 @@ private:
     pp_data.output_data.write_q_criterion         = true;
     pp_data.output_data.degree                    = this->param.degree_u;
     pp_data.output_data.write_higher_order        = true;
+    pp_data.output_data.write_aspect_ratio        = false;
+    pp_data.output_data.write_processor_id        = false;
 
     MyPostProcessorData<dim> my_pp_data;
     my_pp_data.pp_data = pp_data;
@@ -601,7 +606,7 @@ private:
 
   double const bulk_velocity     = 5.6218;
   double const target_flow_rate  = bulk_velocity * width * height;
-  double const flow_through_time = length / bulk_velocity;
+  double const flow_through_time = 1e-2; // length / bulk_velocity; ##+ REMOVE THIS
 
   // RE_H = u_b * H / nu
   double viscosity = bulk_velocity * H / Re;
@@ -618,6 +623,10 @@ private:
   double grid_stretch_factor = 1.6;
 
   // postprocessing
+
+  // restart
+  bool write_restart = false;
+  bool read_restart  = false;
 
   // sampling
   bool         calculate_statistics        = true;

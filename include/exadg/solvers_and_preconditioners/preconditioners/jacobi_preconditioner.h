@@ -61,6 +61,15 @@ public:
     }
   }
 
+  void
+  vmult(VectorType &                                                        dst,
+        VectorType const &                                                  src,
+        const std::function<void(const unsigned int, const unsigned int)> & before_loop,
+        const std::function<void(const unsigned int, const unsigned int)> & after_loop) const final
+  {
+    PreconditionerBase<typename Operator::value_type>::vmult(dst, src, before_loop, after_loop);
+  }
+
   unsigned int
   get_size_of_diagonal()
   {

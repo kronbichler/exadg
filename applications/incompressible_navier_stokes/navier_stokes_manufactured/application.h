@@ -23,7 +23,7 @@
 #define APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_TEST_CASES_NAVIER_STOKES_MANUFACTURED_H_
 
 // ExaDG
-#include <exadg/incompressible_navier_stokes/user_interface/enum_types.h>
+#include <exadg/grid/mesh_movement_functions.h>
 
 namespace ExaDG
 {
@@ -350,6 +350,12 @@ public:
 
     prm.enter_subsection("Application");
     {
+      prm.add_parameter("MoveGrid", move_grid, "Should the grid be deformed over time?");
+      prm.add_parameter("WriteRestart", write_restart, "Should restart files be written?");
+      prm.add_parameter("ReadRestart", read_restart, "Is this a restarted simulation?");
+      prm.add_parameter("SpatialDiscretization",
+                        spatial_discretization,
+                        "Spatial discretization (element type) for Navier--Stokes");
       prm.add_parameter("IncludeConvectiveTerm",
                         include_convective_term,
                         "Include the nonlinear convective term.",
@@ -440,6 +446,10 @@ private:
                                              FormulationViscousTerm::DivergenceFormulation;
     this->param.right_hand_side          = true;
 
+    // ALE
+    this->param.ale_formulation                     = move_grid;
+    this->param.mesh_movement_type                  = MeshMovementType::Function;
+    this->param.neumann_with_variable_normal_vector = true;
 
     // PHYSICAL QUANTITIES
     this->param.start_time = start_time;
@@ -452,7 +462,7 @@ private:
     this->param.solver_type                   = SolverType::Unsteady;
     this->param.temporal_discretization       = temporal_discretization;
     this->param.calculation_of_time_step_size = TimeStepCalculation::UserSpecified;
-    this->param.time_step_size                = this->param.end_time;
+    this->param.time_step_size                = std::abs(end_time - start_time) / 1000.0;
     this->param.order_time_integrator         = 2;     // 1; // 2; // 3;
     this->param.start_with_low_order          = false; // true;
 
@@ -462,6 +472,7 @@ private:
 
 
     // SPATIAL DISCRETIZATION
+    this->param.spatial_discretization      = spatial_discretization;
     this->param.grid.triangulation_type     = TriangulationType::Distributed;
     this->param.mapping_degree              = this->param.degree_u;
     this->param.mapping_degree_coarse_grids = this->param.mapping_degree;
@@ -485,15 +496,18 @@ private:
     // divergence term
     this->param.divu_integrated_by_parts = true;
     this->param.divu_use_boundary_data   = true;
-    this->param.divu_formulation         = FormulationVelocityDivergenceTerm::Weak;
+    this->param.divu_formulation         = FormulationVelocityDivergenceTerm::Strong;
 
     // pressure level is undefined
     if(pure_dirichlet_problem)
       this->param.adjust_pressure_level = AdjustPressureLevel::ApplyAnalyticalMeanValue;
 
     // div-div and continuity penalty terms
-    this->param.use_divergence_penalty                     = true;
-    this->param.use_continuity_penalty                     = true;
+    this->param.divergence_penalty_factor     = 1.0e1;
+    this->param.use_divergence_penalty        = spatial_discretization == SpatialDiscretization::L2;
+    this->param.use_continuity_penalty        = spatial_discretization == SpatialDiscretization::L2;
+    this->param.continuity_penalty_factor     = this->param.divergence_penalty_factor;
+    this->param.continuity_penalty_components = ContinuityPenaltyComponents::Normal;
     this->param.continuity_penalty_use_boundary_data       = true;
     this->param.apply_penalty_terms_in_postprocessing_step = true;
 
@@ -529,21 +543,27 @@ private:
     this->param.solver_data_pressure_poisson    = SolverData(1000, 1.e-12, 1.e-8);
 
     // projection step
-    this->param.solver_projection         = SolverProjection::CG;
-    this->param.solver_data_projection    = SolverData(1000, 1.e-12, 1.e-8);
-    this->param.preconditioner_projection = PreconditionerProjection::InverseMassMatrix;
+    this->param.solver_projection                = SolverProjection::CG;
+    this->param.solver_data_projection           = SolverData(1000, 1.e-12, 1.e-3);
+    this->param.preconditioner_projection        = PreconditionerProjection::InverseMassMatrix;
+    this->param.update_preconditioner_projection = true;
 
     // HIGH-ORDER DUAL SPLITTING SCHEME
 
     // formulations
     this->param.order_extrapolation_pressure_nbc =
       this->param.order_time_integrator <= 2 ? this->param.order_time_integrator : 2;
+    this->param.preconditioner_momentum = spatial_discretization == SpatialDiscretization::L2 ?
+                                            MomentumPreconditioner::InverseMassMatrix :
+                                            MomentumPreconditioner::PointJacobi;
 
     if(this->param.temporal_discretization == TemporalDiscretization::BDFDualSplittingScheme)
     {
-      this->param.solver_momentum         = SolverMomentum::CG;
-      this->param.solver_data_momentum    = SolverData(1000, 1.e-12, 1.e-8);
-      this->param.preconditioner_momentum = MomentumPreconditioner::InverseMassMatrix;
+      this->param.solver_momentum      = SolverMomentum::CG;
+      this->param.solver_data_momentum = SolverData(1000, 1.e-12, 1.e-8);
+
+      this->param.inverse_mass_operator_hdiv.preconditioner = PreconditionerMass::PointJacobi;
+      this->param.inverse_mass_operator_hdiv.solver_data    = SolverData(1000, 1e-12, 1e-4);
     }
 
 
@@ -562,7 +582,6 @@ private:
       // linear solver
       this->param.solver_momentum                = SolverMomentum::GMRES;
       this->param.solver_data_momentum           = SolverData(1e4, 1.e-12, 1.e-8, 100);
-      this->param.preconditioner_momentum        = MomentumPreconditioner::InverseMassMatrix;
       this->param.update_preconditioner_momentum = true;
     }
 
@@ -570,19 +589,20 @@ private:
     // COUPLED NAVIER-STOKES SOLVER
 
     // nonlinear solver (Newton solver)
-    this->param.newton_solver_data_coupled = Newton::SolverData(100, 1.e-10, 1.e-6);
+    this->param.newton_solver_data_coupled = Newton::SolverData(100, 1.e-10, 1.e-3);
 
     // linear solver
     this->param.solver_coupled      = SolverCoupled::FGMRES;
-    this->param.solver_data_coupled = SolverData(1e4, 1.e-12, 1.e-8, 100);
+    this->param.solver_data_coupled = SolverData(1e4, 1.e-12, 1.e-3, 100);
 
     // preconditioning linear solver
     this->param.preconditioner_coupled        = PreconditionerCoupled::BlockTriangular;
     this->param.update_preconditioner_coupled = true;
 
     // preconditioner velocity/momentum block
-    this->param.preconditioner_velocity_block = MomentumPreconditioner::Multigrid;
-
+    this->param.preconditioner_velocity_block =
+      spatial_discretization == SpatialDiscretization::L2 ? MomentumPreconditioner::Multigrid :
+                                                            MomentumPreconditioner::PointJacobi;
     if(this->param.treatment_of_convective_term == TreatmentOfConvectiveTerm::Implicit &&
        include_convective_term == true)
       this->param.multigrid_operator_type_velocity_block =
@@ -643,6 +663,26 @@ private:
                                                  this->param.mapping_degree,
                                                  this->param.mapping_degree_coarse_grids,
                                                  this->param.involves_h_multigrid());
+  }
+
+  std::shared_ptr<dealii::Function<dim>>
+  create_mesh_movement_function() final
+  {
+    std::shared_ptr<dealii::Function<dim>> mesh_motion;
+
+    MeshMovementData<dim> data;
+    data.temporal      = MeshMovementAdvanceInTime::Sin;
+    data.shape         = MeshMovementShape::Sin;
+    data.dimensions[0] = std::abs(interval_end - interval_start);
+    data.dimensions[1] = std::abs(interval_end - interval_start);
+    data.amplitude     = move_grid ? std::abs(interval_end - interval_start) / 15.0 : 0.0;
+    data.period        = std::abs(end_time - start_time);
+    data.t_start       = start_time;
+    data.t_end         = end_time;
+    data.spatial_number_of_oscillations = 1.0;
+    mesh_motion.reset(new CubeMeshMovementFunctions<dim>(data));
+
+    return mesh_motion;
   }
 
   void
@@ -713,7 +753,7 @@ private:
     // write output for visualization of results
     pp_data.output_data.time_control_data.is_active        = this->output_parameters.write;
     pp_data.output_data.time_control_data.start_time       = start_time;
-    pp_data.output_data.time_control_data.trigger_interval = (end_time - start_time) / 1.0;
+    pp_data.output_data.time_control_data.trigger_interval = (end_time - start_time) / 20.0;
     pp_data.output_data.directory          = this->output_parameters.directory + "vtu/";
     pp_data.output_data.filename           = this->output_parameters.filename;
     pp_data.output_data.write_divergence   = true;
@@ -744,6 +784,12 @@ private:
 
     return pp;
   }
+
+  bool read_restart  = false;
+  bool write_restart = false;
+  bool move_grid     = false;
+
+  SpatialDiscretization spatial_discretization = SpatialDiscretization::L2;
 
   bool                   include_convective_term                      = true;
   bool                   pure_dirichlet_problem                       = true;
