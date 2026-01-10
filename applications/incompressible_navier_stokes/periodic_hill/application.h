@@ -109,6 +109,7 @@ public:
     {
       prm.add_parameter("WriteRestart", write_restart, "Should restart files be written?");
       prm.add_parameter("ReadRestart", read_restart, "Is this a restarted simulation?");
+      prm.add_parameter("TriangulationType", triangulation_type, "Type of triangulation");
       prm.add_parameter("TemporalDiscretization",
                         temporal_discretization,
                         "Temporal discretization");
@@ -196,12 +197,13 @@ private:
     this->param.start_with_low_order            = read_restart ? false : true;
 
     // output of solver information
-    this->param.solver_info_data.interval_time = flow_through_time / 10.0;
+    this->param.solver_info_data.interval_time = flow_through_time / 10000000000.0;
 
     // SPATIAL DISCRETIZATION
-    this->param.spatial_discretization      = spatial_discretization;
-    this->param.grid.triangulation_type     = TriangulationType::Distributed;
-    this->param.mapping_degree              = this->param.degree_u;
+    this->param.spatial_discretization  = spatial_discretization;
+    this->param.grid.triangulation_type = triangulation_type;
+    this->param.mapping_degree =
+      3; // this->param.degree_u; // temporary, should be better with finer grids
     this->param.mapping_degree_coarse_grids = this->param.mapping_degree;
     this->param.degree_p                    = DegreePressure::MixedOrder;
 
@@ -238,13 +240,15 @@ private:
     this->param.restarted_simulation       = read_restart;
     this->param.restart_data.write_restart = write_restart;
     // write restart every 40% of the simulation time
-    this->param.restart_data.interval_time = (this->param.end_time - this->param.start_time) * 0.4;
+    this->param.restart_data.interval_time = (this->param.end_time - this->param.start_time) * 0.01;
     this->param.restart_data.directory_coarse_triangulation = this->output_parameters.directory;
     this->param.restart_data.directory                      = this->output_parameters.directory;
     this->param.restart_data.filename            = this->output_parameters.filename + "_restart";
     this->param.restart_data.interval_wall_time  = 1.e6;
     this->param.restart_data.interval_time_steps = 1e8;
 
+    // Same `mapping_degree` and spatial resolution is stable for restart, polynomial degree can be
+    // varied.
     this->param.restart_data.discretization_identical                        = false;
     this->param.restart_data.consider_mapping_write                          = true;
     this->param.restart_data.consider_mapping_read_source                    = true;
@@ -658,6 +662,7 @@ private:
 
   // dicretization
   TemporalDiscretization temporal_discretization = TemporalDiscretization::Undefined;
+  TriangulationType      triangulation_type      = TriangulationType::Distributed;
   SpatialDiscretization  spatial_discretization  = SpatialDiscretization::L2;
 
   // postprocessing

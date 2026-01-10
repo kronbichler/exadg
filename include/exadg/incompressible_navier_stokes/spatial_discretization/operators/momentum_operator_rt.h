@@ -293,6 +293,8 @@ public:
          const Quadrature<1> &                  quadrature,
          const MPI_Comm                         communicator_shared = MPI_COMM_SELF)
   {
+    (void)communicator_shared;
+
     this->mapping                                       = &mapping;
     this->dof_handler                                   = &dof_handler;
     const FiniteElement<dim> &                       fe = dof_handler.get_fe();

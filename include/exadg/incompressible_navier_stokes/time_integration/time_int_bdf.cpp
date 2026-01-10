@@ -53,6 +53,7 @@ TimeIntBDF<dim, Number>::TimeIntBDF(
     cfl(param.cfl / std::pow(2.0, refine_steps_time)),
     operator_base(operator_in),
     vec_convective_term(this->order),
+    vec_convective_term_for_restart(this->order),
     use_extrapolation(true),
     store_solution(false),
     update_velocity(true),
@@ -75,7 +76,14 @@ TimeIntBDF<dim, Number>::allocate_vectors()
   if(needs_vector_convective_term)
   {
     for(unsigned int i = 0; i < vec_convective_term.size(); ++i)
+    {
       this->operator_base->initialize_vector_velocity(vec_convective_term[i]);
+
+      if(this->param.restarted_simulation or this->param.restart_data.write_restart)
+      {
+        this->operator_base->initialize_vector_velocity(vec_convective_term_for_restart[i]);
+      }
+    }
 
     if(param.ale_formulation == false)
     {
@@ -131,6 +139,28 @@ TimeIntBDF<dim, Number>::setup_derived()
       initialize_vec_convective_term();
     }
   }
+}
+
+template<int dim, typename Number>
+unsigned int
+TimeIntBDF<dim, Number>::get_size_velocity() const
+{
+  // overwrite in derived class if vector size is different
+  AssertThrow(false,
+              dealii::ExcMessage("this should not be used for now, "
+                                 "as we use the function in the derived class."));
+  return this->order;
+}
+
+template<int dim, typename Number>
+unsigned int
+TimeIntBDF<dim, Number>::get_size_pressure() const
+{
+  // overwrite in derived class if vector size is different
+  AssertThrow(false,
+              dealii::ExcMessage("this should not be used for now, "
+                                 "as we use the function in the derived class."));
+  return this->order;
 }
 
 template<int dim, typename Number>
@@ -283,17 +313,23 @@ TimeIntBDF<dim, Number>::read_restart_vectors()
   // Setup vectors locally to read into.
   std::vector<VectorType> vectors_velocity;
   std::vector<VectorType> vectors_pressure;
-  for(unsigned int i = 0; i < this->order; i++)
+  for(unsigned int i = 0; i < this->get_size_velocity(); i++)
   {
     vectors_velocity.push_back(get_velocity(i));
+  }
+  for(unsigned int i = 0; i < this->get_size_pressure(); i++)
+  {
     vectors_pressure.push_back(get_pressure(i));
   }
 
   std::vector<VectorType *> vectors_velocity_ptr;
   std::vector<VectorType *> vectors_pressure_ptr;
-  for(unsigned int i = 0; i < this->order; i++)
+  for(unsigned int i = 0; i < this->get_size_velocity(); i++)
   {
     vectors_velocity_ptr.push_back(&vectors_velocity[i]);
+  }
+  for(unsigned int i = 0; i < this->get_size_pressure(); i++)
+  {
     vectors_pressure_ptr.push_back(&vectors_pressure[i]);
   }
 
@@ -303,7 +339,8 @@ TimeIntBDF<dim, Number>::read_restart_vectors()
     {
       for(unsigned int i = 0; i < this->order; i++)
       {
-        vectors_velocity_ptr.push_back(&vec_convective_term[i]);
+        // vectors_velocity_ptr.push_back(&vec_convective_term[i]);
+        vectors_velocity_ptr.push_back(&vec_convective_term_for_restart[i]);
       }
     }
   }
@@ -342,13 +379,25 @@ TimeIntBDF<dim, Number>::read_restart_vectors()
   operator_base->deserialize_vectors(vectors_velocity_ptr, vectors_pressure_ptr);
 
   // Copy contents from deserialized to used vectors.
-  for(unsigned int i = 0; i < this->order; i++)
+  for(unsigned int i = 0; i < this->get_size_velocity(); i++)
   {
     set_velocity(vectors_velocity[i], i);
   }
-  for(unsigned int i = 0; i < this->order; i++)
+  for(unsigned int i = 0; i < this->get_size_pressure(); i++)
   {
     set_pressure(vectors_pressure[i], i);
+  }
+
+  // Copy the vector to the standard matrix-free format.
+  if(needs_vector_convective_term)
+  {
+    if(this->param.ale_formulation == false)
+    {
+      for(unsigned int i = 0; i < this->order; i++)
+      {
+        this->copy_from_vec_convective_term_for_restart(i);
+      }
+    }
   }
 
   this->set_vectors_deserialization(vectors_velocity_add, vectors_pressure_add);
@@ -358,14 +407,64 @@ TimeIntBDF<dim, Number>::read_restart_vectors()
 
 template<int dim, typename Number>
 void
+TimeIntBDF<dim, Number>::copy_to_vec_convective_term_for_restart(unsigned int const i) const
+{
+  AssertThrow(false,
+              dealii::ExcMessage("Not used currently, since we overwrite in derived class."));
+
+  if(vec_convective_term[i].size() == vec_convective_term_for_restart[i].size())
+  {
+    // This is a simplified check assuming that the vector size is enough indication that the
+    // `IndexSets` match. In such a case, we can just copy the data, ignoring possible savings
+    // copying only local data as this is not done often.
+    vec_convective_term_for_restart[i].copy_locally_owned_data_from(vec_convective_term[i]);
+  }
+  else
+  {
+    AssertThrow(false,
+                dealii::ExcMessage(
+                  "Vector size mismatch in `copy_to_vec_convective_term_for_restart()` "
+                  "define copy operation in derived class."));
+  }
+}
+
+template<int dim, typename Number>
+void
+TimeIntBDF<dim, Number>::copy_from_vec_convective_term_for_restart(unsigned int const i)
+{
+  AssertThrow(false,
+              dealii::ExcMessage("Not used currently, since we overwrite in derived class."));
+
+  if(vec_convective_term[i].size() == vec_convective_term_for_restart[i].size())
+  {
+    // This is a simplified check assuming that the vector size is enough indication that the
+    // `IndexSets` match. In such a case, we can just copy the data, ignoring possible savings
+    // copying only local data as this is not done often.
+    vec_convective_term[i].copy_locally_owned_data_from(vec_convective_term_for_restart[i]);
+  }
+  else
+  {
+    AssertThrow(false,
+                dealii::ExcMessage(
+                  "Vector size mismatch in `copy_from_vec_convective_term_for_restart()` "
+                  "define copy operation in derived class."));
+  }
+}
+
+template<int dim, typename Number>
+void
 TimeIntBDF<dim, Number>::write_restart_vectors() const
 {
   std::vector<VectorType const *> vectors_velocity;
   std::vector<VectorType const *> vectors_pressure;
 
-  for(unsigned int i = 0; i < this->order; i++)
+  for(unsigned int i = 0; i < this->get_size_velocity(); i++)
   {
     vectors_velocity.push_back(&get_velocity(i));
+  }
+
+  for(unsigned int i = 0; i < this->get_size_pressure(); i++)
+  {
     vectors_pressure.push_back(&get_pressure(i));
   }
 
@@ -375,7 +474,11 @@ TimeIntBDF<dim, Number>::write_restart_vectors() const
     {
       for(unsigned int i = 0; i < this->order; i++)
       {
-        vectors_velocity.push_back(&vec_convective_term[i]);
+        // Copy the vector to the standard matrix-free format.
+        this->copy_to_vec_convective_term_for_restart(i);
+        vectors_velocity.push_back(&vec_convective_term_for_restart[i]);
+
+        // vectors_velocity.push_back(&vec_convective_term[i]);
       }
     }
   }
@@ -612,13 +715,13 @@ TimeIntBDF<dim, Number>::postprocessing() const
   // `dealii::VectorTools::integrate_difference()` does not take constraints into account like
   // `dealii::MatrixFree` does, hence reading the wrong values. `distribute_constraint_u()` updates
   // the constrained values for the velocity.
-  operator_base->distribute_constraint_u(const_cast<VectorType &>(get_velocity(0)));
+  operator_base->distribute_constraint_u(const_cast<VectorType &>(get_velocity()));
 
   bool constexpr postprocess_solution_else_error = true;
   if(postprocess_solution_else_error)
   {
-    postprocessor->do_postprocessing(get_velocity(0),
-                                     get_pressure(0),
+    postprocessor->do_postprocessing(get_velocity(),
+                                     get_pressure(),
                                      this->get_time(),
                                      this->get_time_step_number());
   }
@@ -632,8 +735,8 @@ TimeIntBDF<dim, Number>::postprocessing() const
 
     operator_base->prescribe_initial_conditions(velocity_error, pressure_error, this->get_time());
 
-    velocity_error.add(-1.0, get_velocity(0));
-    pressure_error.add(-1.0, get_pressure(0));
+    velocity_error.add(-1.0, get_velocity());
+    pressure_error.add(-1.0, get_pressure());
 
     postprocessor->do_postprocessing(velocity_error, // error!
                                      pressure_error, // error!

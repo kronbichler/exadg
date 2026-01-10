@@ -401,7 +401,7 @@ TimeIntBDFDualSplitting<dim, Number>::convective_step()
     }
 
     velocity_np.equ(-this->extra.get_beta(0), this->vec_convective_term[0]);
-    for(unsigned int i = 1; i < this->vec_convective_term.size(); ++i)
+    for(unsigned int i = 1; i < this->extra.get_order(); ++i)
       velocity_np.add(-this->extra.get_beta(i), this->vec_convective_term[i]);
   }
   else
@@ -493,7 +493,7 @@ TimeIntBDFDualSplitting<dim, Number>::pressure_step()
   if(this->use_extrapolation)
   {
     pressure_np.equ(this->extra.get_beta(0), pressure[0]);
-    for(unsigned int i = 1; i < pressure.size(); ++i)
+    for(unsigned int i = 1; i < this->extra.get_order(); ++i)
     {
       pressure_np.add(this->extra.get_beta(i), pressure[i]);
     }
@@ -563,7 +563,7 @@ TimeIntBDFDualSplitting<dim, Number>::rhs_pressure(VectorType & rhs) const
     // convective term
     if(this->param.convective_problem())
     {
-      for(unsigned int i = 0; i < velocity.size(); ++i)
+      for(unsigned int i = 0; i < this->extra.get_order(); ++i)
       {
         temp = 0.0;
         pde_operator->rhs_ppe_div_term_convective_term_add(temp, velocity[i]);
@@ -686,7 +686,7 @@ TimeIntBDFDualSplitting<dim, Number>::projection_step()
     if(this->use_extrapolation)
     {
       velocity_extrapolated.reinit(velocity[0]);
-      for(unsigned int i = 0; i < velocity.size(); ++i)
+      for(unsigned int i = 0; i < this->extra.get_order(); ++i)
         velocity_extrapolated.add(this->extra.get_beta(i), velocity[i]);
     }
     else
@@ -777,7 +777,7 @@ TimeIntBDFDualSplitting<dim, Number>::viscous_step()
     if(this->use_extrapolation)
     {
       velocity_np.equ(this->extra.get_beta(0), velocity[0]);
-      for(unsigned int i = 1; i < velocity.size(); ++i)
+      for(unsigned int i = 1; i < this->extra.get_order(); ++i)
         velocity_np.add(this->extra.get_beta(i), velocity[i]);
     }
     else
@@ -1001,7 +1001,7 @@ TimeIntBDFDualSplitting<dim, Number>::rhs_viscous(VectorType &       rhs,
   // dual-splitting scheme
   if(this->param.non_explicit_convective_problem())
   {
-    for(unsigned int i = 0; i < this->vec_convective_term.size(); ++i)
+    for(unsigned int i = 0; i < this->extra.get_order(); ++i)
       rhs.add(this->extra.get_beta(i), this->vec_convective_term[i]);
   }
 
@@ -1038,7 +1038,7 @@ TimeIntBDFDualSplitting<dim, Number>::residual_rhs_viscous(
   // dual-splitting scheme
   if(this->param.non_explicit_convective_problem())
   {
-    for(unsigned int i = 0; i < this->vec_convective_term.size(); ++i)
+    for(unsigned int i = 0; i < this->extra.get_order(); ++i)
     {
       rhs.add(this->extra.get_beta(i), this->vec_convective_term[i]);
     }
@@ -1064,7 +1064,7 @@ TimeIntBDFDualSplitting<dim, Number>::penalty_step()
     VectorType velocity_extrapolated;
     velocity_extrapolated.reinit(velocity_np, true /* omit_zeroing_entries */);
     velocity_extrapolated.equ(this->extra.get_beta(0), velocity[0]);
-    for(unsigned int i = 1; i < velocity.size(); ++i)
+    for(unsigned int i = 1; i < this->extra.get_order(); ++i)
       velocity_extrapolated.add(this->extra.get_beta(i), velocity[i]);
 
     pde_operator->update_projection_operator(velocity_extrapolated, this->get_time_step_size());

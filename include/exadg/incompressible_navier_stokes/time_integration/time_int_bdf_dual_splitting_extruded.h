@@ -97,6 +97,18 @@ private:
   void
   setup_derived() final;
 
+  unsigned int
+  get_size_velocity() const final;
+
+  unsigned int
+  get_size_pressure() const final;
+
+  void
+  copy_to_vec_convective_term_for_restart(unsigned int const i) const final;
+
+  void
+  copy_from_vec_convective_term_for_restart(unsigned int const i) final;
+
   void
   get_vectors_serialization(std::vector<VectorType const *> & vectors_velocity,
                             std::vector<VectorType const *> & vectors_pressure) const final;
@@ -160,17 +172,24 @@ private:
 
   std::vector<VectorType> velocity;
 
-  VectorType velocity_np;
+  VectorType velocity_np; // standard mf vector
 
-  std::vector<VectorTypeFloat> velocity_red;
-  std::vector<VectorTypeFloat> velocity_matvec;
+  std::vector<VectorTypeFloat> velocity_red;    // op_rt vector
+  std::vector<VectorTypeFloat> velocity_matvec; // op_rt vector
 
-  VectorType pressure_np;
-  VectorType pressure_rhs;
+  VectorType pressure_np;  // standard mf vector
+  VectorType pressure_rhs; // standard mf vector, not to be deserialized
 
-  std::vector<VectorTypeFloat> pressure;
-  std::vector<VectorTypeFloat> pressure_matvec;
-  std::vector<VectorType>      pressure_nbc_rhs;
+  std::vector<VectorTypeFloat> pressure;         // op_rt vector
+  std::vector<VectorTypeFloat> pressure_matvec;  // standard mf vector, but initialized differently?
+  std::vector<VectorType>      pressure_nbc_rhs; // op_rt vector
+
+  mutable std::vector<VectorType> velocity_for_restart; // standard mf vector
+  mutable std::vector<VectorType> pressure_for_restart; // standard mf vector
+
+  mutable std::vector<VectorType> velocity_red_for_restart;    // standard mf vector
+  mutable std::vector<VectorType> velocity_matvec_for_restart; // standard mf vector
+  mutable std::vector<VectorType> pressure_matvec_for_restart; // standard mf vector
 
   // required for strongly-coupled partitioned FSI
   VectorType pressure_last_iter;

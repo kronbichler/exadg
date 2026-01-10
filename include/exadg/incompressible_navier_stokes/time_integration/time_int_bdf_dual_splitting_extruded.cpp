@@ -54,6 +54,11 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::TimeIntBDFDualSplittingExtruded(
     pressure(4),
     pressure_matvec(4),
     pressure_nbc_rhs(this->param.order_extrapolation_pressure_nbc),
+    velocity_for_restart(this->order),
+    pressure_for_restart(4),
+    velocity_red_for_restart(4),
+    velocity_matvec_for_restart(4 * 2),
+    pressure_matvec_for_restart(4),
     iterations_pressure({0, 0}),
     iterations_projection({0, 0}),
     iterations_viscous({0, {0, 0}}),
@@ -94,6 +99,42 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::setup_derived()
 }
 
 template<int dim, typename Number>
+unsigned int
+TimeIntBDFDualSplittingExtruded<dim, Number>::get_size_velocity() const
+{
+  return velocity.size();
+}
+
+template<int dim, typename Number>
+unsigned int
+TimeIntBDFDualSplittingExtruded<dim, Number>::get_size_pressure() const
+{
+  return pressure.size();
+}
+
+template<int dim, typename Number>
+void
+TimeIntBDFDualSplittingExtruded<dim, Number>::copy_to_vec_convective_term_for_restart(
+  unsigned int const i) const
+{
+  // The standard matrix-free vector and the format used here are not identical, we overwrite the
+  // method in the base class.
+  op_rt->copy_this_to_mf_vector(this->vec_convective_term[i],
+                                this->vec_convective_term_for_restart[i]);
+}
+
+template<int dim, typename Number>
+void
+TimeIntBDFDualSplittingExtruded<dim, Number>::copy_from_vec_convective_term_for_restart(
+  unsigned int const i)
+{
+  // The standard matrix-free vector and the format used here are not identical, we overwrite the
+  // method in the base class.
+  op_rt->copy_mf_to_this_vector(this->vec_convective_term_for_restart[i],
+                                this->vec_convective_term[i]);
+}
+
+template<int dim, typename Number>
 void
 TimeIntBDFDualSplittingExtruded<dim, Number>::get_vectors_serialization(
   std::vector<VectorType const *> & vectors_velocity,
@@ -101,6 +142,100 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::get_vectors_serialization(
 {
   (void)vectors_pressure;
   (void)vectors_velocity;
+
+  // // velocity vectors: velocity_np
+  // vectors_velocity.push_back(&velocity_np);
+
+  // // velocity vectors: velocity_red, needs to be converted to standard matrix-free vector
+  // for(unsigned int i = 0; i < velocity_red_for_restart.size(); ++i)
+  // {
+  //   // initialize standard matrix-free vector
+  //   pde_operator->initialize_vector_velocity(velocity_red_for_restart[i]);
+  //   // copy entries converting float to Number
+  //   op_rt_float->copy_this_to_mf_vector(velocity_red[i], velocity_red_for_restart[i]);
+  //   // add pointer to serialization list
+  //   vectors_velocity.push_back(&velocity_red_for_restart[i]);
+  // }
+
+  // // velocity vectors: velocity_matvec, needs to be converted to standard matrix-free vector
+  // for(unsigned int i = 0; i < velocity_matvec_for_restart.size(); ++i)
+  // {
+  //   // initialize standard matrix-free vector
+  //   pde_operator->initialize_vector_velocity(velocity_matvec_for_restart[i]);
+  //   // copy entries converting float to Number
+  //   op_rt_float->copy_this_to_mf_vector(velocity_matvec[i], velocity_matvec_for_restart[i]);
+  //   // add pointer to serialization list
+  //   vectors_velocity.push_back(&velocity_matvec_for_restart[i]);
+  // }
+
+  // // pressure vectors: pressure_np
+  // vectors_pressure.push_back(&pressure_np);
+
+  // // pressure vectors: pressure_matvec, needs to be converted to standard matrix-free vector
+  // for(unsigned int i = 0; i < pressure_matvec_for_restart.size(); ++i)
+  // {
+  //   // initialize standard matrix-free vector
+  //   pde_operator->initialize_vector_pressure(pressure_matvec_for_restart[i]);
+  //   // copy entries converting float to Number
+  //   pressure_matvec_for_restart[i] = pressure_matvec[i];
+
+  //   // add pointer to serialization list
+  //   vectors_pressure.push_back(&pressure_matvec_for_restart[i]);
+  // }
+
+  // // pressure vectors: pressure_nbc_rhs
+  // for(unsigned int i = 0; i < pressure_nbc_rhs.size(); i++)
+  // {
+  //   vectors_pressure.push_back(&pressure_nbc_rhs[i]);
+  // }
+
+  // // PRINT ALL THE VECTORS WE DE-/DESERIALIZE
+  // this->pcout << std::scientific << std::setprecision(8);
+
+  // for(unsigned int i = 0; i < vectors_velocity.size(); ++i)
+  // {
+  //   this->pcout << "vectors_velocity[" << i << "]->l2_norm() : " <<
+  //   vectors_velocity[i]->l2_norm()
+  //               << "\n";
+  // }
+  // for(unsigned int i = 0; i < vectors_pressure.size(); ++i)
+  // {
+  //   this->pcout << "vectors_pressure[" << i << "]->l2_norm() : " <<
+  //   vectors_pressure[i]->l2_norm()
+  //               << "\n";
+  // }
+
+
+  // this->pcout << "velocity_np.l2_norm() = " << velocity_np.l2_norm() << "\n";
+  // for(unsigned int i = 0; i < velocity.size(); ++i)
+  // {
+  //   this->pcout << "velocity[" << i << "].l2_norm() = " << velocity[i].l2_norm() << "\n";
+  // }
+  // for(unsigned int i = 0; i < velocity_red.size(); ++i)
+  // {
+  //   this->pcout << "velocity_red[" << i << "].l2_norm() = " << velocity_red[i].l2_norm() << "\n";
+  // }
+  // for(unsigned int i = 0; i < velocity_matvec.size(); ++i)
+  // {
+  //   this->pcout << "velocity_matvec[" << i << "].l2_norm() = " << velocity_matvec[i].l2_norm()
+  //               << "\n";
+  // }
+
+  // this->pcout << "pressure_np.l2_norm() = " << pressure_np.l2_norm() << "\n";
+  // for(unsigned int i = 0; i < pressure.size(); ++i)
+  // {
+  //   this->pcout << "pressure[" << i << "].l2_norm() = " << pressure[i].l2_norm() << "\n";
+  // }
+  // for(unsigned int i = 0; i < pressure_matvec.size(); ++i)
+  // {
+  //   this->pcout << "pressure_matvec[" << i << "].l2_norm() = " << pressure_matvec[i].l2_norm()
+  //               << "\n";
+  // }
+  // for(unsigned int i = 0; i < pressure_nbc_rhs.size(); ++i)
+  // {
+  //   this->pcout << "pressure_nbc_rhs[" << i << "].l2_norm() = " << pressure_nbc_rhs[i].l2_norm()
+  //               << "\n";
+  // }
 }
 
 template<int dim, typename Number>
@@ -111,6 +246,92 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::set_vectors_deserialization(
 {
   (void)vectors_pressure;
   (void)vectors_velocity;
+
+  // // velocity vectors: velocity_np
+  // velocity_np = vectors_velocity[0];
+
+  // // velocity vectors: velocity_red, needs to be converted from standard matrix-free vector
+  // unsigned int start_index_velocity = 1;
+  // for(unsigned int i = 0; i < velocity_red.size(); ++i)
+  // {
+  //   // copy entries converting float to Number
+  //   op_rt_float->copy_mf_to_this_vector(vectors_velocity[start_index_velocity + i],
+  //   velocity_red[i]);
+  // }
+
+  // // velocity vectors: velocity_matvec, needs to be converted from standard matrix-free vector
+  // start_index_velocity = 1 + velocity_red.size();
+  // for(unsigned int i = 0; i < velocity_matvec.size(); ++i)
+  // {
+  //   // copy entries converting float to Number
+  //   op_rt_float->copy_mf_to_this_vector(vectors_velocity[start_index_velocity + i],
+  //   velocity_matvec[i]);
+  // }
+
+  // // pressure vectors: pressure_np
+  // pressure_np = vectors_pressure[0];
+
+  // // pressure vectors: pressure_matvec, needs to be converted from standard matrix-free vector
+  // unsigned int start_index_pressure = 1;
+  // for(unsigned int i = 0; i < pressure_matvec.size(); ++i)
+  // {
+  //   // copy entries converting Number to float
+  //   pressure_matvec[i] = vectors_pressure[start_index_pressure + i];
+  // }
+
+  // // pressure vectors: pressure_nbc_rhs
+  // start_index_pressure = 1 + pressure_matvec.size();
+  // for(unsigned int i = 0; i < pressure_nbc_rhs.size(); i++)
+  // {
+  //   pressure_nbc_rhs[i] = vectors_pressure[start_index_pressure + i];
+  // }
+
+  // // PRINT ALL THE VECTORS WE DE-/DESERIALIZE
+  // this->pcout << std::scientific << std::setprecision(8);
+
+
+  // for(unsigned int i = 0; i < vectors_velocity.size(); ++i)
+  // {
+  //   this->pcout << "vectors_velocity[" << i << "].l2_norm() : " << vectors_velocity[i].l2_norm()
+  //               << "\n";
+  // }
+  // for(unsigned int i = 0; i < vectors_pressure.size(); ++i)
+  // {
+  //   this->pcout << "vectors_pressure[" << i << "].l2_norm() : " << vectors_pressure[i].l2_norm()
+  //               << "\n";
+  // }
+
+
+  // this->pcout << "velocity_np.l2_norm() = " << velocity_np.l2_norm() << "\n";
+  // for(unsigned int i = 0; i < velocity.size(); ++i)
+  // {
+  //   this->pcout << "velocity[" << i << "].l2_norm() = " << velocity[i].l2_norm() << "\n";
+  // }
+  // for(unsigned int i = 0; i < velocity_red.size(); ++i)
+  // {
+  //   this->pcout << "velocity_red[" << i << "].l2_norm() = " << velocity_red[i].l2_norm() << "\n";
+  // }
+  // for(unsigned int i = 0; i < velocity_matvec.size(); ++i)
+  // {
+  //   this->pcout << "velocity_matvec[" << i << "].l2_norm() = " << velocity_matvec[i].l2_norm()
+  //               << "\n";
+  // }
+
+  // this->pcout << "pressure_np.l2_norm() = " << pressure_np.l2_norm() << "\n";
+  // for(unsigned int i = 0; i < pressure.size(); ++i)
+  // {
+  //   this->pcout << "pressure[" << i << "].l2_norm() = " << pressure[i].l2_norm() << "\n";
+  // }
+  // for(unsigned int i = 0; i < pressure_matvec.size(); ++i)
+  // {
+  //   this->pcout << "pressure_matvec[" << i << "].l2_norm() = " << pressure_matvec[i].l2_norm()
+  //               << "\n";
+  // }
+  // for(unsigned int i = 0; i < pressure_nbc_rhs.size(); ++i)
+  // {
+  //   this->pcout << "pressure_nbc_rhs[" << i << "].l2_norm() = " << pressure_nbc_rhs[i].l2_norm()
+  //               << "\n";
+  // }
 }
 
 template<int dim, typename Number>
@@ -118,6 +339,19 @@ void
 TimeIntBDFDualSplittingExtruded<dim, Number>::allocate_vectors()
 {
   Base::allocate_vectors();
+
+  // restart vectors
+  if(this->param.restarted_simulation or this->param.restart_data.write_restart)
+  {
+    for(unsigned int i = 0; i < velocity_for_restart.size(); ++i)
+    {
+      pde_operator->initialize_vector_velocity(velocity_for_restart[i]);
+    }
+    for(unsigned int i = 0; i < pressure_for_restart.size(); ++i)
+    {
+      pde_operator->initialize_vector_pressure(pressure_for_restart[i]);
+    }
+  }
 
   // velocity
   pde_operator->initialize_vector_velocity(velocity_np);
@@ -267,8 +501,12 @@ template<int dim, typename Number>
 typename TimeIntBDFDualSplittingExtruded<dim, Number>::VectorType const &
 TimeIntBDFDualSplittingExtruded<dim, Number>::get_pressure(const unsigned int i) const
 {
-  AssertThrow(i == 0, dealii::ExcNotImplemented());
-  return pressure_np;
+  AssertThrow(this->param.restarted_simulation or this->param.restart_data.write_restart,
+              dealii::ExcMessage("Pressure vectors not initialized"));
+
+  // Convert `VectorTypeFloat` to `VectorType` if necessary.
+  pressure_for_restart[i].copy_locally_owned_data_from(pressure[i]);
+  return pressure_for_restart[i];
 }
 
 template<int dim, typename Number>
@@ -282,8 +520,12 @@ template<int dim, typename Number>
 typename TimeIntBDFDualSplittingExtruded<dim, Number>::VectorType const &
 TimeIntBDFDualSplittingExtruded<dim, Number>::get_velocity(unsigned int i) const
 {
-  AssertThrow(i == 0, dealii::ExcNotImplemented());
-  return velocity_np;
+  AssertThrow(this->param.restarted_simulation or this->param.restart_data.write_restart,
+              dealii::ExcMessage("Velocity vectors not initialized"));
+
+  // We need to copy since the `IndexSet`s are different.
+  op_rt->copy_this_to_mf_vector(velocity[i], velocity_for_restart[i]);
+  return velocity_for_restart[i];
 }
 
 template<int dim, typename Number>
@@ -291,8 +533,8 @@ void
 TimeIntBDFDualSplittingExtruded<dim, Number>::set_velocity(VectorType const & velocity_in,
                                                            unsigned int const i)
 {
-  AssertThrow(false, dealii::ExcNotImplemented());
-  velocity[i] = velocity_in;
+  // We need to copy since the `IndexSet`s are different.
+  op_rt->copy_mf_to_this_vector(velocity_in, velocity[i]);
 }
 
 template<int dim, typename Number>
@@ -300,7 +542,8 @@ void
 TimeIntBDFDualSplittingExtruded<dim, Number>::set_pressure(VectorType const & pressure_in,
                                                            unsigned int const i)
 {
-  pressure[i] = pressure_in;
+  // Converts the incoming `VectorType` to `VectorTypeFloat` if necessary.
+  pressure[i].copy_locally_owned_data_from(pressure_in);
 }
 
 template<int dim, typename Number>
@@ -341,7 +584,7 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::convective_step()
       }
     }
 
-    for(unsigned int i = 0; i < factors.size(); ++i)
+    for(unsigned int i = 0; i < this->extra.get_order(); ++i)
       factors[i] = -this->extra.get_beta(i);
     extrapolate_vectors(factors, this->vec_convective_term, rhs_rt);
   }
@@ -366,7 +609,7 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::convective_step()
 
   dealii::SolverCG<VectorType> solver_cg(control);
   op_rt->set_parameters(1.0, 0.0);
-  for(unsigned int i = 0; i < solutions_convective.size(); ++i)
+  for(unsigned int i = 0; i < this->extra.get_order(); ++i)
     factors[i] = this->extra.get_beta(i);
   extrapolate_vectors(factors, solutions_convective, solutions_convective.back());
   solver_cg.solve(*op_rt, solutions_convective.back(), rhs_rt, preconditioner_mass);
