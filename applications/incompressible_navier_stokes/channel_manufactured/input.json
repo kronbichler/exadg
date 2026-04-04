@@ -1,0 +1,34 @@
+{
+    "General": {
+        "Precision": "double",
+        "Dim": "3",
+        "IsTest": "false"
+    },
+    "SpatialResolution": {
+        "DegreeMin": "3",
+        "DegreeMax": "3",
+        "RefineSpaceMin": "2",
+        "RefineSpaceMax": "2"
+    },
+    "TemporalResolution": {
+        "RefineTimeMin": "3",
+        "RefineTimeMax": "3"
+    },
+    "Application": {
+        "TriangulationType": "Distributed",
+        "ReadRestart": "false",
+        "WriteRestart": "false",
+        "RestartDirectory": "./output/",
+        "TemporalDiscretization": "BDFConsistentSplittingExtruded",
+        "OrderTimeIntegrator": "2",
+        "SpatialDiscretization": "HDIV",
+        "viscosity": "1e-2",
+        "EndTime": "1.0e-3",
+        "CoarseMeshRefinements": "4,1,1"
+    },
+    "Output": {
+        "OutputDirectory": "output/",
+        "OutputName": "channel_manufactured",
+        "WriteOutput": "true"
+    }
+}

@@ -230,6 +230,8 @@ public:
 
       dealii::internal::set_initial_guess(rhs[level]);
       make_zero_mean(mg_matrices[level].get_matrix_free().get_constrained_dofs(), rhs[level]);
+
+      // TODO: this call raises an exception when running with many MPI processes on coarse grids.
       solver.solve(mg_matrices[level],
                    temp_vector[level],
                    rhs[level],
