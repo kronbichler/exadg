@@ -87,103 +87,185 @@ convert_map_to_range_list(const unsigned int                                    
   }
 }
 
+
+
+template<std::size_t dim>
+void
+group_cells_by_left_neighbors(
+  const std::array<int, dim> &                               lexicographic_index,
+  const typename dealii::Triangulation<dim>::cell_iterator & cell,
+  std::array<std::vector<std::pair<std::array<int, dim>,
+                                   typename dealii::Triangulation<dim>::active_cell_iterator>>,
+             8> &                                            cells_per_neighbor_value)
+{
+  if(cell->is_active() && cell->is_locally_owned())
+  {
+    unsigned int boundary_type = 0;
+    for(unsigned int d = 0; d < dim; ++d)
+      if(cell->at_boundary(2 * d) || cell->neighbor(2 * d)->subdomain_id() != cell->subdomain_id())
+      {
+        boundary_type += dealii::Utilities::pow(2, d);
+      }
+    cells_per_neighbor_value[boundary_type].emplace_back(lexicographic_index, cell);
+  }
+  else if(cell->has_children() && cell->n_children() == dealii::Utilities::pow(2, dim))
+    for(unsigned int child = 0, d2 = 0; d2 < (dim > 2 ? 2 : 1); ++d2)
+      for(unsigned int d1 = 0; d1 < (dim > 1 ? 2 : 1); ++d1)
+        for(unsigned int d0 = 0; d0 < 2; ++d0, ++child)
+        {
+          std::array<int, dim> child_lexicographic;
+          child_lexicographic[dim - 1] = lexicographic_index[dim - 1] * 2 + d0;
+          if constexpr(dim > 1)
+            child_lexicographic[dim - 2] = lexicographic_index[dim - 2] * 2 + d1;
+          if constexpr(dim > 2)
+            child_lexicographic[dim - 3] = lexicographic_index[dim - 3] * 2 + d2;
+          group_cells_by_left_neighbors(child_lexicographic,
+                                        cell->child(child),
+                                        cells_per_neighbor_value);
+        }
+  else
+    AssertThrow(cell->has_children() == false,
+                dealii::ExcMessage("Only hypercube elements allowed for this code path"));
+}
+
+
+
+// Create categories of cells to ensure optimal use of the face flux buffer
+// in the context of vectorization: we would like to place cells at the
+// boundary or adjacent to remote processes (requiring different algorithms
+// for the face data) in a lower category such that they get processed
+// first. The assignment aims for having as few cells as possible in batches
+// that are more expensive, i.e., to have cells placed together that have
+// the same faces with the increased cost
 template<int dim>
 std::vector<unsigned int>
 compute_vectorization_category(const dealii::Triangulation<dim> & tria)
 {
-  std::vector<unsigned int> cell_vectorization_category;
-  if(tria.n_levels() > 2)
-  {
-    cell_vectorization_category.resize(tria.n_active_cells(),
-                                       dealii::numbers::invalid_unsigned_int);
-    unsigned int                             next_category = 0;
-    std::array<std::vector<unsigned int>, 8> next_cells;
-    std::vector<unsigned int>                sorted_next_cells;
-    for(const auto & grandparent : tria.cell_iterators_on_level(tria.n_levels() - 3))
-      if(grandparent->has_children())
-      {
-        for(auto & entry : next_cells)
-          entry.clear();
-        for(unsigned int c0 = 0; c0 < grandparent->n_children(); ++c0)
-        {
-          const auto parent = grandparent->child(c0);
-          if(parent->has_children())
-            for(unsigned int c = 0; c < parent->n_children(); ++c)
-            {
-              const auto cell = parent->child(c);
-              Assert(cell->is_active(), dealii::ExcInternalError());
-              if(cell->is_locally_owned())
-              {
-                unsigned int boundary_type = 0;
-                for(unsigned int d = 0; d < dim; ++d)
-                  if(cell->at_boundary(2 * d) ||
-                     cell->neighbor(2 * d)->subdomain_id() != cell->subdomain_id())
-                  {
-                    boundary_type += dealii::Utilities::pow(2, d);
-                  }
-                next_cells[boundary_type].push_back(cell->active_cell_index());
-              }
-            }
-        }
-        unsigned int n_cells = 0;
-        for(const std::vector<unsigned int> & cells : next_cells)
-          n_cells += cells.size();
-        sorted_next_cells.clear();
-        sorted_next_cells.insert(sorted_next_cells.end(),
-                                 next_cells[7].begin(),
-                                 next_cells[7].end());
-        sorted_next_cells.insert(sorted_next_cells.end(),
-                                 next_cells[6].begin(),
-                                 next_cells[6].end());
-        sorted_next_cells.insert(sorted_next_cells.end(),
-                                 next_cells[5].begin(),
-                                 next_cells[5].end());
-        unsigned int count_4 = 0, count_2 = 0, count_1 = 0;
-        while(sorted_next_cells.size() % 16 != 0 && count_4 < next_cells[4].size())
-        {
-          sorted_next_cells.push_back(next_cells[4][count_4]);
-          ++count_4;
-        }
-        sorted_next_cells.insert(sorted_next_cells.end(),
-                                 next_cells[3].begin(),
-                                 next_cells[3].end());
-        while(sorted_next_cells.size() % 16 != 0 && count_4 < next_cells[4].size())
-        {
-          sorted_next_cells.push_back(next_cells[4][count_4]);
-          ++count_4;
-        }
-        while(sorted_next_cells.size() % 16 != 0 && count_2 < next_cells[2].size())
-        {
-          sorted_next_cells.push_back(next_cells[2][count_2]);
-          ++count_2;
-        }
-        while(sorted_next_cells.size() % 16 != 0 && count_1 < next_cells[1].size())
-        {
-          sorted_next_cells.push_back(next_cells[1][count_1]);
-          ++count_1;
-        }
-        // possibly move some insertions of category 0 in between to fill
-        // up and avoid further exchange steps
-        sorted_next_cells.insert(sorted_next_cells.end(),
-                                 next_cells[1].begin() + count_1,
-                                 next_cells[1].end());
-        sorted_next_cells.insert(sorted_next_cells.end(),
-                                 next_cells[2].begin() + count_2,
-                                 next_cells[2].end());
-        sorted_next_cells.insert(sorted_next_cells.end(),
-                                 next_cells[4].begin() + count_4,
-                                 next_cells[4].end());
-        sorted_next_cells.insert(sorted_next_cells.end(),
-                                 next_cells[0].begin(),
-                                 next_cells[0].end());
-        AssertThrow(sorted_next_cells.size() == n_cells,
-                    dealii::ExcDimensionMismatch(sorted_next_cells.size(), n_cells));
+  std::vector<unsigned int> cell_vectorization_category(tria.n_active_cells(),
+                                                        dealii::numbers::invalid_unsigned_int);
 
-        for(unsigned int i = 0; i < n_cells; ++next_category)
-          for(unsigned int j = 0; j < 16 && i < n_cells; ++j, ++i)
-            cell_vectorization_category[sorted_next_cells[i]] = next_category;
-      }
+  unsigned int n_owned_cells = 0;
+  for(const auto & cell : tria.active_cell_iterators())
+    if(cell->is_locally_owned())
+      ++n_owned_cells;
+
+  unsigned int category_counter = 0;
+
+  // Store:
+  //   - lexicographic coordinates (for ordering) - note that the z index
+  //     comes first to allow standard sorting, this impacts the use of the
+  //     index below
+  //   - corresponding active cell iterator
+  using CellLexEntry =
+    std::pair<std::array<int, dim>, typename dealii::Triangulation<dim>::active_cell_iterator>;
+
+  // Partition cells according to neighbor configuration.
+  // Index meaning:
+  //   0 = fully interior cells (all left neighbors treated in the same code,
+  //       providing opportunity to use a flux buffer from right faces)
+  //   1,2,... = cells touching specific subdomain boundary configurations or
+  //             the physical boundary
+  std::array<std::vector<CellLexEntry>, 8> cells_per_neighbor_value;
+
+  // Limit the number of levels we use for the lexicographic traversal,
+  // avoiding bad cache usage. For low degrees, it might actually make sense
+  // to allow for one more level, but in general the utilization with 8^dim
+  // cells is already very good in this case and improvements are rather
+  // minor from allowing up to 16^dim cells.
+  unsigned int blocking_level = 0;
+  if(tria.n_levels() > 4)
+    blocking_level = tria.n_levels() - 4;
+
+  for(const auto & cell : tria.cell_iterators_on_level(blocking_level))
+  {
+    // Group cells by their left neighbor, and within each group create
+    // a lexicographic ordering
+    for(auto & local_vector : cells_per_neighbor_value)
+      local_vector.clear();
+
+    // Recursively group descendant cells by left-neighbor pattern and
+    // collect lexicographic positions.
+    group_cells_by_left_neighbors(std::array<int, dim>{}, cell, cells_per_neighbor_value);
+
+    // Sort each group lexicographically
+    for(auto & local_vector : cells_per_neighbor_value)
+      std::sort(local_vector.begin(), local_vector.end());
+
+    // First do xy base layer with z faces at boundary and the category of
+    // z > 0, x=y=0
+    for(unsigned int neighbor_id = 7; neighbor_id > 2; --neighbor_id)
+      for(auto & entry : cells_per_neighbor_value[neighbor_id])
+        cell_vectorization_category[entry.second->active_cell_index()] = category_counter++;
+
+    // Then proceed layer by layer, including some blocking for cells
+    // along the y/z faces and the interior to increase the data locality;
+    // the SIMD width determines preferred category block size
+    constexpr unsigned int n_lanes = dealii::VectorizedArray<float>::size();
+    std::array<typename std::vector<CellLexEntry>::iterator, 3> lex_ptrs{
+      {cells_per_neighbor_value[0].begin(),
+       cells_per_neighbor_value[1].begin(),
+       cells_per_neighbor_value[2].begin()}};
+    const std::array<typename std::vector<CellLexEntry>::iterator, 3> lex_ends{
+      {cells_per_neighbor_value[0].end(),
+       cells_per_neighbor_value[1].end(),
+       cells_per_neighbor_value[2].end()}};
+
+    // First fill up the lanes with the previously accumulated info,
+    // making sure that the remaining parts also fit within the available
+    // lanes to ensure a good utilization
+    auto assign_category = [&](auto & it) {
+      cell_vectorization_category[it->second->active_cell_index()] = category_counter++;
+      ++it;
+    };
+
+    // Before proceeding with the next category, fill up with cells whose
+    // pattern should already be present in the same vectorization batch: we
+    // either had category 3 or some previous one; in either case, we should
+    // expect that categories 1 and 2 fit well; we first try to use cells of
+    // those categories until they are divisible by the SIMD length
+    // themselves, then we use some of the remaining cells
+    while(category_counter % n_lanes != 0)
+    {
+      if(lex_ptrs[2] != lex_ends[2] && (lex_ends[2] - lex_ptrs[2]) % n_lanes > 0)
+        assign_category(lex_ptrs[2]);
+      else if(lex_ptrs[1] != lex_ends[1] && (lex_ends[1] - lex_ptrs[1]) % n_lanes > 0)
+        assign_category(lex_ptrs[1]);
+      else if(lex_ptrs[2] != lex_ends[2])
+        assign_category(lex_ptrs[2]);
+      else if(lex_ptrs[1] != lex_ends[1])
+        assign_category(lex_ptrs[1]);
+      else if(lex_ptrs[0] != lex_ends[0])
+        assign_category(lex_ptrs[0]);
+      else
+        break;
+    }
+
+    // Then proceed layer by layer, always making sure that the interior
+    // part with index 0 (= all faces have a left neighbor and can use the
+    // flux buffer) comes after the other cells to not create bubbles
+    // without 'left' neighbor data accessible in flux buffer
+    while(lex_ptrs[0] != lex_ends[0])
+    {
+      int z_index = std::numeric_limits<int>::max();
+      if((lex_ends[0] - lex_ptrs[0]) >= n_lanes)
+        z_index = (lex_ptrs[0] + n_lanes)->first[0];
+      while(lex_ptrs[2] != lex_ends[2] && lex_ptrs[2]->first[0] <= z_index)
+        assign_category(lex_ptrs[2]);
+      while(lex_ptrs[2] != lex_ends[2] && category_counter % n_lanes != 0)
+        assign_category(lex_ptrs[2]);
+      while(lex_ptrs[1] != lex_ends[1] && lex_ptrs[1]->first[0] <= z_index)
+        assign_category(lex_ptrs[1]);
+      while(lex_ptrs[1] != lex_ends[1] && category_counter % n_lanes != 0)
+        assign_category(lex_ptrs[1]);
+      do
+        assign_category(lex_ptrs[0]);
+      while(lex_ptrs[0] != lex_ends[0] && category_counter % n_lanes != 0);
+    }
   }
+  // Final consistency check:
+  // every locally owned cell must have received exactly one category.
+  AssertThrow(category_counter == n_owned_cells,
+              dealii::ExcDimensionMismatch(category_counter, n_owned_cells));
   return cell_vectorization_category;
 }
 

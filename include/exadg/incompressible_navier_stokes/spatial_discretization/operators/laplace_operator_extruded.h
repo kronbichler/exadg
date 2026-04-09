@@ -222,7 +222,7 @@ public:
     const FiniteElement<dim> &                       fe = dof_handler.get_fe();
     typename MatrixFree<dim, Number>::AdditionalData mf_data;
     mf_data.cell_vectorization_category          = cell_vectorization_category;
-    mf_data.cell_vectorization_categories_strict = true;
+    mf_data.cell_vectorization_categories_strict = false;
     mf_data.overlap_communication_computation    = false;
     mf_data.initialize_mapping                   = false;
     matrix_free.reinit(mapping, dof_handler, constraints, quadrature, mf_data);
@@ -1193,7 +1193,7 @@ public:
     const FiniteElement<dim> &                       fe = dof_handler.get_fe();
     typename MatrixFree<dim, Number>::AdditionalData mf_data;
     mf_data.cell_vectorization_category          = cell_vectorization_category;
-    mf_data.cell_vectorization_categories_strict = true;
+    mf_data.cell_vectorization_categories_strict = false;
     mf_data.overlap_communication_computation    = false;
     mf_data.initialize_mapping                   = false;
     matrix_free.reinit(MappingQ1<dim>(), dof_handler, constraints, quadrature, mf_data);
