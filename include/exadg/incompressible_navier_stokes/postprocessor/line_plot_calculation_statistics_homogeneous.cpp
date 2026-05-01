@@ -747,7 +747,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::print_headline(
   std::ofstream &    f,
   unsigned int const number_of_samples) const
 {
-  f << "number of samples: N = " << number_of_samples << std::endl;
+  f << "number of samples: N = " << number_of_samples << " representing a time span of "
+    << accumulated_time << std::endl;
 }
 
 void
@@ -817,13 +818,13 @@ apply_matrix_vector_vect_eo(const VectorizedArray<Number> * matrix,
 
 template<int dim, typename Number>
 void
-read_rt_cell_values(const unsigned int                                     degree_normal,
-                    const Number *                                         src_vector,
-                    const dealii::AlignedVector<VectorizedArray<Number>> & matrix_n,
-                    const dealii::AlignedVector<VectorizedArray<Number>> & matrix_t,
-                    const dealii::ndarray<unsigned int, 2 * dim + 1> &     dof_indices,
-                    std::vector<Number> &                                  tmp_array,
-                    std::vector<Tensor<1, dim, Number>> &                  out)
+read_rt_cell_values(const unsigned int                                             degree_normal,
+                    const Number *                                                 src_vector,
+                    const dealii::AlignedVector<dealii::VectorizedArray<Number>> & matrix_n,
+                    const dealii::AlignedVector<dealii::VectorizedArray<Number>> & matrix_t,
+                    const dealii::ndarray<unsigned int, 2 * dim + 1> &             dof_indices,
+                    std::vector<Number> &                                          tmp_array,
+                    std::vector<dealii::Tensor<1, dim, Number>> &                  out)
 {
   const unsigned int n_t                = degree_normal;
   const unsigned int n_n                = n_t + 1;
@@ -955,6 +956,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
   double const       time_step_size_for_sampling)
 {
   dealii::Timer time;
+  using VectorizedArrayType = dealii::VectorizedArray<Number>;
   // increment number of samples
   number_of_samples++;
   accumulated_time += time_step_size_for_sampling;
@@ -964,12 +966,12 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
   if(rt_operator != nullptr)
   {
     velocity.update_ghost_values();
-    dealii::AlignedVector<Tensor<1, dim, VectorizedArray<Number>>> eval_field(
+    dealii::AlignedVector<dealii::Tensor<1, dim, VectorizedArrayType>> eval_field(
       evaluated_dg_values_on_cells.size(1));
     for(unsigned int i = 0; i < list_of_cells_to_evaluate.size(); ++i)
     {
       rt_operator->evaluate_field(velocity, list_of_cells_to_evaluate[i], eval_field);
-      std::array<unsigned int, VectorizedArray<Number>::size()> store_indices;
+      std::array<unsigned int, VectorizedArrayType::size()> store_indices;
       for(unsigned int j = 0; j < store_indices.size(); ++j)
         store_indices[j] = j * dim * eval_field.size();
       dealii::vectorized_transpose_and_store(
@@ -977,7 +979,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
         dim * eval_field.size(),
         &eval_field[0][0],
         store_indices.data(),
-        &evaluated_dg_values_on_cells(i * VectorizedArray<Number>::size(), 0)[0]);
+        &evaluated_dg_values_on_cells(i * VectorizedArrayType::size(), 0)[0]);
     }
   }
   else if(dof_indices_on_cell.empty())
@@ -1023,12 +1025,12 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
   std::vector<dealii::Tensor<1, dim, Number>> velocity_dgq_on_cell(
     jacobians_at_nodal_points.size(1));
-  std::vector<Number>                                                  tmp_array;
-  std::array<dealii::ndarray<VectorizedArray<Number>, 2, dim - 1>, 20> shapes_2d;
+  std::vector<Number>                                              tmp_array;
+  std::array<dealii::ndarray<VectorizedArrayType, 2, dim - 1>, 20> shapes_2d;
 
   const unsigned int n_points_in_plane = dealii::Utilities::pow(n_q_points_1d, dim - 1);
-  std::vector<Tensor<1, dim, Number>>          cell_averaged_velocity;
-  std::vector<SymmetricTensor<2, dim, Number>> cell_averaged_reynolds;
+  std::vector<dealii::Tensor<1, dim, Number>>          cell_averaged_velocity;
+  std::vector<dealii::SymmetricTensor<2, dim, Number>> cell_averaged_reynolds;
 
   if(rt_operator == nullptr)
     velocity.update_ghost_values();
@@ -1080,7 +1082,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
           has_skin_friction_quantity = true;
 
       AssertThrow(has_skin_friction_quantity,
-                  ExcMessage("Dissipation requires QuantitySkinFriction to provide viscosity."));
+                  dealii::ExcMessage(
+                    "Dissipation requires QuantitySkinFriction to provide viscosity."));
     }
 
 
@@ -1095,7 +1098,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
     {
       for(auto const & [cell, point_list] : cells_and_ref_points[index])
       {
-        Tensor<1, dim, Number> * eval_ptr = nullptr;
+        dealii::Tensor<1, dim, Number> * eval_ptr = nullptr;
         if(rt_operator == nullptr)
         {
           const std::array<unsigned int, 2 * dim + 1> cell_indices =
@@ -1112,17 +1115,21 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                                 velocity_dgq_on_cell);
             for(unsigned int q = 0; q < velocity_dgq_on_cell.size(); ++q)
             {
-              const Tensor<2, dim> jac = jacobians_at_nodal_points(counter_all_cells, q);
-              velocity_dgq_on_cell[q]  = (jac * velocity_dgq_on_cell[q]) / determinant(jac);
+              const dealii::Tensor<2, dim> jac = jacobians_at_nodal_points(counter_all_cells, q);
+              velocity_dgq_on_cell[q]          = (jac * velocity_dgq_on_cell[q]) / determinant(jac);
             }
           }
           else
             for(unsigned int c = 0; c < dim; ++c)
             {
-              internal::
-                EvaluatorTensorProduct<internal::evaluate_evenodd, dim, 0, 0, Number, Number>
-                  eval(
-                    shape_values_eo_dgq.data(), nullptr, nullptr, fe_u.degree + 1, fe_u.degree + 1);
+              dealii::internal::EvaluatorTensorProduct<dealii::internal::evaluate_evenodd,
+                                                       dim,
+                                                       0,
+                                                       0,
+                                                       Number,
+                                                       Number>
+                eval(
+                  shape_values_eo_dgq.data(), nullptr, nullptr, fe_u.degree + 1, fe_u.degree + 1);
               eval.template values<0, true, false>(velocity.begin() + cell_indices[0] +
                                                      c * velocity_dgq_on_cell.size(),
                                                    tmp_array.data());
@@ -1165,13 +1172,13 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
         // directions are hardcoded, so we can only support the last direction
         // here
         AssertThrow(averaging_direction == dim - 1, dealii::ExcNotImplemented());
-        const unsigned int n_lanes  = VectorizedArray<Number>::size();
+        const unsigned int n_lanes  = VectorizedArrayType::size();
         const unsigned int n_points = point_list.size();
         const unsigned int n_chunks = (n_points + n_lanes - 1) / n_lanes;
         for(unsigned int p1_v = 0; p1_v < n_chunks; ++p1_v)
         {
-          dealii::Point<dim - 1, VectorizedArray<Number>> point_on_line;
-          Tensor<2, dim, VectorizedArray<Number>>         inv_jac;
+          dealii::Point<dim - 1, VectorizedArrayType> point_on_line;
+          dealii::Tensor<2, dim, VectorizedArrayType> inv_jac;
           for(unsigned int d = 0; d < dim; ++d)
             inv_jac[d][d] = 1.0;
           for(unsigned int p1 = p1_v * n_lanes, v = 0;
@@ -1181,15 +1188,15 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
             for(unsigned int d = 0, c = 0; d < dim; ++d)
               if(d != averaging_direction)
                 point_on_line[c++][v] = point_list[p1].second[d];
-            Tensor<2, dim> const inv_jac_v = inverse_jacobians_on_lines[counter_line++];
+            dealii::Tensor<2, dim> const inv_jac_v = inverse_jacobians_on_lines[counter_line++];
             for(unsigned int d = 0; d < dim; ++d)
               for(unsigned int e = 0; e < dim; ++e)
                 inv_jac[d][e][v] = inv_jac_v[d][e];
           }
           // bool                                    need_skin_friction = false;
 
-          Tensor<1, dim, VectorizedArray<Number>> normal;
-          Tensor<1, dim, VectorizedArray<Number>> tangent;
+          dealii::Tensor<1, dim, VectorizedArrayType> normal;
+          dealii::Tensor<1, dim, VectorizedArrayType> tangent;
 
           Number viscosity = 0.0;
           if(need_skin_friction || need_dissipation)
@@ -1199,10 +1206,10 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
               if(quantity->type == QuantityType::SkinFriction)
               {
                 auto q = std::dynamic_pointer_cast<QuantitySkinFriction<dim>>(quantity);
-                AssertThrow(q, ExcInternalError());
+                AssertThrow(q, dealii::ExcInternalError());
 
-                Tensor<2, dim, VectorizedArray<Number>> jac = invert(transpose(inv_jac));
-                tangent                                     = jac * q->tangent_vector;
+                dealii::Tensor<2, dim, VectorizedArrayType> jac = invert(transpose(inv_jac));
+                tangent                                         = jac * q->tangent_vector;
                 tangent /= tangent.norm();
 
                 if(averaging_direction == 2)
@@ -1211,42 +1218,44 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                   normal[1] = -tangent[0];
                 }
                 else
-                  AssertThrow(false, ExcNotImplemented());
+                  AssertThrow(false, dealii::ExcNotImplemented());
 
                 viscosity           = q->viscosity;
                 found_skin_friction = true;
               }
             AssertThrow(found_skin_friction,
-                        ExcMessage("Dissipation/SkinFriction requires QuantitySkinFriction"));
+                        dealii::ExcMessage(
+                          "Dissipation/SkinFriction requires QuantitySkinFriction"));
           }
 
 
-          VectorizedArray<Number> const det =
+          VectorizedArrayType const det =
             1.0 / std::abs(inv_jac[averaging_direction][averaging_direction]);
           dealii::internal::compute_values_of_array(shapes_2d.data(),
                                                     polynomials_nodal,
                                                     point_on_line);
 
-          const VectorizedArray<Number>                    length = det;
-          Tensor<1, dim, VectorizedArray<Number>>          vel;
-          SymmetricTensor<2, dim, VectorizedArray<Number>> reynolds;
-          VectorizedArray<Number>                          skin_friction = 0;
-          VectorizedArray<Number>                          dissipation   = 0.0;
+          const VectorizedArrayType                            length = det;
+          dealii::Tensor<1, dim, VectorizedArrayType>          vel;
+          dealii::SymmetricTensor<2, dim, VectorizedArrayType> reynolds;
+          VectorizedArrayType                                  skin_friction = 0;
+          VectorizedArrayType                                  dissipation   = 0.0;
           if constexpr(!evaluate_averaging_by_tensor_product)
           {
-            Tensor<1, dim, VectorizedArray<Number>> velocity;
-            Tensor<2, dim, VectorizedArray<Number>> velocity_gradient;
+            dealii::Tensor<1, dim, VectorizedArrayType> velocity;
+            dealii::Tensor<2, dim, VectorizedArrayType> velocity_gradient;
             for(unsigned int q1 = 0; q1 < n_q_points_1d; ++q1)
             {
-              VectorizedArray<Number> const JxW = det * gauss_1d.weight(q1);
+              VectorizedArrayType const JxW = det * gauss_1d.weight(q1);
               if(need_velocity_gradient)
               {
-                auto const val_grad = internal::evaluate_tensor_product_value_and_gradient_shapes<
-                  dim - 1,
-                  Tensor<1, dim, Number>,
-                  VectorizedArray<Number>>(shapes_2d.data(),
-                                           polynomials_nodal.size(),
-                                           eval_ptr + q1 * n_points_in_plane);
+                auto const val_grad =
+                  dealii::internal::evaluate_tensor_product_value_and_gradient_shapes<
+                    dim - 1,
+                    dealii::Tensor<1, dim, Number>,
+                    VectorizedArrayType>(shapes_2d.data(),
+                                         polynomials_nodal.size(),
+                                         eval_ptr + q1 * n_points_in_plane);
                 velocity = val_grad[dim - 1];
                 for(unsigned int d = 0; d < dim; ++d)
                 {
@@ -1257,7 +1266,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
                 if(need_dissipation)
                 {
-                  VectorizedArray<Number> epsilon_q = 0.0;
+                  VectorizedArrayType epsilon_q = 0.0;
                   for(unsigned int i = 0; i < dim; ++i)
                     for(unsigned int j = 0; j < dim; ++j)
                       epsilon_q += velocity_gradient[i][j] * velocity_gradient[i][j];
@@ -1273,10 +1282,12 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                 }
               }
               else
-                velocity = internal::evaluate_tensor_product_value_shapes<dim - 1,
-                                                                          Tensor<1, dim, Number>,
-                                                                          VectorizedArray<Number>>(
-                  shapes_2d.data(), polynomials_nodal.size(), eval_ptr + q1 * n_points_in_plane);
+                velocity = dealii::internal::evaluate_tensor_product_value_shapes<
+                  dim - 1,
+                  dealii::Tensor<1, dim, Number>,
+                  VectorizedArrayType>(shapes_2d.data(),
+                                       polynomials_nodal.size(),
+                                       eval_ptr + q1 * n_points_in_plane);
 
               for(const std::shared_ptr<Quantity> & quantity : line.quantities)
               {
@@ -1304,14 +1315,15 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
           {
             if(need_velocity_gradient)
             {
-              auto const val_grad = internal::evaluate_tensor_product_value_and_gradient_shapes<
-                dim - 1,
-                Tensor<1, dim, Number>,
-                VectorizedArray<Number>>(shapes_2d.data(),
-                                         polynomials_nodal.size(),
-                                         cell_averaged_velocity.data());
+              auto const val_grad =
+                dealii::internal::evaluate_tensor_product_value_and_gradient_shapes<
+                  dim - 1,
+                  dealii::Tensor<1, dim, Number>,
+                  VectorizedArrayType>(shapes_2d.data(),
+                                       polynomials_nodal.size(),
+                                       cell_averaged_velocity.data());
               vel = val_grad[dim - 1];
-              Tensor<2, dim, VectorizedArray<Number>> grad;
+              dealii::Tensor<2, dim, VectorizedArrayType> grad;
               for(unsigned int d = 0; d < dim; ++d)
               {
                 for(unsigned int e = 0; e < dim - 1; ++e)
@@ -1326,15 +1338,18 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
               }
             }
             else
-              vel = internal::evaluate_tensor_product_value_shapes<dim - 1,
-                                                                   Tensor<1, dim, Number>,
-                                                                   VectorizedArray<Number>>(
-                shapes_2d.data(), polynomials_nodal.size(), cell_averaged_velocity.data());
-            reynolds =
-              internal::evaluate_tensor_product_value_shapes<dim - 1,
-                                                             SymmetricTensor<2, dim, Number>,
-                                                             VectorizedArray<Number>>(
-                shapes_2d.data(), polynomials_nodal.size(), cell_averaged_reynolds.data());
+              vel = dealii::internal::evaluate_tensor_product_value_shapes<
+                dim - 1,
+                dealii::Tensor<1, dim, Number>,
+                VectorizedArrayType>(shapes_2d.data(),
+                                     polynomials_nodal.size(),
+                                     cell_averaged_velocity.data());
+            reynolds = dealii::internal::evaluate_tensor_product_value_shapes<
+              dim - 1,
+              dealii::SymmetricTensor<2, dim, Number>,
+              VectorizedArrayType>(shapes_2d.data(),
+                                   polynomials_nodal.size(),
+                                   cell_averaged_reynolds.data());
           }
 
           for(unsigned int p1 = p1_v * n_lanes, v = 0;
@@ -1365,7 +1380,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
               else if(quantity->type == QuantityType::Dissipation)
               {
                 dissipation_local[offset_arrays + p] += dissipation[v];
-                VectorizedArray<Number> local_he =
+                VectorizedArrayType local_he =
                   std::pow(Number(1.0) / std::abs(determinant(inv_jac)), Number(1.0 / 3.0));
 
                 grid_size_local[offset_arrays + p] += local_he[v] * det[v];
@@ -1826,8 +1841,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_write_output() const
       ++line_iterator;
     }
     const_cast<double &>(time_all) += time.wall_time();
-    std::cout << "Accumulated time = " << accumulated_time << " output line stats t = " << time_all
-              << " s" << std::endl;
+    std::cout << "Accumulated " << number_of_samples
+              << " samples on lines in a compute time of t = " << time_all << " s" << std::endl;
   }
 }
 

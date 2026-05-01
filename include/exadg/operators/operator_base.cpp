@@ -370,13 +370,11 @@ OperatorBase<dim, Number, n_components>::assemble_matrix_if_matrix_based() const
     // initialize matrix
     if(not(system_matrix_based_been_initialized))
     {
-      dealii::DoFHandler<dim> const & dof_handler =
-        this->matrix_free->get_dof_handler(this->data.dof_index);
-
       if(this->data.sparse_matrix_type == SparseMatrixType::Trilinos)
       {
 #ifdef DEAL_II_WITH_TRILINOS
-        init_system_matrix(system_matrix_trilinos, dof_handler.get_mpi_communicator());
+        init_system_matrix(system_matrix_trilinos,
+                           this->matrix_free->get_dof_handler().get_mpi_communicator());
 #else
         AssertThrow(
           false,
@@ -387,7 +385,8 @@ OperatorBase<dim, Number, n_components>::assemble_matrix_if_matrix_based() const
       else if(this->data.sparse_matrix_type == SparseMatrixType::PETSc)
       {
 #ifdef DEAL_II_WITH_PETSC
-        init_system_matrix(system_matrix_petsc, dof_handler.get_mpi_communicator());
+        init_system_matrix(system_matrix_petsc,
+                           this->matrix_free->get_dof_handler().get_mpi_communicator());
 #else
         AssertThrow(
           false,

@@ -267,16 +267,24 @@ TimeIntBase::output_remaining_time() const
   {
     if(time > start_time)
     {
-      double const remaining_time =
-        global_timer.wall_time() * (end_time - time) / (time - start_time);
+      double const time_spent     = global_timer.wall_time();
+      double const remaining_time = time_spent * (end_time - time) / (time - start_time);
+
+      int const hours_spent   = int(time_spent / 3600.0);
+      int const minutes_spent = int((time_spent - hours_spent * 3600.0) / 60.0);
+      int const seconds_spent = int((time_spent - hours_spent * 3600.0 - minutes_spent * 60.0));
 
       int const hours   = int(remaining_time / 3600.0);
       int const minutes = int((remaining_time - hours * 3600.0) / 60.0);
       int const seconds = int((remaining_time - hours * 3600.0 - minutes * 60.0));
 
-      pcout << std::endl
-            << "Estimated time until completion is " << hours << " h " << minutes << " min "
-            << seconds << " s." << std::endl;
+      pcout << std::endl << "Spent ";
+      if(hours_spent > 0)
+        pcout << hours_spent << " h ";
+      pcout << minutes_spent << " min " << seconds_spent << " s, estimated time until completion: ";
+      if(hours > 0)
+        pcout << hours << " h ";
+      pcout << minutes << " min " << seconds << " s." << std::endl;
     }
   }
 }
