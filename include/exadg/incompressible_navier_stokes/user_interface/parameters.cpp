@@ -429,6 +429,14 @@ Parameters::check(dealii::ConditionalOStream const & pcout) const
                   dealii::ExcMessage("Use either PointJacobi or None as preconditioner for the "
                                      "momentum block in the case of HDIV - Raviart-Thomas."));
     }
+
+    if(restarted_simulation)
+    {
+      AssertThrow(not restart_data.discretization_identical,
+                  dealii::ExcMessage("HDIV restart de-/serializes using an intermediate "
+                                     "FE space based on `FE_DGQArbitraryNodes`, the flag "
+                                     "discretization_identical cannot be used."));
+    }
   }
 
   if(viscous_problem() and viscosity_is_variable())

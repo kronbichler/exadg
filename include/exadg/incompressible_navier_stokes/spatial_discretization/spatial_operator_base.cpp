@@ -118,24 +118,13 @@ SpatialOperatorBase<dim, Number>::project_to_restart_space(
   // We interpolate each source vector on the cell in the integration points and use the
   // Kronecker-delta property in the support points being the Gauss integration points for the
   // restart space. Hence, the number of DoFs per cell can differ, but the grid must be identical.
-  // We assume that if the number of refinement levels and the number of global cells is identical,
-  // the grid is identical, since we do not support adaptive refinement.
   AssertThrow(src.size() > 0, dealii::ExcMessage("No vector provided for projection."));
 
   AssertThrow(src.size() == dst_restart.size(),
               dealii::ExcMessage("Number of vectors per DoFHandler must be equal."));
 
-  AssertThrow(src_dof_handler.get_triangulation().n_global_levels() ==
-                dst_dof_handler_restart.get_triangulation().n_global_levels(),
-              dealii::ExcMessage("Number of refinement levels in source and target triangulation "
-                                 "must be identical, since we loop over cells and "
-                                 "exploit the diagonal mass matrix in target."));
-
-  AssertThrow(src_dof_handler.get_triangulation().n_global_active_cells() ==
-                dst_dof_handler_restart.get_triangulation().n_global_active_cells(),
-              dealii::ExcMessage("Number of cells in source and target triangulation "
-                                 "must be identical, since we loop over cells and "
-                                 "exploit the diagonal mass matrix in target."));
+  AssertThrow(&src_dof_handler.get_triangulation() == &dst_dof_handler_restart.get_triangulation(),
+              dealii::ExcMessage("Triangulations attached to the DoFHandlers must be identical."));
 
   // vector with relevant DoFs needed for interpolation
   for(VectorType const * vec : src)
@@ -1302,56 +1291,231 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
     checkpoint_vectors[1 /* pressure */].push_back(&checkpoint_vectors_pressure[i]);
   }
 
-  if(param.restart_data.discretization_identical)
+  // Perform global projection in case of a non-matching discretization.
+  std::vector<dealii::DoFHandler<dim> const *> dof_handlers{&this->get_dof_handler_u(),
+                                                            &this->get_dof_handler_p()};
+
+  std::vector<std::vector<VectorType *>> vectors_per_dof_handler(2);
+  for(unsigned int i = 0; i < vectors_velocity.size(); ++i)
   {
-    AssertThrow(param.restart_data.discretization_identical,
-                dealii::ExcMessage("Since we project onto `FE_DGQArbitraryNodes`, we require "
-                                   "the projection onto the currently used FE space."));
+    vectors_per_dof_handler[0 /* velocity */].push_back(vectors_velocity[i]);
+  }
+  for(unsigned int i = 0; i < vectors_pressure.size(); ++i)
+  {
+    vectors_per_dof_handler[1 /* pressure */].push_back(vectors_pressure[i]);
+  }
+
+  // Deserialize mapping from vector or project on reference triangulations.
+  check_mapping_deserialization(param.restart_data.consider_mapping_read_source,
+                                deserialization_parameters.consider_mapping_write);
+  std::shared_ptr<dealii::Mapping<dim> const> checkpoint_mapping;
+  std::shared_ptr<MappingDoFVector<dim, typename VectorType::value_type>>
+    checkpoint_mapping_dof_vector;
+  if(param.restart_data.consider_mapping_read_source)
+  {
+    dealii::DoFHandler<dim> checkpoint_dof_handler_mapping(*checkpoint_triangulation);
+    std::shared_ptr<dealii::FiniteElement<dim>> checkpoint_fe_mapping =
+      create_finite_element<dim>(get_element_type(*checkpoint_triangulation),
+                                 true /* is_dg */,
+                                 dim /* n_components */,
+                                 deserialization_parameters.mapping_degree);
+    checkpoint_dof_handler_mapping.distribute_dofs(*checkpoint_fe_mapping);
+
+    checkpoint_mapping_dof_vector = load_vectors(checkpoint_vectors,
+                                                 checkpoint_dof_handlers,
+                                                 &checkpoint_dof_handler_mapping,
+                                                 deserialization_parameters.mapping_degree);
+
+    checkpoint_mapping = checkpoint_mapping_dof_vector->get_mapping();
   }
   else
   {
-    // Perform global projection in case of a non-matching discretization.
-    std::vector<dealii::DoFHandler<dim> const *> dof_handlers{&this->get_dof_handler_u(),
-                                                              &this->get_dof_handler_p()};
+    load_vectors(checkpoint_vectors, checkpoint_dof_handlers);
 
-    std::vector<std::vector<VectorType *>> vectors_per_dof_handler(2);
-    for(unsigned int i = 0; i < vectors_velocity.size(); ++i)
-    {
-      vectors_per_dof_handler[0 /* velocity */].push_back(vectors_velocity[i]);
-    }
-    for(unsigned int i = 0; i < vectors_pressure.size(); ++i)
-    {
-      vectors_per_dof_handler[1 /* pressure */].push_back(vectors_pressure[i]);
-    }
+    // Create dummy linear mapping since we have no mapping serialized to restore.
+    std::shared_ptr<dealii::Mapping<dim>> tmp;
+    GridUtilities::create_mapping(tmp,
+                                  get_element_type(*checkpoint_triangulation),
+                                  1 /* mapping_degree */);
+    checkpoint_mapping = std::const_pointer_cast<dealii::Mapping<dim> const>(tmp);
+  }
 
-    // Deserialize mapping from vector or project on reference triangulations.
-    check_mapping_deserialization(param.restart_data.consider_mapping_read_source,
-                                  deserialization_parameters.consider_mapping_write);
-    std::shared_ptr<dealii::Mapping<dim> const> checkpoint_mapping;
-    std::shared_ptr<MappingDoFVector<dim, typename VectorType::value_type>>
-      checkpoint_mapping_dof_vector;
-    if(param.restart_data.consider_mapping_read_source)
-    {
-      dealii::DoFHandler<dim> checkpoint_dof_handler_mapping(*checkpoint_triangulation);
-      std::shared_ptr<dealii::FiniteElement<dim>> checkpoint_fe_mapping =
-        create_finite_element<dim>(get_element_type(*checkpoint_triangulation),
-                                   true /* is_dg */,
+  // Define grid-to-grid projection data for all projections used here.
+  ExaDG::GridToGridProjection::GridToGridProjectionData<dim> projection_data;
+  projection_data.grids_and_maps_identical        = false;
+  projection_data.solver_data                     = param.restart_data.solver_data;
+  projection_data.rpe_data.rtree_level            = param.restart_data.rpe_rtree_level;
+  projection_data.rpe_data.tolerance              = param.restart_data.rpe_tolerance_unit_cell;
+  projection_data.rpe_data.enforce_unique_mapping = param.restart_data.rpe_enforce_unique_mapping;
+
+  // Overwrite the velocity checkpoint `DoFHandler` and vectors in case we require an intermediate
+  // step for consistency. Data structures have to stay in scope for pointers to remain valid for
+  // projection and export to vtu.
+  std::shared_ptr<dealii::DoFHandler<dim>> dof_handler_u_restart_intermediate;
+  std::vector<VectorType>                  checkpoint_vectors_velocity_intermediate;
+  if(this->param.restart_data.consider_mapping_read_target == false and
+     this->param.spatial_discretization == SpatialDiscretization::HDIV)
+  {
+    // Projecting the solution on the undeformed grid using `SpatialDicretization::HDIV` requires
+    // an intermediate step for the velocity as the mapped grid and DoFs define the field. First,
+    // project the saved state in the undeformed, but potentially refined grid, using
+    // `FE_DGQArbitraryNodes` to reduce projection costs if the spatial resolution is identical.
+    dealii::Triangulation<dim> const & triangulation =
+      matrix_free->get_dof_handler().get_triangulation();
+    initialize_dof_handler_restart(param.degree_u,
                                    dim /* n_components */,
-                                   deserialization_parameters.mapping_degree);
-      checkpoint_dof_handler_mapping.distribute_dofs(*checkpoint_fe_mapping);
+                                   dof_handler_u_restart_intermediate,
+                                   triangulation);
 
-      checkpoint_mapping_dof_vector = load_vectors(checkpoint_vectors,
-                                                   checkpoint_dof_handlers,
-                                                   &checkpoint_dof_handler_mapping,
-                                                   deserialization_parameters.mapping_degree);
+    checkpoint_vectors_velocity_intermediate.resize(checkpoint_vectors_velocity.size());
+    for(VectorType & vec : checkpoint_vectors_velocity_intermediate)
+      vec.reinit(dof_handler_u_restart_intermediate->locally_owned_dofs(),
+                 dof_handler_u_restart_intermediate->get_mpi_communicator());
 
-      checkpoint_mapping = checkpoint_mapping_dof_vector->get_mapping();
-    }
-    else
+    // Perform grid-to-grid projection in the undeformed configuration with potentially different
+    // grids, this constructs a new `MatrixFree` object since the `DoFHandler` used differs. This
+    // approach avoids resetting the mapping of the standard `MatrixFree` object. We cannot use
+    // `project_to_restart_space()` here, since the sequence the cells are iterated through even
+    // for identical triangulations might differ.
+
+    dealii::Triangulation<dim> const & triangulation =
+      matrix_free->get_dof_handler().get_triangulation();
+
+    // Create dummy linear mapping in target grid, cannot use `checkpoint_mapping` since cell
+    // type might differ.
+    std::shared_ptr<dealii::Mapping<dim> const> target_mapping;
     {
-      load_vectors(checkpoint_vectors, checkpoint_dof_handlers);
+      std::shared_ptr<dealii::Mapping<dim>> tmp;
+      GridUtilities::create_mapping(tmp, get_element_type(triangulation), 1 /* mapping_degree */);
+      target_mapping = std::const_pointer_cast<dealii::Mapping<dim> const>(tmp);
+    }
+
+    // Grid-to-grid projection in undeformed configuration: velocity to intermediate space and
+    // pressure to final space. The pressure DoFs can simply be used on the deformed grid, while
+    // projection is more stable in the undeformed configuration.
+    std::vector<std::vector<VectorType *>> source_vectors_per_dof_handler(2);
+    for(VectorType & vec : checkpoint_vectors_velocity)
+      source_vectors_per_dof_handler[0 /* velocity */].push_back(&vec);
+    for(VectorType & vec : checkpoint_vectors_pressure)
+      source_vectors_per_dof_handler[1 /* pressure */].push_back(&vec);
+
+    std::vector<std::vector<VectorType *>> target_vectors_per_dof_handler(2);
+    for(VectorType & vec : checkpoint_vectors_velocity_intermediate)
+      target_vectors_per_dof_handler[0].push_back(&vec);
+    target_vectors_per_dof_handler[1] = vectors_pressure;
+
+    std::vector<dealii::DoFHandler<dim> const *> source_dof_handlers = {
+      dof_handler_u_restart.get(), dof_handler_p_restart.get()};
+
+    std::vector<dealii::DoFHandler<dim> const *> target_dof_handlers = {
+      dof_handler_u_restart_intermediate.get(), &this->get_dof_handler_p()};
+
+    this->pcout << "\n"
+                << "PROJECTION IN UNDEFORMED GRID\n\n";
+    ExaDG::GridToGridProjection::grid_to_grid_projection<dim, Number, VectorType>(
+      checkpoint_mapping,
+      source_dof_handlers,
+      source_vectors_per_dof_handler,
+      target_mapping,
+      target_dof_handlers,
+      target_vectors_per_dof_handler,
+      projection_data);
+
+    // Perform the grid-to-grid projection on the deformed grid to the final velocity space,
+    // but between grids that have the same refinement level and mapping to improve stability by
+    // *avoiding* `dealii::RemotePointEvaluation`.
+    projection_data.grids_and_maps_identical = true;
+
+    this->pcout << "\n"
+                << "VELOCITY PROJECTION IN DEFORMED GRID\n\n";
+
+    checkpoint_mapping = this->get_mapping();
+
+    std::vector<std::vector<VectorType *>> source_vectors_per_dof_handler(1);
+    for(VectorType & vec : checkpoint_vectors_velocity_intermediate)
+      source_vectors_per_dof_handler[0].push_back(&vec);
+
+    std::vector<std::vector<VectorType *>> target_vectors_per_dof_handler = {vectors_velocity};
+
+    std::vector<dealii::DoFHandler<dim> const *> source_dof_handlers = {
+      dof_handler_u_restart_intermediate.get()};
+
+    std::vector<dealii::DoFHandler<dim> const *> target_dof_handlers = {&this->get_dof_handler_u()};
+
+    ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
+      checkpoint_mapping,
+      source_dof_handlers,
+      source_vectors_per_dof_handler,
+      target_dof_handlers,
+      *matrix_free,
+      target_vectors_per_dof_handler,
+      projection_data);
+
+    // Set pointers to velocity vectors for plotting.
+    checkpoint_vectors[0 /* velocity */]      = source_vectors_per_dof_handler[0];
+    checkpoint_dof_handlers[0 /* velocity */] = source_dof_handlers[0];
+  }
+  else
+  {
+    // Using `SpatialDiscretization::L2` or projecting in the deformed configuration, we can
+    // perform the grid-to-grid projection straight away only adapting the mapping of the existing
+    // `MatrixFree` object
+    if(param.restart_data.requires_mapping_reset())
+    {
+      // Attaching manifolds, we assume that we at least refine once. We do not support coarsening
+      // (undoing the refinement without the manifold) and subsequent refinement.
+      dealii::Triangulation<dim> const & triangulation =
+        matrix_free->get_dof_handler().get_triangulation();
+      std::vector<dealii::types::manifold_id> manifold_ids = triangulation.get_manifold_ids();
+      AssertThrow(manifold_ids.size() == 1 and manifold_ids[0] == dealii::numbers::flat_manifold_id,
+                  dealii::ExcMessage("Combination of manifolds and grid-to-grid projection "
+                                     "in unmapped grid at restart not supported."));
 
       // Create dummy linear mapping since we have no mapping serialized to restore.
+      std::shared_ptr<dealii::Mapping<dim>> default_mapping;
+      GridUtilities::create_mapping(default_mapping,
+                                    get_element_type(triangulation),
+                                    1 /* mapping_degree */);
+
+      // Update `MatrixFree` mapping, needs to be restored after grid-to-grid projection.
+      matrix_free_mutable->update_mapping(*default_mapping);
+    }
+
+    ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
+      checkpoint_mapping,
+      checkpoint_dof_handlers,
+      checkpoint_vectors,
+      dof_handlers,
+      *matrix_free,
+      vectors_per_dof_handler,
+      projection_data);
+
+    // Restore the mapping in `MatrixFree` to continue with the requested mapping after restart.
+    if(param.restart_data.requires_mapping_reset())
+    {
+      matrix_free_mutable->update_mapping(*this->get_mapping());
+    }
+  }
+
+  // `dealii::MatrixFree` does not enforce the periodic constraints on the vector;
+  // enforce the constraints for visual comparison purposes.
+  for(unsigned int i = 0; i < vectors_velocity.size(); ++i)
+    distribute_constraint_u(*vectors_velocity[i]);
+
+  // Triangulations attached to DoFHandlers might not match if we use the final projection to
+  // plot. Write velocity and pressure separate.
+  if(param.restart_data.write_vectors_to_vtu)
+  {
+    this->pcout << "Writing restart vectors to .vtu files\n";
+    OutputDataBase output_data;
+    output_data.directory = "output/";
+    output_data.degree    = param.degree_u;
+    std::vector<bool> component_is_part_of_vector(dim, true);
+
+    if(this->param.restart_data.consider_mapping_read_target == false and
+       this->param.spatial_discretization == SpatialDiscretization::HDIV)
+    {
+      // TODO: keep the `checkpoint_mapping`.
       std::shared_ptr<dealii::Mapping<dim>> tmp;
       GridUtilities::create_mapping(tmp,
                                     get_element_type(*checkpoint_triangulation),
@@ -1359,297 +1523,23 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
       checkpoint_mapping = std::const_pointer_cast<dealii::Mapping<dim> const>(tmp);
     }
 
-    // Define grid-to-grid projection data for all projections used here.
-    ExaDG::GridToGridProjection::GridToGridProjectionData<dim> projection_data;
-    projection_data.grids_and_maps_identical        = false;
-    projection_data.solver_data                     = param.restart_data.solver_data;
-    projection_data.rpe_data.rtree_level            = param.restart_data.rpe_rtree_level;
-    projection_data.rpe_data.tolerance              = param.restart_data.rpe_tolerance_unit_cell;
-    projection_data.rpe_data.enforce_unique_mapping = param.restart_data.rpe_enforce_unique_mapping;
-
-    // Overwrite the velocity checkpoint `DoFHandler` and vectors in case we require an intermediate
-    // step for consistency. Data structures have to stay in scope for pointers to remain valid for
-    // projection and export to vtu.
-    std::shared_ptr<dealii::DoFHandler<dim>> dof_handler_u_restart_intermediate;
-    std::vector<VectorType>                  checkpoint_vectors_velocity_intermediate;
-    if(this->param.restart_data.consider_mapping_read_target == false and
-       this->param.spatial_discretization == SpatialDiscretization::HDIV)
     {
-      // Projecting the solution on the undeformed grid using `SpatialDicretization::HDIV` requires
-      // an intermediate step for the velocity as the mapped grid and DoFs define the field. First,
-      // project the saved state in the undeformed, but potentially refined grid, using
-      // `FE_DGQArbitraryNodes` to reduce projection costs if the spatial resolution is identical.
-      dealii::Triangulation<dim> const & triangulation =
-        matrix_free->get_dof_handler().get_triangulation();
-      initialize_dof_handler_restart(param.degree_u,
-                                     dim /* n_components */,
-                                     dof_handler_u_restart_intermediate,
-                                     triangulation);
-
-      checkpoint_vectors_velocity_intermediate.resize(checkpoint_vectors_velocity.size());
-      for(VectorType & vec : checkpoint_vectors_velocity_intermediate)
-        vec.reinit(dof_handler_u_restart_intermediate->locally_owned_dofs(),
-                   dof_handler_u_restart_intermediate->get_mpi_communicator());
-
-      // We assume that if the number of cells and number of refinement levels are identical, the
-      // grid is identical, since we do not support adaptive refinement.
-      bool const spatial_resolution_identical =
-        checkpoint_triangulation->n_global_levels() == triangulation.n_global_levels() and
-        checkpoint_triangulation->n_global_active_cells() == triangulation.n_global_active_cells();
-
-      if(spatial_resolution_identical == true)
-      {
-        this->pcout << "\n"
-                    << "USING IDENTICAL GRID\n\n";
-
-        // Use the projection onto the restart space with diagonal mass matrix.
-        std::vector<VectorType const *> src;
-        for(VectorType const & vec : checkpoint_vectors_velocity)
-          src.push_back(&vec);
-
-        this->pcout << "\n"
-                    << "VELOCITY PROJECTION TO INTERMEDIATE SPACE IN UNDEFORMED GRID\n\n";
-
-        project_to_restart_space(src,
-                                 *dof_handler_u_restart,
-                                 *checkpoint_mapping,
-                                 checkpoint_vectors_velocity_intermediate,
-                                 *dof_handler_u_restart_intermediate);
-
-        this->pcout << "\n"
-                    << "PRESSURE PROJECTION IN UNDEFORMED GRID\n\n";
-        // We do not introduce an intermediate space for the pressure, project in the undeformed
-        // grid resetting the mapping in the `MatrixFree` object.
-        {
-          // Attaching manifolds, we assume that we at least refine once. We do not support
-          // coarsening (undoing the refinement without the manifold) and subsequent refinement.
-          dealii::Triangulation<dim> const & triangulation =
-            matrix_free->get_dof_handler().get_triangulation();
-          std::vector<dealii::types::manifold_id> manifold_ids = triangulation.get_manifold_ids();
-          AssertThrow(manifold_ids.size() == 1 and
-                        manifold_ids[0] == dealii::numbers::flat_manifold_id,
-                      dealii::ExcMessage("Combination of manifolds and grid-to-grid projection "
-                                         "in unmapped grid at restart not supported."));
-
-          // Create dummy linear mapping for projection on undeformed grid.
-          std::shared_ptr<dealii::Mapping<dim>> default_mapping;
-          GridUtilities::create_mapping(default_mapping,
-                                        get_element_type(triangulation),
-                                        1 /* mapping_degree */);
-
-          // Update `MatrixFree` mapping, needs to be restored after grid-to-grid projection.
-          matrix_free_mutable->update_mapping(*default_mapping);
-
-          // Grid-to-grid projection for pressure to final finite element space. The DoFs can simply
-          // be used on the deformed grid, while projection is more stable in the undeformed
-          // configuration.
-          std::vector<std::vector<VectorType *>> source_vectors_per_dof_handler(1);
-          for(VectorType & vec : checkpoint_vectors_pressure)
-            source_vectors_per_dof_handler[0].push_back(&vec);
-
-          std::vector<std::vector<VectorType *>> target_vectors_per_dof_handler = {
-            vectors_pressure};
-
-          std::vector<dealii::DoFHandler<dim> const *> source_dof_handlers = {
-            dof_handler_p_restart.get()};
-
-          std::vector<dealii::DoFHandler<dim> const *> target_dof_handlers = {
-            &this->get_dof_handler_p()};
-
-          ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
-            checkpoint_mapping,
-            source_dof_handlers,
-            source_vectors_per_dof_handler,
-            target_dof_handlers,
-            *matrix_free,
-            target_vectors_per_dof_handler,
-            projection_data,
-            {1} /* dof_index */,
-            {1} /* quad_index */);
-
-          // Restore the mapping in `MatrixFree` to continue with the requested mapping after
-          // restart.
-          matrix_free_mutable->update_mapping(*this->get_mapping());
-
-          // Set pointers to pressure vectors for plotting.
-          checkpoint_vectors[1 /* pressure */]      = source_vectors_per_dof_handler[0];
-          checkpoint_dof_handlers[1 /* pressure */] = source_dof_handlers[0];
-        }
-      }
-      else
-      {
-        // Perform grid-to-grid projection in the undeformed configuration with different grids,
-        // this constructs a new `MatrixFree` object since the `DoFHandler` used differs. This
-        // approach avoids resetting the mapping of the standard `MatrixFree` object.
-
-        dealii::Triangulation<dim> const & triangulation =
-          matrix_free->get_dof_handler().get_triangulation();
-
-        // Create dummy linear mapping in target grid, cannot use `checkpoint_mapping` since cell
-        // type might differ.
-        std::shared_ptr<dealii::Mapping<dim> const> target_mapping;
-        {
-          std::shared_ptr<dealii::Mapping<dim>> tmp;
-          GridUtilities::create_mapping(tmp,
-                                        get_element_type(triangulation),
-                                        1 /* mapping_degree */);
-          target_mapping = std::const_pointer_cast<dealii::Mapping<dim> const>(tmp);
-        }
-
-        // Grid-to-grid projection in undeformed configuration: velocity to intermediate space and
-        // pressure to final space. The pressure DoFs can simply be used on the deformed grid, while
-        // projection is more stable in the undeformed configuration.
-        std::vector<std::vector<VectorType *>> source_vectors_per_dof_handler(2);
-        for(VectorType & vec : checkpoint_vectors_velocity)
-          source_vectors_per_dof_handler[0 /* velocity */].push_back(&vec);
-        for(VectorType & vec : checkpoint_vectors_pressure)
-          source_vectors_per_dof_handler[1 /* pressure */].push_back(&vec);
-
-        std::vector<std::vector<VectorType *>> target_vectors_per_dof_handler(2);
-        for(VectorType & vec : checkpoint_vectors_velocity_intermediate)
-          target_vectors_per_dof_handler[0].push_back(&vec);
-        target_vectors_per_dof_handler[1] = vectors_pressure;
-
-        std::vector<dealii::DoFHandler<dim> const *> source_dof_handlers = {
-          dof_handler_u_restart.get(), dof_handler_p_restart.get()};
-
-        std::vector<dealii::DoFHandler<dim> const *> target_dof_handlers = {
-          dof_handler_u_restart_intermediate.get(), &this->get_dof_handler_p()};
-
-        this->pcout << "\n"
-                    << "PROJECTION IN UNDEFORMED GRID\n\n";
-        ExaDG::GridToGridProjection::grid_to_grid_projection<dim, Number, VectorType>(
-          checkpoint_mapping,
-          source_dof_handlers,
-          source_vectors_per_dof_handler,
-          target_mapping,
-          target_dof_handlers,
-          target_vectors_per_dof_handler,
-          projection_data);
-      }
-
-      // Perform the grid-to-grid projection on the deformed grid to the final velocity space,
-      // but between grids that have the same refinement level and mapping to improve stability by
-      // *avoiding* `dealii::RemotePointEvaluation`.
-      projection_data.grids_and_maps_identical = true;
-
-      this->pcout << "\n"
-                  << "VELOCITY PROJECTION IN DEFORMED GRID\n\n";
-
-      checkpoint_mapping = this->get_mapping();
-
-      std::vector<std::vector<VectorType *>> source_vectors_per_dof_handler(1);
-      for(VectorType & vec : checkpoint_vectors_velocity_intermediate)
-        source_vectors_per_dof_handler[0].push_back(&vec);
-
-      std::vector<std::vector<VectorType *>> target_vectors_per_dof_handler = {vectors_velocity};
-
-      std::vector<dealii::DoFHandler<dim> const *> source_dof_handlers = {
-        dof_handler_u_restart_intermediate.get()};
-
-      std::vector<dealii::DoFHandler<dim> const *> target_dof_handlers = {
-        &this->get_dof_handler_u()};
-
-      ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
-        checkpoint_mapping,
-        source_dof_handlers,
-        source_vectors_per_dof_handler,
-        target_dof_handlers,
-        *matrix_free,
-        target_vectors_per_dof_handler,
-        projection_data);
-
-      // Set pointers to velocity vectors for plotting.
-      checkpoint_vectors[0 /* velocity */]      = source_vectors_per_dof_handler[0];
-      checkpoint_dof_handlers[0 /* velocity */] = source_dof_handlers[0];
+      output_data.filename = "projected_velocity_read_restart";
+      VectorWriter<dim, Number> vector_writer(output_data, 0 /* output_counter */, mpi_comm);
+      std::vector<std::string>  names_u_restart(dim, "velocity_projected");
+      vector_writer.add_data_vector(*checkpoint_vectors[0 /* velocity */][0],
+                                    *checkpoint_dof_handlers[0 /* velocity */],
+                                    names_u_restart,
+                                    component_is_part_of_vector);
+      vector_writer.write_pvtu(checkpoint_mapping.get());
     }
-    else
     {
-      // Using `SpatialDiscretization::L2` or projecting in the deformed configuration, we can
-      // perform the grid-to-grid projection straight away only adapting the mapping of the existing
-      // `MatrixFree` object
-      if(param.restart_data.requires_mapping_reset())
-      {
-        // Attaching manifolds, we assume that we at least refine once. We do not support coarsening
-        // (undoing the refinement without the manifold) and subsequent refinement.
-        dealii::Triangulation<dim> const & triangulation =
-          matrix_free->get_dof_handler().get_triangulation();
-        std::vector<dealii::types::manifold_id> manifold_ids = triangulation.get_manifold_ids();
-        AssertThrow(manifold_ids.size() == 1 and
-                      manifold_ids[0] == dealii::numbers::flat_manifold_id,
-                    dealii::ExcMessage("Combination of manifolds and grid-to-grid projection "
-                                       "in unmapped grid at restart not supported."));
-
-        // Create dummy linear mapping since we have no mapping serialized to restore.
-        std::shared_ptr<dealii::Mapping<dim>> default_mapping;
-        GridUtilities::create_mapping(default_mapping,
-                                      get_element_type(triangulation),
-                                      1 /* mapping_degree */);
-
-        // Update `MatrixFree` mapping, needs to be restored after grid-to-grid projection.
-        matrix_free_mutable->update_mapping(*default_mapping);
-      }
-
-      ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
-        checkpoint_mapping,
-        checkpoint_dof_handlers,
-        checkpoint_vectors,
-        dof_handlers,
-        *matrix_free,
-        vectors_per_dof_handler,
-        projection_data);
-
-      // Restore the mapping in `MatrixFree` to continue with the requested mapping after restart.
-      if(param.restart_data.requires_mapping_reset())
-      {
-        matrix_free_mutable->update_mapping(*this->get_mapping());
-      }
-    }
-
-    // `dealii::MatrixFree` does not enforce the periodic constraints on the vector;
-    // enforce the constraints for visual comparison purposes.
-    for(unsigned int i = 0; i < vectors_velocity.size(); ++i)
-      distribute_constraint_u(*vectors_velocity[i]);
-
-    // Triangulations attached to DoFHandlers might not match if we use the final projection to
-    // plot. Write velocity and pressure separate.
-    if(param.restart_data.write_vectors_to_vtu)
-    {
-      this->pcout << "Writing restart vectors to .vtu files\n";
-      OutputDataBase output_data;
-      output_data.directory = "output/";
-      output_data.degree    = param.degree_u;
-      std::vector<bool> component_is_part_of_vector(dim, true);
-
-      if(this->param.restart_data.consider_mapping_read_target == false and
-         this->param.spatial_discretization == SpatialDiscretization::HDIV)
-      {
-        // TODO: keep the `checkpoint_mapping`.
-        std::shared_ptr<dealii::Mapping<dim>> tmp;
-        GridUtilities::create_mapping(tmp,
-                                      get_element_type(*checkpoint_triangulation),
-                                      1 /* mapping_degree */);
-        checkpoint_mapping = std::const_pointer_cast<dealii::Mapping<dim> const>(tmp);
-      }
-
-      {
-        output_data.filename = "projected_velocity_read_restart";
-        VectorWriter<dim, Number> vector_writer(output_data, 0 /* output_counter */, mpi_comm);
-        std::vector<std::string>  names_u_restart(dim, "velocity_projected");
-        vector_writer.add_data_vector(*checkpoint_vectors[0 /* velocity */][0],
-                                      *checkpoint_dof_handlers[0 /* velocity */],
-                                      names_u_restart,
-                                      component_is_part_of_vector);
-        vector_writer.write_pvtu(checkpoint_mapping.get());
-      }
-      {
-        output_data.filename = "projected_pressure_read_restart";
-        VectorWriter<dim, Number> vector_writer(output_data, 0 /* output_counter */, mpi_comm);
-        vector_writer.add_data_vector(*checkpoint_vectors[1 /* pressure */][0],
-                                      *checkpoint_dof_handlers[1 /* pressure */],
-                                      {"pressure_projected"});
-        vector_writer.write_pvtu(checkpoint_mapping.get());
-      }
+      output_data.filename = "projected_pressure_read_restart";
+      VectorWriter<dim, Number> vector_writer(output_data, 0 /* output_counter */, mpi_comm);
+      vector_writer.add_data_vector(*checkpoint_vectors[1 /* pressure */][0],
+                                    *checkpoint_dof_handlers[1 /* pressure */],
+                                    {"pressure_projected"});
+      vector_writer.write_pvtu(checkpoint_mapping.get());
     }
   }
 

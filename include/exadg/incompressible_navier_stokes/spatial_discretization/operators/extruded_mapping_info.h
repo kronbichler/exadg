@@ -122,7 +122,7 @@ group_cells_by_left_neighbors(
   else if(cell->has_children())
   {
     AssertThrow(cell->n_children() == dealii::Utilities::pow(2, dim) &&
-                cell->reference_cell().is_hyper_cube(),
+                  cell->reference_cell().is_hyper_cube(),
                 dealii::ExcMessage("Only hypercube elements allowed for this code path"));
 
     for(unsigned int child = 0; child < cell->n_children(); ++child)
