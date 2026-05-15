@@ -104,13 +104,13 @@ evaluate_convergence_study(MPI_Comm const &                 mpi_comm,
 
         if(labels.size() == 0)
         {
-          std::cout << "Could not detect any files matching \"" << directory
-                    << "run_\". No convergence table to display.";
+          std::cout << "Could not detect any files matching \"" << directory << "run_\".\n"
+                    << "No convergence table to display.";
         }
         else if(max_run_id == 0)
         {
-          std::cout << "Only detected files with run_id = 0 matching \"" << directory
-                    << "run_\". Not enough data to display convergence table.";
+          std::cout << "Only detected files with run_id = 0 matching \"" << directory << "run_\".\n"
+                    << "Not enough data to display convergence table.";
         }
         else
         {

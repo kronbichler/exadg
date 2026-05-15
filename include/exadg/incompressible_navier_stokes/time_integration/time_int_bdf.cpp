@@ -731,8 +731,8 @@ TimeIntBDF<dim, Number>::postprocessing() const
     velocity_error.add(-1.0, get_velocity());
     pressure_error.add(-1.0, get_pressure());
 
-    postprocessor->do_postprocessing(velocity_error, // error!
-                                     pressure_error, // error!
+    postprocessor->do_postprocessing(velocity_error,
+                                     pressure_error,
                                      this->get_time(),
                                      this->get_time_step_number());
   }

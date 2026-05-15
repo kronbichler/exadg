@@ -46,7 +46,7 @@ enum class BoundaryCondition
  * (Navier-)Stokes equations, where the convective term may be disabled
  * u     ... velocity vector
  * p     ... kinematic pressure
- * nu    ... kinematic viscosity
+ * mu    ... dynamic viscosity
  * rho   ... density
  * f     ... body force vector
  * sigma ... Cauchy stress
@@ -55,11 +55,11 @@ enum class BoundaryCondition
  *
  * with
  *
- * sigma := -p * I + 2 * nu * sym_grad(u)
+ * sigma := -p * I + 2 * mu * sym_grad(u)
  *
  * such that with variable viscosity we have
  *
- * d/dt(u) + (grad(u)) * u + grad(p) - nu * div(grad(u)) - 2 * sym_grad(u) * grad(nu) = f
+ * d/dt(u) + (grad(u)) * u + grad(p) - mu/rho * div(grad(u)) - 2 * sym_grad(u) * grad(mu/rho) = f
  *
  * In 2D, we derive a solution by setting
  *
@@ -75,7 +75,7 @@ enum class BoundaryCondition
  *
  * and insert into the generalized Carreau-Yasuda law
  *
- * nu := nu_oo + (nu_0 - nu_oo) * [kappa + (lambda*shear_rate)^a]^[(n-1)/a]
+ * nu = mu/rho = nu_oo + (nu_0 - nu_oo) * [kappa + (lambda*shear_rate)^a]^[(n-1)/a]
  *
  * to derive a suitable body force vector f from the momentum balance equation.
  */
