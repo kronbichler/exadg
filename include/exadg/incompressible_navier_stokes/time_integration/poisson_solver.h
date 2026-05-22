@@ -84,7 +84,8 @@ make_periodicity_constraints_recursively(const FaceIterator &                   
 {
   if(face_1->has_children())
   {
-    AssertThrow(face_2->has_children(), ExcInternalError());
+    if (!face_2->has_children())
+      return;
     for(unsigned int i = 0; i < face_1->n_children(); ++i)
       make_periodicity_constraints_recursively(face_1->child(i),
                                                face_2->child(i),
