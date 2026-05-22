@@ -84,7 +84,7 @@ make_periodicity_constraints_recursively(const FaceIterator &                   
 {
   if(face_1->has_children())
   {
-    if (!face_2->has_children())
+    if(!face_2->has_children())
       return;
     for(unsigned int i = 0; i < face_1->n_children(); ++i)
       make_periodicity_constraints_recursively(face_1->child(i),
@@ -142,6 +142,25 @@ public:
         touched_dof[dof] = 1;
       else
         dof = numbers::invalid_unsigned_int;
+
+    for(unsigned int cell = 0; cell < operator_fine.get_matrix_free().n_cell_batches(); ++cell)
+    {
+      for(unsigned int v = 0;
+          v < operator_fine.get_matrix_free().n_active_entries_per_cell_batch(cell);
+          ++v)
+      {
+        AssertThrow(
+          operator_fine.get_matrix_free().get_cell_iterator(cell, v)->level() ==
+              operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->level() &&
+            operator_fine.get_matrix_free().get_cell_iterator(cell, v)->index() ==
+              operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->index(),
+          ExcMessage(
+            "Mismatch in cells " +
+            operator_fine.get_matrix_free().get_cell_iterator(cell, v)->id().to_string() + " vs " +
+            operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->id().to_string() + " " +
+            std::to_string(cell) + " " + std::to_string(v)));
+      }
+    }
 
     all_indices_unconstrained.resize(fine_dof_indices.size() / n_lanes, 0);
 
@@ -408,7 +427,7 @@ public:
       level_constraints[level].close();
 
       typename dealii::MatrixFree<dim, Number>::AdditionalData mf_data;
-      if(level >= coarse_triangulations.size())
+      if(level + 1 >= coarse_triangulations.size())
         mf_data.cell_vectorization_category = cell_vectorization_category;
 
       // renumber Dofs to minimize the number of partitions in import
@@ -432,7 +451,9 @@ public:
           mg_matrices[level].reinit(mapping_coarse,
                                     dof_h,
                                     level_constraints[level],
-                                    {},
+                                    level + 1 < coarse_triangulations.size() ?
+                                      std::vector<unsigned int>() :
+                                      cell_vectorization_category,
                                     dealii::QGauss<1>(dof_h.get_fe().degree + 1));
         }
         else
@@ -441,7 +462,9 @@ public:
           mg_matrices[level].reinit(mapping_coarse,
                                     dof_h,
                                     level_constraints[level],
-                                    {},
+                                    level + 1 < coarse_triangulations.size() ?
+                                      std::vector<unsigned int>() :
+                                      cell_vectorization_category,
                                     dealii::QGauss<1>(dof_h.get_fe().degree + 1));
         }
       }
