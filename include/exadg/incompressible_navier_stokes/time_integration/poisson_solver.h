@@ -67,6 +67,259 @@ make_zero_mean(const std::vector<unsigned int> &                    constrained_
 }
 
 
+// Manually implement periodicity constraints, because the deal.II
+// implementation places the constraints the 'wrong' way around, leading to a
+// case with more unknowns on the processor with the lower rank and less on
+// the higher ranks. This function constrains the unknown on the lower-left
+// boundary by the one on the upper-right boundary. This is coherent with the
+// strategy that DoFs on interfaces of two processes are assigned to the
+// process with lower rank.
+namespace Periodicity
+{
+template<typename FaceIterator, typename Number>
+void
+make_periodicity_constraints_recursively(const FaceIterator &                             face_1,
+                                         const std_cxx20::type_identity_t<FaceIterator> & face_2,
+                                         AffineConstraints<Number> & affine_constraints)
+{
+  if(face_1->has_children())
+  {
+    AssertThrow(face_2->has_children(), ExcInternalError());
+    for(unsigned int i = 0; i < face_1->n_children(); ++i)
+      make_periodicity_constraints_recursively(face_1->child(i),
+                                               face_2->child(i),
+                                               affine_constraints);
+  }
+  else
+  {
+    const unsigned int                   dofs_per_face = face_1->get_fe(0).n_dofs_per_face(0);
+    std::vector<types::global_dof_index> dofs_1(dofs_per_face);
+    std::vector<types::global_dof_index> dofs_2(dofs_per_face);
+
+    face_1->get_dof_indices(dofs_1, 0);
+    face_2->get_dof_indices(dofs_2, 0);
+    for(unsigned int i = 0; i < dofs_per_face; ++i)
+      if(dofs_1[i] == numbers::invalid_dof_index || dofs_2[i] == numbers::invalid_dof_index)
+        return;
+    for(unsigned int i = 0; i < dofs_per_face; ++i)
+    {
+      if(!affine_constraints.is_constrained(dofs_1[i]))
+        affine_constraints.add_constraint(dofs_1[i], {{dofs_2[i], 1.0}});
+    }
+  }
+}
+
+} // namespace Periodicity
+
+
+
+template<int dim, typename Number>
+class MGTwoLevelTransferFromOperator
+  : public MGTwoLevelTransferBase<dim, LinearAlgebra::distributed::Vector<Number>>
+{
+public:
+  using VectorType                      = LinearAlgebra::distributed::Vector<Number>;
+  static constexpr unsigned int n_lanes = VectorizedArray<Number>::size();
+
+  MGTwoLevelTransferFromOperator(const LaplaceOperatorFE<dim, Number> & operator_fine,
+                                 const LaplaceOperatorFE<dim, Number> & operator_coarse)
+    : operator_fine(operator_fine), operator_coarse(operator_coarse)
+  {
+    // find unique indices of prolongation to identify the actual read pattern
+    fine_dof_indices = operator_fine.get_compressed_dof_indices();
+    const unsigned int degree_fine =
+      operator_fine.get_matrix_free().get_dof_handler().get_fe().degree;
+    const unsigned int degree_coarse =
+      operator_coarse.get_matrix_free().get_dof_handler().get_fe().degree;
+    const unsigned int n_owned_dofs =
+      operator_fine.get_matrix_free().get_dof_handler().locally_owned_dofs().n_elements();
+    std::vector<char> touched_dof(n_owned_dofs, 0);
+    for(unsigned int & dof : fine_dof_indices)
+      if(dof >= n_owned_dofs)
+        dof = numbers::invalid_unsigned_int;
+      else if(touched_dof[dof] == 0)
+        touched_dof[dof] = 1;
+      else
+        dof = numbers::invalid_unsigned_int;
+
+    all_indices_unconstrained.resize(fine_dof_indices.size() / n_lanes, 0);
+
+    std::vector<Polynomials::Polynomial<double>> poly_coarse =
+      Polynomials::generate_complete_Lagrange_basis(
+        QGaussLobatto<1>(degree_coarse + 1).get_points());
+    std::vector<Point<1>> points_fine(QGaussLobatto<1>(degree_fine + 1).get_points());
+    prolongation_matrix.reinit(degree_coarse + 1, degree_fine + 1);
+    for(unsigned int i = 0; i < prolongation_matrix.m(); ++i)
+      for(unsigned int j = 0; j < prolongation_matrix.n(); ++j)
+        prolongation_matrix(i, j) = poly_coarse[i].value(points_fine[j][0]);
+    prolongation_matrix_data.resize(prolongation_matrix.m() * prolongation_matrix.n());
+    for(unsigned int i = 0, c = 0; i < prolongation_matrix.m(); ++i)
+      for(unsigned int j = 0; j < prolongation_matrix.n(); ++j, ++c)
+        prolongation_matrix_data[c] = prolongation_matrix(i, j);
+  }
+
+  /**
+   * @copydoc MGTwoLevelTransferBase::prolongate_and_add
+   */
+  void
+  prolongate_and_add(VectorType & dst, const VectorType & src) const override
+  {
+    src.update_ghost_values();
+
+    const unsigned int size_fine = prolongation_matrix.n();
+    const unsigned int n_cell_batches =
+      fine_dof_indices.size() / n_lanes / Utilities::pow(std::min(3u, size_fine), dim);
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      if(size_fine == 2)
+        do_prolongate_and_add_on_cell<2>(cell, dst, src);
+      else if(size_fine == 3)
+        do_prolongate_and_add_on_cell<3>(cell, dst, src);
+      else if(size_fine == 4)
+        do_prolongate_and_add_on_cell<4>(cell, dst, src);
+      else if(size_fine == 5)
+        do_prolongate_and_add_on_cell<5>(cell, dst, src);
+      else if(size_fine == 6)
+        do_prolongate_and_add_on_cell<6>(cell, dst, src);
+      else if(size_fine == 7)
+        do_prolongate_and_add_on_cell<7>(cell, dst, src);
+      else if(size_fine == 8)
+        do_prolongate_and_add_on_cell<8>(cell, dst, src);
+      else if(size_fine == 9)
+        do_prolongate_and_add_on_cell<9>(cell, dst, src);
+      else
+        AssertThrow(false,
+                    ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
+                               " not instantiated"));
+    }
+
+    src.zero_out_ghost_values();
+  }
+
+  /**
+   * @copydoc MGTwoLevelTransferBase::restrict_and_add
+   */
+  void
+  restrict_and_add(VectorType & dst, const VectorType & src) const override
+  {
+    const unsigned int size_fine = prolongation_matrix.n();
+    const unsigned int n_cell_batches =
+      fine_dof_indices.size() / n_lanes /
+      Utilities::pow(std::min<unsigned int>(3u, prolongation_matrix.n()), dim);
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      if(size_fine == 2)
+        do_restrict_and_add_on_cell<2>(cell, dst, src);
+      else if(size_fine == 3)
+        do_restrict_and_add_on_cell<3>(cell, dst, src);
+      else if(size_fine == 4)
+        do_restrict_and_add_on_cell<4>(cell, dst, src);
+      else if(size_fine == 5)
+        do_restrict_and_add_on_cell<5>(cell, dst, src);
+      else if(size_fine == 6)
+        do_restrict_and_add_on_cell<6>(cell, dst, src);
+      else if(size_fine == 7)
+        do_restrict_and_add_on_cell<7>(cell, dst, src);
+      else if(size_fine == 8)
+        do_restrict_and_add_on_cell<8>(cell, dst, src);
+      else if(size_fine == 9)
+        do_restrict_and_add_on_cell<9>(cell, dst, src);
+      else
+        AssertThrow(false,
+                    ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
+                               " not instantiated"));
+    }
+
+    dst.compress(VectorOperation::add);
+  }
+
+  void
+  interpolate(VectorType &, const VectorType &) const override
+  {
+    AssertThrow(false, ExcNotImplemented());
+  }
+
+  std::pair<bool, bool>
+  enable_inplace_operations_if_possible(
+    const std::shared_ptr<const Utilities::MPI::Partitioner> &,
+    const std::shared_ptr<const Utilities::MPI::Partitioner> &) override
+  {
+    return std::make_pair(true, true);
+  }
+
+  std::size_t
+  memory_consumption() const override
+  {
+    return MemoryConsumption::memory_consumption(fine_dof_indices) +
+           MemoryConsumption::memory_consumption(all_indices_unconstrained) +
+           prolongation_matrix.memory_consumption() + prolongation_matrix_data.memory_consumption();
+  }
+
+  std::pair<const DoFHandler<dim> *, unsigned int>
+  get_dof_handler_fine() const override
+  {
+    return std::make_pair(&operator_fine.get_matrix_free().get_dof_handler(),
+                          numbers::invalid_unsigned_int);
+  }
+
+private:
+  const LaplaceOperatorFE<dim, Number> & operator_fine;
+  const LaplaceOperatorFE<dim, Number> & operator_coarse;
+  std::vector<unsigned int>              fine_dof_indices;
+  std::vector<unsigned char>             all_indices_unconstrained;
+  FullMatrix<Number>                     prolongation_matrix;
+  AlignedVector<Number>                  prolongation_matrix_data;
+
+  template<int size_fine>
+  void
+  do_prolongate_and_add_on_cell(const unsigned int cell,
+                                VectorType &       dst,
+                                const VectorType & src) const
+  {
+    constexpr int size_coarse = get_coarser_fe_degree(size_fine - 1) + 1;
+    AssertDimension(prolongation_matrix.m(), size_coarse);
+    VectorizedArray<Number> tmp[Utilities::pow(size_fine, dim)];
+
+    operator_coarse.template read_dof_values<size_coarse - 1>(cell, src, tmp);
+    dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_general,
+                                                  dealii::internal::EvaluatorQuantity::value,
+                                                  dim,
+                                                  size_coarse,
+                                                  size_fine>::do_forward(1,
+                                                                         prolongation_matrix_data,
+                                                                         tmp,
+                                                                         tmp);
+
+    operator_fine.template distribute_local_to_global_compressed<size_fine - 1, size_fine, 1>(
+      dst, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
+  }
+
+  template<int size_fine>
+  void
+  do_restrict_and_add_on_cell(const unsigned int cell,
+                              VectorType &       dst,
+                              const VectorType & src) const
+  {
+    constexpr int size_coarse = get_coarser_fe_degree(size_fine - 1) + 1;
+    AssertDimension(prolongation_matrix.m(), size_coarse);
+    VectorizedArray<Number> tmp[Utilities::pow(size_fine, dim)];
+
+    operator_fine.template read_dof_values_compressed<size_fine - 1, size_fine, 1>(
+      src, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
+    dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_general,
+                                                  dealii::internal::EvaluatorQuantity::value,
+                                                  dim,
+                                                  size_coarse,
+                                                  size_fine>::do_backward(1,
+                                                                          prolongation_matrix_data,
+                                                                          false,
+                                                                          tmp,
+                                                                          tmp);
+    operator_coarse.template distribute_local_to_global<size_coarse - 1>(cell, tmp, dst);
+  }
+};
+
+
 
 template<int dim, typename Number = float>
 class PoissonPreconditionerMG
@@ -126,25 +379,31 @@ public:
       level_constraints[level].reinit(dof_h.locally_owned_dofs(),
                                       dealii::DoFTools::extract_locally_relevant_dofs(dof_h));
 
+      // Collect matching periodic cells on the coarsest level:
       dealii::ndarray<unsigned int, dim, 2> periodic_ids;
       for(unsigned int d = 0; d < dim; ++d)
         for(unsigned int e = 0; e < 2; ++e)
           periodic_ids[d][e] = numbers::invalid_unsigned_int;
-      {
-        for(const auto & cell : dof_h.cell_iterators_on_level(0))
-          for(unsigned int d = 0; d < dim; ++d)
-            if(cell->at_boundary(2 * d) && cell->has_periodic_neighbor(2 * d))
-            {
-              periodic_ids[d][0] = cell->face(2 * d)->boundary_id();
-              periodic_ids[d][1] = cell->periodic_neighbor(2 * d)
-                                     ->face(cell->periodic_neighbor_face_no(2 * d))
-                                     ->boundary_id();
-            }
+      for(const auto & cell : dof_h.cell_iterators_on_level(0))
         for(unsigned int d = 0; d < dim; ++d)
-          if(periodic_ids[d][0] != numbers::invalid_unsigned_int)
-            dealii::DoFTools::make_periodicity_constraints(
-              dof_h, periodic_ids[d][0], periodic_ids[d][1], d, level_constraints[level]);
-      }
+          if(cell->at_boundary(2 * d) && cell->has_periodic_neighbor(2 * d))
+          {
+            periodic_ids[d][0] = cell->face(2 * d)->boundary_id();
+            periodic_ids[d][1] = cell->periodic_neighbor(2 * d)
+                                   ->face(cell->periodic_neighbor_face_no(2 * d))
+                                   ->boundary_id();
+          }
+      std::vector<GridTools::PeriodicFacePair<typename DoFHandler<dim>::cell_iterator>>
+        periodic_faces;
+      for(unsigned int d = 0; d < dim; ++d)
+        if(periodic_ids[d][0] != numbers::invalid_unsigned_int)
+          GridTools::collect_periodic_faces(
+            dof_h, periodic_ids[d][0], periodic_ids[d][1], d, periodic_faces);
+      for(const auto & face_pair : periodic_faces)
+        Periodicity::make_periodicity_constraints_recursively(
+          face_pair.cell[0]->face(face_pair.face_idx[0]),
+          face_pair.cell[1]->face(face_pair.face_idx[1]),
+          level_constraints[level]);
       level_constraints[level].close();
 
       typename dealii::MatrixFree<dim, Number>::AdditionalData mf_data;
@@ -156,10 +415,11 @@ public:
       dealii::DoFRenumbering::matrix_free_data_locality(dof_h, level_constraints[level], mf_data);
       level_constraints[level].reinit(dof_h.locally_owned_dofs(),
                                       dealii::DoFTools::extract_locally_relevant_dofs(dof_h));
-      for(unsigned int d = 0; d < dim; ++d)
-        if(periodic_ids[d][0] != numbers::invalid_unsigned_int)
-          dealii::DoFTools::make_periodicity_constraints(
-            dof_h, periodic_ids[d][0], periodic_ids[d][1], d, level_constraints[level]);
+      for(const auto & face_pair : periodic_faces)
+        Periodicity::make_periodicity_constraints_recursively(
+          face_pair.cell[0]->face(face_pair.face_idx[0]),
+          face_pair.cell[1]->face(face_pair.face_idx[1]),
+          level_constraints[level]);
 
       level_constraints[level].close();
       if(level < coarse_triangulations.size())
@@ -194,16 +454,26 @@ public:
       // initialize transfer operator
       if(level > 0)
       {
-        auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();
-        transfer->reinit(dof_h,
-                         dof_handler_hierarchy[level - 1],
-                         level_constraints[level],
-                         level_constraints[level - 1]);
-        transfer->enable_inplace_operations_if_possible(
-          mg_matrices[level - 1].get_matrix_free().get_dof_info().vector_partitioner,
-          mg_matrices[level].get_matrix_free().get_dof_info().vector_partitioner);
+        if(level >= coarse_triangulations.size())
+        {
+          auto transfer =
+            std::make_unique<MGTwoLevelTransferFromOperator<dim, Number>>(mg_matrices[level],
+                                                                          mg_matrices[level - 1]);
+          mg_transfers[level - 1] = std::move(transfer);
+        }
+        else
+        {
+          auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();
+          transfer->reinit(dof_h,
+                           dof_handler_hierarchy[level - 1],
+                           level_constraints[level],
+                           level_constraints[level - 1]);
+          transfer->enable_inplace_operations_if_possible(
+            mg_matrices[level - 1].get_matrix_free().get_dof_info().vector_partitioner,
+            mg_matrices[level].get_matrix_free().get_dof_info().vector_partitioner);
 
-        mg_transfers[level - 1] = std::move(transfer);
+          mg_transfers[level - 1] = std::move(transfer);
+        }
       }
     }
 
@@ -338,16 +608,7 @@ public:
   {
     std::vector<unsigned int> p_levels({fe.degree});
     while(p_levels.back() > 1)
-    {
-      // pick the next coarser degree as half the previous degree; if
-      // integer division has remainder, use the nearest even degree (i.e.,
-      // we do steps like 2-1, 3-2-1, 4-2-1, 5-2-1, 6-3-2-1, 7-4-2-1, etc)
-      const unsigned int tentative_degree = p_levels.back() / 2;
-      if(p_levels.back() % 2 == 1 && tentative_degree % 2 == 1)
-        p_levels.push_back(tentative_degree + 1);
-      else
-        p_levels.push_back(tentative_degree);
-    }
+      p_levels.push_back(get_coarser_fe_degree(p_levels.back()));
     dealii::MGLevelObject<std::unique_ptr<dealii::FE_Q<dim>>> fes(0, p_levels.size() - 1);
     for(unsigned int level = 0; level < p_levels.size(); ++level)
       fes[level] = std::make_unique<dealii::FE_Q<dim>>(p_levels[p_levels.size() - 1 - level]);

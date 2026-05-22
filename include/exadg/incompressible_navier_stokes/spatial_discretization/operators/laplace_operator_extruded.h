@@ -41,6 +41,22 @@ namespace LaplaceOperator
 {
 using namespace dealii;
 
+
+// retrieve the coarsening sequence for p multigrid, defined in a central
+// place: pick the next coarser degree as half the previous degree; if integer
+// division has remainder, use the nearest even degree (i.e., we do steps like
+// 2-1, 3-2-1, 4-2-1, 5-2-1, 6-3-2-1, 7-4-2-1, etc)
+constexpr unsigned int
+get_coarser_fe_degree(const unsigned int degree)
+{
+  const unsigned int half = degree / 2;
+  if(degree % 2 == 1 && half % 2 == 1)
+    return half + 1;
+  else
+    return half;
+}
+
+
 template<int n_q_points_1d, int dim, typename Number>
 void
 compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data,
@@ -449,7 +465,7 @@ public:
                              VectorizedArray<Number> * dof_values,
                              VectorType &              dst) const
   {
-    if(degree <= 2)
+    if constexpr(degree <= 2)
     {
       constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
       const unsigned int *   dof_indices =
@@ -477,7 +493,7 @@ public:
                   const VectorType &        src,
                   VectorizedArray<Number> * dof_values) const
   {
-    if(degree <= 2)
+    if constexpr(degree <= 2)
     {
       constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
       const unsigned int *   dof_indices =
@@ -500,216 +516,10 @@ public:
         src, compressed_dof_indices, all_indices_unconstrained, cell, {}, true, dof_values);
   }
 
-
-private:
-  void
-  local_apply(const MatrixFree<dim, Number> &               data,
-              VectorType &                                  dst,
-              const VectorType &                            src,
-              const std::pair<unsigned int, unsigned int> & cell_range) const
+  const std::vector<unsigned int> &
+  get_compressed_dof_indices() const
   {
-    const unsigned int degree = data.get_shape_info().data[0].fe_degree;
-    for(unsigned int cell = cell_range.first; cell < cell_range.second; ++cell)
-    {
-      if(degree == 1)
-        do_cell_operation<1, true>(cell, src, dst);
-      else if(degree == 2)
-        do_cell_operation<2, true>(cell, src, dst);
-      else if(degree == 3)
-        do_cell_operation<3, true>(cell, src, dst);
-      else if(degree == 4)
-        do_cell_operation<4, true>(cell, src, dst);
-#ifndef DEBUG
-      else if(degree == 5)
-        do_cell_operation<5, true>(cell, src, dst);
-      else if(degree == 6)
-        do_cell_operation<6, true>(cell, src, dst);
-      else if(degree == 7)
-        do_cell_operation<7, true>(cell, src, dst);
-      else if(degree == 8)
-        do_cell_operation<8, true>(cell, src, dst);
-#endif
-      else
-        AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
-    }
-  }
-
-  void
-  local_compute_diagonal(const MatrixFree<dim, Number> & data,
-                         VectorType &                    dst,
-                         const unsigned int &,
-                         const std::pair<unsigned int, unsigned int> & cell_range) const
-  {
-    const unsigned int degree = data.get_shape_info().data[0].fe_degree;
-    for(unsigned int cell = cell_range.first; cell < cell_range.second; ++cell)
-    {
-      if(degree == 1)
-        do_cell_operation<1, false>(cell, dst, dst);
-      else if(degree == 2)
-        do_cell_operation<2, false>(cell, dst, dst);
-      else if(degree == 3)
-        do_cell_operation<3, false>(cell, dst, dst);
-      else if(degree == 4)
-        do_cell_operation<4, false>(cell, dst, dst);
-#ifndef DEBUG
-      else if(degree == 5)
-        do_cell_operation<5, false>(cell, dst, dst);
-      else if(degree == 6)
-        do_cell_operation<6, false>(cell, dst, dst);
-      else if(degree == 7)
-        do_cell_operation<7, false>(cell, dst, dst);
-      else if(degree == 8)
-        do_cell_operation<8, false>(cell, dst, dst);
-#endif
-      else
-        AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
-    }
-  }
-
-  template<int degree, bool evaluate_operator>
-  void
-  do_cell_operation(const unsigned int cell_index, const VectorType & src, VectorType & dst) const
-  {
-    constexpr unsigned int  n_q_points_1d = degree + 1;
-    constexpr unsigned int  n_q_points    = Utilities::pow(n_q_points_1d, dim);
-    VectorizedArray<Number> quad_values[n_q_points];
-
-    const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data =
-      matrix_free.get_shape_info().data[0];
-    if(evaluate_operator)
-    {
-      if(degree <= 2)
-      {
-        const unsigned int * dof_indices =
-          compressed_dof_indices.data() + cell_index * Utilities::pow(degree + 1, dim) * n_lanes;
-        const unsigned char * unconstrained =
-          all_indices_unconstrained.data() + cell_index * Utilities::pow(degree + 1, dim);
-        for(unsigned int i = 0; i < n_q_points; ++i)
-          if(unconstrained[i])
-            for(unsigned int v = 0; v < n_lanes; ++v)
-              quad_values[i][v] = src.local_element(dof_indices[i * n_lanes + v]);
-          else
-          {
-            quad_values[i] = VectorizedArray<Number>();
-            for(unsigned int v = 0; v < n_lanes; ++v)
-              if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
-                quad_values[i][v] = src.local_element(dof_indices[i * n_lanes + v]);
-          }
-
-        dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_evenodd,
-                                                      dealii::internal::EvaluatorQuantity::value,
-                                                      dim,
-                                                      degree + 1,
-                                                      degree + 1>::do_forward(1,
-                                                                              shape_data
-                                                                                .shape_values_eo,
-                                                                              quad_values,
-                                                                              quad_values);
-      }
-      else
-        read_dof_values_compressed<degree, n_q_points_1d, 1>(src,
-                                                             compressed_dof_indices,
-                                                             all_indices_unconstrained,
-                                                             cell_index,
-                                                             shape_data.shape_values_eo,
-                                                             false,
-                                                             quad_values);
-
-      if(factor_laplace != 0)
-        compute_cell_lapl<n_q_points_1d>(shape_data,
-                                         mapping_info,
-                                         cell_index,
-                                         factor_mass,
-                                         factor_laplace,
-                                         quad_values,
-                                         quad_values);
-      else
-        AssertThrow(false, ExcNotImplemented());
-
-      if(degree <= 2)
-      {
-        dealii::internal::FEEvaluationImplBasisChange<
-          dealii::internal::evaluate_evenodd,
-          dealii::internal::EvaluatorQuantity::value,
-          dim,
-          degree + 1,
-          degree + 1>::do_backward(1, shape_data.shape_values_eo, false, quad_values, quad_values);
-        const unsigned int * dof_indices =
-          compressed_dof_indices.data() + cell_index * Utilities::pow(degree + 1, dim) * n_lanes;
-        const unsigned char * unconstrained =
-          all_indices_unconstrained.data() + cell_index * Utilities::pow(degree + 1, dim);
-        for(unsigned int i = 0; i < n_q_points; ++i)
-          if(unconstrained[i])
-            for(unsigned int v = 0; v < n_lanes; ++v)
-              dst.local_element(dof_indices[i * n_lanes + v]) += quad_values[i][v];
-          else
-          {
-            for(unsigned int v = 0; v < n_lanes; ++v)
-              if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
-                dst.local_element(dof_indices[i * n_lanes + v]) += quad_values[i][v];
-          }
-      }
-      else
-        distribute_local_to_global_compressed<degree, n_q_points_1d, 1>(dst,
-                                                                        compressed_dof_indices,
-                                                                        all_indices_unconstrained,
-                                                                        cell_index,
-                                                                        shape_data.shape_values_eo,
-                                                                        false,
-                                                                        quad_values);
-    }
-    else
-    {
-      VectorizedArray<Number> diag_values[n_q_points];
-      for(unsigned int i = 0; i < n_q_points; ++i)
-      {
-        std::array<unsigned int, dim> tensor_i;
-        constexpr unsigned int        nn = degree + 1;
-        if(dim == 2)
-        {
-          tensor_i[0] = i % nn;
-          tensor_i[1] = i / nn;
-        }
-        else if(dim == 3)
-        {
-          tensor_i[0] = i % nn;
-          tensor_i[1] = (i / nn) % nn;
-          tensor_i[2] = i / (nn * nn);
-        }
-        for(unsigned int q2 = 0, q = 0; q2 < (dim > 2 ? n_q_points_1d : 1); ++q2)
-          for(unsigned int q1 = 0; q1 < (dim > 1 ? n_q_points_1d : 1); ++q1)
-            for(unsigned int q0 = 0; q0 < n_q_points_1d; ++q0, ++q)
-              quad_values[q] =
-                ((dim == 3 ? shape_data.shape_values[tensor_i[2] * nn + q2] : Number(1.0)) *
-                 shape_data.shape_values[tensor_i[1] * nn + q1]) *
-                shape_data.shape_values[tensor_i[0] * nn + q0];
-
-        if(factor_laplace != 0)
-          compute_cell_lapl<n_q_points_1d>(shape_data,
-                                           mapping_info,
-                                           cell_index,
-                                           factor_mass,
-                                           factor_laplace,
-                                           quad_values,
-                                           quad_values);
-
-        VectorizedArray<Number> sum = 0;
-        for(unsigned int q2 = 0, q = 0; q2 < (dim > 2 ? n_q_points_1d : 1); ++q2)
-          for(unsigned int q1 = 0; q1 < (dim > 1 ? n_q_points_1d : 1); ++q1)
-          {
-            VectorizedArray<Number> inner_sum = {};
-            for(unsigned int q0 = 0; q0 < n_q_points_1d; ++q0, ++q)
-              inner_sum += shape_data.shape_values[tensor_i[0] * nn + q0] * quad_values[q];
-            sum += ((dim == 3 ? shape_data.shape_values[tensor_i[2] * nn + q2] : Number(1.0)) *
-                    shape_data.shape_values[tensor_i[1] * nn + q1]) *
-                   inner_sum;
-          }
-
-        // write diagonal entry to global vector
-        diag_values[i] = sum;
-      }
-      distribute_local_to_global<degree>(cell_index, diag_values, dst);
-    }
+    return compressed_dof_indices;
   }
 
   template<int fe_degree, int n_q_points_1d, int n_components>
@@ -1152,6 +962,217 @@ private:
       else
         ++offset_i2;
       dof_values += n_q_points_1d * n_q_points_1d;
+    }
+  }
+
+private:
+  void
+  local_apply(const MatrixFree<dim, Number> &               data,
+              VectorType &                                  dst,
+              const VectorType &                            src,
+              const std::pair<unsigned int, unsigned int> & cell_range) const
+  {
+    const unsigned int degree = data.get_shape_info().data[0].fe_degree;
+    for(unsigned int cell = cell_range.first; cell < cell_range.second; ++cell)
+    {
+      if(degree == 1)
+        do_cell_operation<1, true>(cell, src, dst);
+      else if(degree == 2)
+        do_cell_operation<2, true>(cell, src, dst);
+      else if(degree == 3)
+        do_cell_operation<3, true>(cell, src, dst);
+      else if(degree == 4)
+        do_cell_operation<4, true>(cell, src, dst);
+#ifndef DEBUG
+      else if(degree == 5)
+        do_cell_operation<5, true>(cell, src, dst);
+      else if(degree == 6)
+        do_cell_operation<6, true>(cell, src, dst);
+      else if(degree == 7)
+        do_cell_operation<7, true>(cell, src, dst);
+      else if(degree == 8)
+        do_cell_operation<8, true>(cell, src, dst);
+#endif
+      else
+        AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+    }
+  }
+
+  void
+  local_compute_diagonal(const MatrixFree<dim, Number> & data,
+                         VectorType &                    dst,
+                         const unsigned int &,
+                         const std::pair<unsigned int, unsigned int> & cell_range) const
+  {
+    const unsigned int degree = data.get_shape_info().data[0].fe_degree;
+    for(unsigned int cell = cell_range.first; cell < cell_range.second; ++cell)
+    {
+      if(degree == 1)
+        do_cell_operation<1, false>(cell, dst, dst);
+      else if(degree == 2)
+        do_cell_operation<2, false>(cell, dst, dst);
+      else if(degree == 3)
+        do_cell_operation<3, false>(cell, dst, dst);
+      else if(degree == 4)
+        do_cell_operation<4, false>(cell, dst, dst);
+#ifndef DEBUG
+      else if(degree == 5)
+        do_cell_operation<5, false>(cell, dst, dst);
+      else if(degree == 6)
+        do_cell_operation<6, false>(cell, dst, dst);
+      else if(degree == 7)
+        do_cell_operation<7, false>(cell, dst, dst);
+      else if(degree == 8)
+        do_cell_operation<8, false>(cell, dst, dst);
+#endif
+      else
+        AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+    }
+  }
+
+  template<int degree, bool evaluate_operator>
+  void
+  do_cell_operation(const unsigned int cell_index, const VectorType & src, VectorType & dst) const
+  {
+    constexpr unsigned int  n_q_points_1d = degree + 1;
+    constexpr unsigned int  n_q_points    = Utilities::pow(n_q_points_1d, dim);
+    VectorizedArray<Number> quad_values[n_q_points];
+
+    const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data =
+      matrix_free.get_shape_info().data[0];
+    if(evaluate_operator)
+    {
+      if(degree <= 2)
+      {
+        const unsigned int * dof_indices =
+          compressed_dof_indices.data() + cell_index * Utilities::pow(degree + 1, dim) * n_lanes;
+        const unsigned char * unconstrained =
+          all_indices_unconstrained.data() + cell_index * Utilities::pow(degree + 1, dim);
+        for(unsigned int i = 0; i < n_q_points; ++i)
+          if(unconstrained[i])
+            for(unsigned int v = 0; v < n_lanes; ++v)
+              quad_values[i][v] = src.local_element(dof_indices[i * n_lanes + v]);
+          else
+          {
+            quad_values[i] = VectorizedArray<Number>();
+            for(unsigned int v = 0; v < n_lanes; ++v)
+              if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+                quad_values[i][v] = src.local_element(dof_indices[i * n_lanes + v]);
+          }
+
+        dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_evenodd,
+                                                      dealii::internal::EvaluatorQuantity::value,
+                                                      dim,
+                                                      degree + 1,
+                                                      degree + 1>::do_forward(1,
+                                                                              shape_data
+                                                                                .shape_values_eo,
+                                                                              quad_values,
+                                                                              quad_values);
+      }
+      else
+        read_dof_values_compressed<degree, n_q_points_1d, 1>(src,
+                                                             compressed_dof_indices,
+                                                             all_indices_unconstrained,
+                                                             cell_index,
+                                                             shape_data.shape_values_eo,
+                                                             false,
+                                                             quad_values);
+
+      if(factor_laplace != 0)
+        compute_cell_lapl<n_q_points_1d>(shape_data,
+                                         mapping_info,
+                                         cell_index,
+                                         factor_mass,
+                                         factor_laplace,
+                                         quad_values,
+                                         quad_values);
+      else
+        AssertThrow(false, ExcNotImplemented());
+
+      if(degree <= 2)
+      {
+        dealii::internal::FEEvaluationImplBasisChange<
+          dealii::internal::evaluate_evenodd,
+          dealii::internal::EvaluatorQuantity::value,
+          dim,
+          degree + 1,
+          degree + 1>::do_backward(1, shape_data.shape_values_eo, false, quad_values, quad_values);
+        const unsigned int * dof_indices =
+          compressed_dof_indices.data() + cell_index * Utilities::pow(degree + 1, dim) * n_lanes;
+        const unsigned char * unconstrained =
+          all_indices_unconstrained.data() + cell_index * Utilities::pow(degree + 1, dim);
+        for(unsigned int i = 0; i < n_q_points; ++i)
+          if(unconstrained[i])
+            for(unsigned int v = 0; v < n_lanes; ++v)
+              dst.local_element(dof_indices[i * n_lanes + v]) += quad_values[i][v];
+          else
+          {
+            for(unsigned int v = 0; v < n_lanes; ++v)
+              if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+                dst.local_element(dof_indices[i * n_lanes + v]) += quad_values[i][v];
+          }
+      }
+      else
+        distribute_local_to_global_compressed<degree, n_q_points_1d, 1>(dst,
+                                                                        compressed_dof_indices,
+                                                                        all_indices_unconstrained,
+                                                                        cell_index,
+                                                                        shape_data.shape_values_eo,
+                                                                        false,
+                                                                        quad_values);
+    }
+    else
+    {
+      VectorizedArray<Number> diag_values[n_q_points];
+      for(unsigned int i = 0; i < n_q_points; ++i)
+      {
+        std::array<unsigned int, dim> tensor_i;
+        constexpr unsigned int        nn = degree + 1;
+        if(dim == 2)
+        {
+          tensor_i[0] = i % nn;
+          tensor_i[1] = i / nn;
+        }
+        else if(dim == 3)
+        {
+          tensor_i[0] = i % nn;
+          tensor_i[1] = (i / nn) % nn;
+          tensor_i[2] = i / (nn * nn);
+        }
+        for(unsigned int q2 = 0, q = 0; q2 < (dim > 2 ? n_q_points_1d : 1); ++q2)
+          for(unsigned int q1 = 0; q1 < (dim > 1 ? n_q_points_1d : 1); ++q1)
+            for(unsigned int q0 = 0; q0 < n_q_points_1d; ++q0, ++q)
+              quad_values[q] =
+                ((dim == 3 ? shape_data.shape_values[tensor_i[2] * nn + q2] : Number(1.0)) *
+                 shape_data.shape_values[tensor_i[1] * nn + q1]) *
+                shape_data.shape_values[tensor_i[0] * nn + q0];
+
+        if(factor_laplace != 0)
+          compute_cell_lapl<n_q_points_1d>(shape_data,
+                                           mapping_info,
+                                           cell_index,
+                                           factor_mass,
+                                           factor_laplace,
+                                           quad_values,
+                                           quad_values);
+
+        VectorizedArray<Number> sum = 0;
+        for(unsigned int q2 = 0, q = 0; q2 < (dim > 2 ? n_q_points_1d : 1); ++q2)
+          for(unsigned int q1 = 0; q1 < (dim > 1 ? n_q_points_1d : 1); ++q1)
+          {
+            VectorizedArray<Number> inner_sum = {};
+            for(unsigned int q0 = 0; q0 < n_q_points_1d; ++q0, ++q)
+              inner_sum += shape_data.shape_values[tensor_i[0] * nn + q0] * quad_values[q];
+            sum += ((dim == 3 ? shape_data.shape_values[tensor_i[2] * nn + q2] : Number(1.0)) *
+                    shape_data.shape_values[tensor_i[1] * nn + q1]) *
+                   inner_sum;
+          }
+
+        // write diagonal entry to global vector
+        diag_values[i] = sum;
+      }
+      distribute_local_to_global<degree>(cell_index, diag_values, dst);
     }
   }
 
