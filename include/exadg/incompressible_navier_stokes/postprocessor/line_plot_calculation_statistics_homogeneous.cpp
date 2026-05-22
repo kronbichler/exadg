@@ -1266,11 +1266,9 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
                 if(need_dissipation)
                 {
-                  VectorizedArrayType epsilon_q = 0.0;
-                  for(unsigned int i = 0; i < dim; ++i)
-                    for(unsigned int j = 0; j < dim; ++j)
-                      epsilon_q += velocity_gradient[i][j] * velocity_gradient[i][j];
-                  epsilon_q *= viscosity;
+                  auto const S = 0.5 * (velocity_gradient + transpose(velocity_gradient));
+                  auto epsilon_q = 2.0 * viscosity * scalar_product(S,S);
+
                   dissipation += epsilon_q * JxW;
                 }
 
