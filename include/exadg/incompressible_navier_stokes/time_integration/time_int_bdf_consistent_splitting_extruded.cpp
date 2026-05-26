@@ -754,14 +754,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::calculate_time_step_size()
 {
   double time_step = 1.0;
 
-  if(this->param.calculation_of_time_step_size == TimeStepCalculation::UserSpecified)
-  {
-    time_step = calculate_const_time_step(this->param.time_step_size, this->refine_steps_time);
-
-    this->pcout << std::endl << "User specified time step size:" << std::endl << std::endl;
-    print_parameter(this->pcout, "time step size", time_step);
-  }
-  else if(this->param.calculation_of_time_step_size == TimeStepCalculation::CFL)
+  if(this->param.calculation_of_time_step_size == TimeStepCalculation::CFL)
   {
     double time_step_global = this->operator_base->calculate_time_step_cfl_global();
     time_step_global *= this->cfl;

@@ -101,7 +101,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
               dealii::ExcMessage("write_preliminary_results_every_nth_time_step has to be set."));
   time_control_statistics.setup(data_in.time_control_data_statistics);
 
-  if(data.time_control_data_statistics.time_control_data.is_active)
+  if(data_in.time_control_data_statistics.time_control_data.is_active)
   {
     AssertThrow(dim == 3, dealii::ExcMessage("Not implemented."));
 
@@ -432,7 +432,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
               dealii::ExcMessage("write_preliminary_results_every_nth_time_step has to be set."));
   time_control_statistics.setup(data_in.time_control_data_statistics);
 
-  if(data.time_control_data_statistics.time_control_data.is_active)
+  if(data_in.time_control_data_statistics.time_control_data.is_active)
   {
     AssertThrow(dim == 3, dealii::ExcMessage("Not implemented."));
 
@@ -1590,8 +1590,7 @@ template<int dim, typename Number>
 void
 LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_write_output() const
 {
-  if(data.time_control_data_statistics.time_control_data.is_active and
-     dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0)
+  if(dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0)
   {
     dealii::Timer      time;
     unsigned int const precision = data.precision;

@@ -31,56 +31,12 @@ namespace ExaDG
 {
 namespace IncNS
 {
-/*
- * function to distort the undeformed box grid in
- * [0, length] x [0, height_hill+height_channel_minimum] x [-width, width]
- * by a smooth trigonometric function |f(x)| < 1 that is zero on the boundaries in the
- * respective direction and is scaled with some scaling factor and has `n_periods` periods.
- * Lambda has no effect if `consider_box_distort == false`.
- */
 template<int dim>
-dealii::Point<dim>
-box_distort(dealii::Point<dim> const & point_in,
-            bool const                 consider_box_distort,
-            double const               length_channel,
-            double const               height_hill,
-            double const               height_channel_minimum)
-{
-  dealii::Point<dim> point_out = point_in;
-
-  if(consider_box_distort)
-  {
-    double const n_periods_length = 2.0;
-    double const n_periods_height = 1.0;
-    double const scale_length = 0.02 * std::sin(dealii::numbers::PI * point_in[0] / length_channel);
-    double const scale_hight =
-      0.08 * std::sin(dealii::numbers::PI * (point_in[1] - height_hill) / height_channel_minimum);
-
-    point_out[0] +=
-      length_channel * scale_length *
-      std::sin(dealii::numbers::PI * n_periods_length * point_in[1] / height_channel_minimum);
-    point_out[1] += height_channel_minimum * scale_hight *
-                    std::sin(dealii::numbers::PI * n_periods_height * point_in[0] / length_channel);
-  }
-
-  return point_out;
-};
-
-/*
- * Initial condition for the velocity for the standard periodic hill benchmark. Qudratic flow
- * profile in upper part of the channel with added Gaussian noise.
- */
-template<int dim>
-class InitialConditionVelocity : public dealii::Function<dim>
+class InitialSolutionVelocity : public dealii::Function<dim>
 {
 public:
-  InitialConditionVelocity(double const bulk_velocity,
-                           double const height_hill,
-                           double const height_channel_minimum)
-    : dealii::Function<dim>(dim, 0.0),
-      bulk_velocity(bulk_velocity),
-      height_hill(height_hill),
-      height_channel_minimum(height_channel_minimum)
+  InitialSolutionVelocity(double const bulk_velocity, double const H, double const height)
+    : dealii::Function<dim>(dim, 0.0), bulk_velocity(bulk_velocity), H(H), height(height)
   {
   }
 
@@ -92,10 +48,8 @@ public:
     if(component == 0)
     {
       // initial conditions
-      if(p[1] > height_hill and p[1] < (height_hill + height_channel_minimum))
-        result = bulk_velocity * (p[1] - height_hill) *
-                 ((height_hill + height_channel_minimum) - p[1]) /
-                 std::pow(height_channel_minimum / 2.0, 2.0);
+      if(p[1] > H and p[1] < (H + height))
+        result = bulk_velocity * (p[1] - H) * ((H + height) - p[1]) / std::pow(height / 2.0, 2.0);
 
       // add some random perturbations
       result *= (1.0 + 0.1 * (((double)rand() / RAND_MAX - 0.5) / 0.5));
@@ -105,13 +59,9 @@ public:
   }
 
 private:
-  double const bulk_velocity, height_hill, height_channel_minimum;
+  double const bulk_velocity, H, height;
 };
 
-/*
- * The driving force on the right hand side is controlled by the flow rate exiting the domain to
- * achieve the desired target flow rate in the periodic hill benchmark.
- */
 template<int dim>
 class RightHandSide : public SerializableFunction<dim>
 {
@@ -172,232 +122,6 @@ private:
   FlowRateController const & flow_rate_controller;
 };
 
-/*
- * Manufactured solution for incompressible flow of a Newtonian fluid in a channel of height H,
- * width W, and length L, where the convective term may be disabled.
- * u  ... velocity vector
- * p  ... kinematic pressure
- * nu ... kinematic viscosity
- * f  ... body force vector
- *
- * d/dt(u) + (grad(u)) * u + grad(p) - nu * div(grad(u)) = f
- *
- * In 3D, we derive a solution by selecting the stream function
- *
- * psi = cos(a*x) * cos^2(b*y) * cos(c*t),
- *
- * u1 = d/dy psi = - 2 * b * cos(a*x) * cos(b*y) * sin(b*y) * cos(c*t),
- *
- * u2 = -d/dx psi = a * sin(a*x) * cos^2(b*y) * cos(c*t),
- *
- * u3 = 0,
- *
- * p  = cos(a*x) * cos(c*t),
- *
- * where
- *
- * a = 2*pi/L, b = pi/H, c = 2*pi/T, and T is the period of the solution in time.
- *
- * which is periodic in [0, length], i.e., the channel's longitudinal axis, constant in z, and
- * fulfills no-slip conditions at y = +-H/2. This means we have to modify the incoming y coordinate.
- *
- * The force vector follows from the momentum balance equation.
- */
-template<int dim>
-class ManufacturedSolutionVelocity : public dealii::Function<dim>
-{
-public:
-  ManufacturedSolutionVelocity(double const & height,
-                               double const & length,
-                               double const & y_shift,
-                               double const & time_period)
-    : dealii::Function<dim>(dim /* n_components */, 0.0),
-      height(height),
-      length(length),
-      y_shift(y_shift),
-      time_period(time_period)
-  {
-  }
-
-  double
-  value(dealii::Point<dim> const & p, unsigned int const component = 0) const final
-  {
-    double const a = 2.0 * dealii::numbers::PI / length;
-    double const b = dealii::numbers::PI / height;
-    double const c = 2.0 * dealii::numbers::PI / time_period;
-
-    double const t = this->get_time();
-    double const x = p[0];
-    // shift incoming y coordinate since channel is not symmetric around 0.
-    double const y      = p[1] - y_shift;
-    double const sin_ax = std::sin(a * x);
-    double const sin_by = std::sin(b * y);
-    double const cos_ax = std::cos(a * x);
-    double const cos_by = std::cos(b * y);
-    double const cos_ct = std::cos(c * t);
-
-    if(component == 0)
-      return -2.0 * b * cos_ax * cos_by * sin_by * cos_ct;
-    else if(component == 1)
-      return a * sin_ax * dealii::Utilities::fixed_power<2>(cos_by) * cos_ct;
-    else
-      return 0.0;
-  }
-
-private:
-  double const height;
-  double const length;
-  double const y_shift;
-  double const time_period;
-};
-
-
-template<int dim>
-class ManufacturedSolutionPressure : public dealii::Function<dim>
-{
-public:
-  ManufacturedSolutionPressure(double const & length, double const & time_period)
-    : dealii::Function<dim>(1, 0.0), length(length), time_period(time_period)
-  {
-  }
-
-  double
-  value(dealii::Point<dim> const & p, unsigned int const /*component*/) const final
-  {
-    double const a = 2.0 * dealii::numbers::PI / length;
-    double const c = 2.0 * dealii::numbers::PI / time_period;
-
-    double const t      = this->get_time();
-    double const x      = p[0];
-    double const cos_ax = std::cos(a * x);
-    double const cos_ct = std::cos(c * t);
-
-    return cos_ax * cos_ct;
-  }
-
-private:
-  double const length;
-  double const time_period;
-};
-
-
-template<int dim>
-class ManufacturedRightHandSide : public dealii::Function<dim>
-{
-public:
-  ManufacturedRightHandSide(bool const     include_convective_term,
-                            double const & height,
-                            double const & length,
-                            double const & y_shift,
-                            double const & time_period,
-                            double const & kinematic_viscosity)
-    : dealii::Function<dim>(dim, 0.0),
-      include_convective_term(include_convective_term),
-      height(height),
-      length(length),
-      y_shift(y_shift),
-      time_period(time_period),
-      kinematic_viscosity(kinematic_viscosity)
-  {
-  }
-
-  double
-  value(dealii::Point<dim> const & p, unsigned int const component = 0) const final
-  {
-    /*
-     * The solution laid out above is inserted into the momentum balance
-     * equation to derive the vector f on the right-hand side.
-     *
-     * f = d/dt(u) + (grad(u)) * u + grad(p) - nu * div(grad(u))
-     *
-     * Note that the solution is constant in z, such that the respective entries in the gradients
-     * are empty and we can adapt a case corresponding to a 2D solution.
-     */
-
-    if constexpr(dim == 3)
-      if(component == 2)
-        return 0.0;
-
-    double const a = 2.0 * dealii::numbers::PI / length;
-    double const b = dealii::numbers::PI / height;
-    double const c = 2.0 * dealii::numbers::PI / time_period;
-
-    double const t = this->get_time();
-    double const x = p[0];
-    // shift incoming y coordinate since channel is not symmetric around 0.
-    double const y      = p[1] - y_shift;
-    double const sin_ax = std::sin(a * x);
-    double const sin_by = std::sin(b * y);
-    double const cos_ax = std::cos(a * x);
-    double const cos_by = std::cos(b * y);
-    double const sin_ct = std::sin(c * t);
-    double const cos_ct = std::cos(c * t);
-
-    double const u1 = -2.0 * b * cos_ax * cos_by * sin_by * cos_ct;
-
-    double const du1_dt = 2.0 * b * cos_ax * cos_by * sin_by * sin_ct * c;
-    double const du1_dx = 2.0 * b * a * sin_ax * cos_by * sin_by * cos_ct;
-    double const du1_dy = 2.0 * b * b * cos_ax * cos_ct * (sin_by * sin_by - cos_by * cos_by);
-
-    double const du1_dxx = 2.0 * b * a * a * cos_ax * cos_by * sin_by * cos_ct;
-    double const du1_dyy = 8.0 * b * b * b * cos_ax * cos_ct * cos_by * sin_by;
-
-    double const u2 = a * sin_ax * dealii::Utilities::fixed_power<2>(cos_by) * cos_ct;
-
-    double const du2_dt = -a * sin_ax * dealii::Utilities::fixed_power<2>(cos_by) * sin_ct * c;
-    double const du2_dx = a * a * cos_ax * dealii::Utilities::fixed_power<2>(cos_by) * cos_ct;
-    double const du2_dy = -2.0 * a * b * sin_ax * cos_by * sin_by * cos_ct;
-
-    double const du2_dxx = -a * a * a * sin_ax * dealii::Utilities::fixed_power<2>(cos_by) * cos_ct;
-    double const du2_dyy = 2.0 * a * b * b * sin_ax * cos_ct * (sin_by * sin_by - cos_by * cos_by);
-
-    // p = cos_ax * cos_ct;
-    double const dp_dx = -a * sin_ax * cos_ct;
-    double const dp_dy = 0.0;
-
-    dealii::Tensor<2, dim> grad_u;
-    grad_u[0][0] = du1_dx;
-    grad_u[0][1] = du1_dy;
-    grad_u[1][0] = du2_dx;
-    grad_u[1][1] = du2_dy;
-
-    dealii::Tensor<1, dim> div_grad_u;
-    div_grad_u[0] = du1_dxx + du1_dyy;
-    div_grad_u[1] = du2_dxx + du2_dyy;
-
-    // add time derivative terms
-    dealii::Tensor<1, dim> rhs;
-    rhs[0] += du1_dt;
-    rhs[1] += du2_dt;
-
-    // convective term
-    if(include_convective_term)
-    {
-      dealii::Tensor<1, dim> u;
-      u[0] = u1;
-      u[1] = u2;
-      rhs += grad_u * u;
-    }
-
-    // pressure gradient
-    rhs[0] += dp_dx;
-    rhs[1] += dp_dy;
-
-    // viscous term
-    rhs -= kinematic_viscosity * div_grad_u;
-
-    return rhs[component];
-  }
-
-private:
-  bool const   include_convective_term;
-  double const height;
-  double const length;
-  double const y_shift;
-  double const time_period;
-  double const kinematic_viscosity;
-};
-
 template<int dim, typename Number>
 class Application : public ApplicationBase<dim, Number>
 {
@@ -414,58 +138,31 @@ public:
 
     prm.enter_subsection("Application");
     {
-      prm.add_parameter("UseManufacturedSolution",
-                        use_manufactured_solution,
-                        "Use a manufactured solution to compute errors in the box domain",
-                        dealii::Patterns::Bool());
-      prm.add_parameter("ConsiderBoxDistort",
-                        consider_box_distort,
-                        "Set whether to distort the box domain before mapping to the hill",
-                        dealii::Patterns::Bool());
-      prm.add_parameter("ConsiderMapping",
-                        consider_mapping,
-                        "Set whether to map the box domain to form the periodic hill?",
-                        dealii::Patterns::Bool());
-      prm.add_parameter("WriteRestart",
-                        write_restart,
-                        "Set whether to write restart files be written",
-                        dealii::Patterns::Bool());
-      prm.add_parameter("ReadRestart",
-                        read_restart,
-                        "Set whether to restart the restarted simulation from restart data",
-                        dealii::Patterns::Bool());
+      prm.add_parameter("WriteRestart", write_restart, "Should restart files be written?");
+      prm.add_parameter("ReadRestart", read_restart, "Is this a restarted simulation?");
       prm.add_parameter("RestartDirectory",
                         restart_directory,
                         "Directory with restart data to start the simulation from.");
       prm.add_parameter("RestartIntervalTime",
                         restart_interval_time,
-                        "Time between writes of restart data in multiples of flow-through time.",
-                        dealii::Patterns::Double());
+                        "Time between writes of restart data in multiples of flow-through time.");
       prm.add_parameter("TriangulationType", triangulation_type, "Type of triangulation");
       prm.add_parameter("TemporalDiscretization",
                         temporal_discretization,
                         "Temporal discretization");
       prm.add_parameter("SpatialDiscretization", spatial_discretization, "Spatial discretization");
-      prm.add_parameter("Inviscid",
-                        inviscid,
-                        "Is this an inviscid simulation?",
-                        dealii::Patterns::Bool());
-      prm.add_parameter("ReynoldsNumber",
-                        Re,
-                        "Reynolds number (ignored if Inviscid = true)",
-                        dealii::Patterns::Double());
+      prm.add_parameter("Inviscid", inviscid, "Is this an inviscid simulation?");
+      prm.add_parameter("ReynoldsNumber", Re, "Reynolds number (ignored if Inviscid = true)");
       prm.add_parameter("EndTime",
                         end_time_multiples,
                         "End time in multiples of flow-through time.",
                         dealii::Patterns::Double(0.0, 1000.0));
       prm.add_parameter("GridStretchFactor",
                         grid_stretch_factor,
-                        "Factor describing grid stretching in vertical direction.",
-                        dealii::Patterns::Double());
+                        "Factor describing grid stretching in vertical direction.");
       prm.add_parameter("CalculateStatistics",
                         calculate_statistics,
-                        "Decides whether statistics are calculated.",
-                        dealii::Patterns::Bool());
+                        "Decides whether statistics are calculated.");
       prm.add_parameter("SampleStartTime",
                         sample_start_time_multiples,
                         "Start time of sampling in multiples of flow-through time.",
@@ -493,10 +190,10 @@ private:
 
     // viscosity needs to be recomputed since the parameters inviscid, Re are
     // read from the input file
-    viscosity = inviscid ? 0.0 : bulk_velocity * height_hill / Re;
+    viscosity = inviscid ? 0.0 : bulk_velocity * H / Re;
 
     // depend on values defined in input file
-    end_time              = convergence_study ? 0.1 : end_time_multiples * flow_through_time;
+    end_time              = end_time_multiples * flow_through_time;
     sample_start_time     = double(sample_start_time_multiples) * flow_through_time;
     restart_interval_time = restart_interval_time * flow_through_time;
 
@@ -505,16 +202,16 @@ private:
 
     // need to recompute the width, since we make it dependent on the number of elements in z
     // direction, or rather, the ratio between elements in x and z direction
-    width_channel = length_channel * coarse_mesh_refinements[2] / coarse_mesh_refinements[0];
+    width = length * coarse_mesh_refinements[2] / coarse_mesh_refinements[0];
 
     // recompute target flow rate as it depends on the width
-    target_flow_rate = bulk_velocity * width_channel * height_channel_minimum;
+    target_flow_rate = bulk_velocity * width * height;
 
     // finally refresh the flow rate controller
     flow_rate_controller.reset(
       new FlowRateController(bulk_velocity,
                              target_flow_rate,
-                             height_hill,
+                             H,
                              start_time,
                              true /* assert_non_matching_parameters_at_restart */));
   }
@@ -540,16 +237,15 @@ private:
 
 
     // TEMPORAL DISCRETIZATION
-    this->param.solver_type                  = SolverType::Unsteady;
-    this->param.temporal_discretization      = temporal_discretization;
-    this->param.treatment_of_convective_term = TreatmentOfConvectiveTerm::Explicit;
-    this->param.calculation_of_time_step_size =
-      convergence_study ? TimeStepCalculation::UserSpecified : TimeStepCalculation::CFL;
-    this->param.adaptive_time_stepping          = convergence_study ? false : true;
+    this->param.solver_type                     = SolverType::Unsteady;
+    this->param.temporal_discretization         = temporal_discretization;
+    this->param.treatment_of_convective_term    = TreatmentOfConvectiveTerm::Explicit;
+    this->param.calculation_of_time_step_size   = TimeStepCalculation::CFL;
+    this->param.adaptive_time_stepping          = true;
     this->param.max_velocity                    = bulk_velocity;
     this->param.cfl                             = 0.32; // 0.375;
     this->param.cfl_exponent_fe_degree_velocity = 1.5;
-    this->param.time_step_size                  = 1.0e-4;
+    this->param.time_step_size                  = 1.0e-1;
     this->param.order_time_integrator           = 3;
     this->param.start_with_low_order            = read_restart ? false : true;
 
@@ -622,13 +318,8 @@ private:
     // PROJECTION METHODS
 
     // pressure Poisson equation
-    double const abs_tol_lin            = convergence_study ? 1.0e-18 : 1.0e-12;
-    double const rel_tol_lin_ppe        = convergence_study ? 1.0e-9 : 1.0e-5;
-    double const rel_tol_lin_projection = convergence_study ? 1.0e-9 : 1.0e-6;
-    double const rel_tol_lin_momentum   = convergence_study ? 1.0e-9 : 1.0e-8;
-    double const rel_tol_lin_mass       = convergence_study ? 1.0e-9 : 1.0e-4;
     this->param.solver_data_pressure_poisson =
-      SolverData(1000, abs_tol_lin, rel_tol_lin_ppe, LinearSolver::CG, 100);
+      SolverData(1000, 1.e-12, 1.e-5, LinearSolver::CG, 100);
     this->param.preconditioner_pressure_poisson      = PreconditionerPressurePoisson::Multigrid;
     this->param.multigrid_data_pressure_poisson.type = MultigridType::cphMG;
     this->param.multigrid_data_pressure_poisson.coarse_problem.solver =
@@ -637,9 +328,8 @@ private:
       MultigridCoarseGridPreconditioner::PointJacobi;
 
     // projection step
-    this->param.solver_data_projection =
-      SolverData(1000, abs_tol_lin, rel_tol_lin_projection, LinearSolver::CG);
-    this->param.preconditioner_projection        = PreconditionerProjection::InverseMassMatrix;
+    this->param.solver_data_projection    = SolverData(1000, 1.e-12, 1.e-6, LinearSolver::CG);
+    this->param.preconditioner_projection = PreconditionerProjection::InverseMassMatrix;
     this->param.update_preconditioner_projection = true;
 
 
@@ -649,16 +339,14 @@ private:
     this->param.order_extrapolation_pressure_nbc =
       this->param.order_time_integrator <= 2 ? this->param.order_time_integrator : 2;
 
-    this->param.solver_data_momentum =
-      SolverData(1000, abs_tol_lin, rel_tol_lin_momentum, LinearSolver::CG);
+    this->param.solver_data_momentum    = SolverData(1000, 1.e-12, 1.e-8, LinearSolver::CG);
     this->param.preconditioner_momentum = spatial_discretization == SpatialDiscretization::L2 ?
                                             MomentumPreconditioner::InverseMassMatrix :
                                             MomentumPreconditioner::PointJacobi;
 
     this->param.inverse_mass_operator.implementation_type = InverseMassType::GlobalKrylovSolver;
     this->param.inverse_mass_operator.preconditioner      = PreconditionerMass::PointJacobi;
-    this->param.inverse_mass_operator.solver_data =
-      SolverData(1000, abs_tol_lin, rel_tol_lin_mass, LinearSolver::CG);
+    this->param.inverse_mass_operator.solver_data = SolverData(1000, 1e-12, 1e-4, LinearSolver::CG);
 
     // CONSISTENT SPLITTING SCHEME
     this->param.order_extrapolation_pressure_rhs = 2;
@@ -682,15 +370,15 @@ private:
 
       dealii::Point<dim> p_1;
       p_1[0] = 0.;
-      p_1[1] = height_hill;
+      p_1[1] = H;
       if(dim == 3)
-        p_1[2] = -width_channel / 2.0;
+        p_1[2] = -width / 2.0;
 
       dealii::Point<dim> p_2;
-      p_2[0] = length_channel;
-      p_2[1] = height_hill + height_channel_minimum;
+      p_2[0] = length;
+      p_2[1] = H + height;
       if(dim == 3)
-        p_2[2] = width_channel / 2.0;
+        p_2[2] = width / 2.0;
 
       // use 2 cells in x-direction on coarsest grid and 1 cell in y- and z-directions
       std::vector<unsigned int> refinements{
@@ -780,10 +468,7 @@ private:
       *grid.triangulation,
       [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
         -> std::vector<dealii::Point<dim>> {
-        PeriodicHillManifold<dim> manifold(height_hill,
-                                           length_channel,
-                                           height_channel_minimum,
-                                           grid_stretch_factor);
+        PeriodicHillManifold<dim> manifold(H, length, height, grid_stretch_factor);
         fe_values.reinit(cell);
 
         std::vector<dealii::Point<dim>> points_moved(fe_values.n_quadrature_points);
@@ -791,16 +476,11 @@ private:
         {
           // need to adjust for hierarchic numbering of
           // dealii::MappingQCache
-          dealii::Point<dim> const point_in_box =
-            box_distort(fe_values.quadrature_point(hierarchic_to_lexicographic_numbering[i]),
-                        consider_box_distort,
-                        length_channel,
-                        height_hill,
-                        height_channel_minimum);
           if(consider_mapping)
-            points_moved[i] = manifold.push_forward(point_in_box);
+            points_moved[i] = manifold.push_forward(
+              fe_values.quadrature_point(hierarchic_to_lexicographic_numbering[i]));
           else
-            points_moved[i] = point_in_box;
+            points_moved[i] = fe_values.quadrature_point(hierarchic_to_lexicographic_numbering[i]);
         }
 
         return points_moved;
@@ -808,25 +488,16 @@ private:
 
     grid.mapping_function = [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
       -> std::vector<dealii::Point<dim>> {
-      PeriodicHillManifold<dim>       manifold(height_hill,
-                                         length_channel,
-                                         height_channel_minimum,
-                                         grid_stretch_factor);
+      PeriodicHillManifold<dim>       manifold(H, length, height, grid_stretch_factor);
       std::vector<dealii::Point<dim>> points_moved(cell->n_vertices());
       for(unsigned int i = 0; i < cell->n_vertices(); ++i)
       {
         // need to adjust for hierarchic numbering of
         // dealii::MappingQCache
-        dealii::Point<dim> const point_in_box = box_distort(cell->vertex(i),
-                                                            consider_box_distort,
-                                                            length_channel,
-                                                            height_hill,
-                                                            height_channel_minimum);
-
         if(consider_mapping)
-          points_moved[i] = manifold.push_forward(point_in_box);
+          points_moved[i] = manifold.push_forward(cell->vertex(i));
         else
-          points_moved[i] = point_in_box;
+          points_moved[i] = cell->vertex(i);
       }
 
       return points_moved;
@@ -857,42 +528,13 @@ private:
   void
   set_field_functions() final
   {
-    if(use_manufactured_solution)
-    {
-      AssertThrow(use_manufactured_solution == true and consider_mapping == false,
-                  dealii::ExcMessage("Manufactured solution is defined on the box grid, "
-                                     "cannot consider mapping to periodic hill."));
-
-      this->field_functions->initial_solution_velocity.reset(new ManufacturedSolutionVelocity<dim>(
-        height_channel_minimum, length_channel, y_shift, time_period));
-      this->field_functions->initial_solution_pressure.reset(
-        new ManufacturedSolutionPressure<dim>(length_channel, time_period));
-
-      this->field_functions->analytical_solution_pressure.reset(
-        new ManufacturedSolutionPressure<dim>(length_channel, time_period));
-      this->field_functions->analytical_solution_velocity.reset(
-        new ManufacturedSolutionVelocity<dim>(
-          height_channel_minimum, length_channel, y_shift, time_period));
-
-      bool const include_convective_term = this->param.equation_type == EquationType::NavierStokes;
-      this->field_functions->right_hand_side.reset(
-        new ManufacturedRightHandSide<dim>(include_convective_term,
-                                           height_channel_minimum,
-                                           length_channel,
-                                           y_shift,
-                                           time_period,
-                                           viscosity));
-    }
-    else
-    {
-      this->field_functions->initial_solution_velocity.reset(
-        new InitialConditionVelocity<dim>(bulk_velocity, height_hill, height_channel_minimum));
-      this->field_functions->initial_solution_pressure.reset(
-        new dealii::Functions::ZeroFunction<dim>(1));
-      this->field_functions->analytical_solution_pressure.reset(
-        new dealii::Functions::ZeroFunction<dim>(1));
-      this->field_functions->right_hand_side.reset(new RightHandSide<dim>(*flow_rate_controller));
-    }
+    this->field_functions->initial_solution_velocity.reset(
+      new InitialSolutionVelocity<dim>(bulk_velocity, H, height));
+    this->field_functions->initial_solution_pressure.reset(
+      new dealii::Functions::ZeroFunction<dim>(1));
+    this->field_functions->analytical_solution_pressure.reset(
+      new dealii::Functions::ZeroFunction<dim>(1));
+    this->field_functions->right_hand_side.reset(new RightHandSide<dim>(*flow_rate_controller));
   }
 
   std::shared_ptr<PostProcessorBase<dim, Number>>
@@ -903,7 +545,7 @@ private:
     // write output for visualization of results
     pp_data.output_data.time_control_data.is_active        = this->output_parameters.write;
     pp_data.output_data.time_control_data.start_time       = start_time;
-    pp_data.output_data.time_control_data.trigger_interval = (end_time - start_time) / 10.0;
+    pp_data.output_data.time_control_data.trigger_interval = flow_through_time / 5.0;
     pp_data.output_data.directory                 = this->output_parameters.directory + "vtu/";
     pp_data.output_data.filename                  = this->output_parameters.filename;
     pp_data.output_data.write_velocity_magnitude  = false;
@@ -917,28 +559,6 @@ private:
     pp_data.output_data.write_higher_order = true;
     pp_data.output_data.write_aspect_ratio = false;
     pp_data.output_data.write_processor_id = true;
-
-    // calculation of velocity error
-    pp_data.error_data_u.time_control_data.is_active        = true;
-    pp_data.error_data_u.time_control_data.start_time       = start_time;
-    pp_data.error_data_u.time_control_data.trigger_interval = (end_time - start_time) / 10.0;
-    pp_data.error_data_u.analytical_solution.reset(new ManufacturedSolutionVelocity<dim>(
-      height_channel_minimum, length_channel, y_shift, time_period));
-    pp_data.error_data_u.name                      = "velocity";
-    pp_data.error_data_u.compute_convergence_table = use_manufactured_solution;
-    pp_data.error_data_u.write_errors_to_file      = use_manufactured_solution;
-    pp_data.error_data_u.calculate_relative_errors = false;
-    pp_data.error_data_u.directory                 = this->output_parameters.directory;
-
-    pp_data.error_data_p.time_control_data = pp_data.error_data_u.time_control_data;
-    pp_data.error_data_p.time_control_data.trigger_interval = (end_time - start_time) / 10.0;
-    pp_data.error_data_p.analytical_solution.reset(
-      new ManufacturedSolutionPressure<dim>(length_channel, time_period));
-    pp_data.error_data_p.name                      = "pressure";
-    pp_data.error_data_p.compute_convergence_table = use_manufactured_solution;
-    pp_data.error_data_p.write_errors_to_file      = use_manufactured_solution;
-    pp_data.error_data_p.calculate_relative_errors = false;
-    pp_data.error_data_p.directory                 = this->output_parameters.directory;
 
     MyPostProcessorData<dim> my_pp_data;
     my_pp_data.pp_data = pp_data;
@@ -1019,73 +639,34 @@ private:
 
     // begin and end points of all lines
     double const eps = 1.e-12;
-    vel_0->begin =
-      dealii::Point<dim>(0.0 * height_hill,
-                         height_hill + f(0.0 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_0->end =
-      dealii::Point<dim>(0.0 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_005->begin =
-      dealii::Point<dim>(0.05 * height_hill,
-                         height_hill + f(0.05 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_005->end =
-      dealii::Point<dim>(0.05 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_05->begin =
-      dealii::Point<dim>(0.5 * height_hill,
-                         height_hill + f(0.5 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_05->end =
-      dealii::Point<dim>(0.5 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_1->begin =
-      dealii::Point<dim>(1 * height_hill,
-                         height_hill + f(1 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_1->end = dealii::Point<dim>(1 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_2->begin =
-      dealii::Point<dim>(2 * height_hill,
-                         height_hill + f(2 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_2->end = dealii::Point<dim>(2 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_3->begin =
-      dealii::Point<dim>(3 * height_hill,
-                         height_hill + f(3 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_3->end = dealii::Point<dim>(3 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_4->begin =
-      dealii::Point<dim>(4 * height_hill,
-                         height_hill + f(4 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_4->end = dealii::Point<dim>(4 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_5->begin =
-      dealii::Point<dim>(5 * height_hill,
-                         height_hill + f(5 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_5->end = dealii::Point<dim>(5 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_6->begin =
-      dealii::Point<dim>(6 * height_hill,
-                         height_hill + f(6 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_6->end = dealii::Point<dim>(6 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_7->begin =
-      dealii::Point<dim>(7 * height_hill,
-                         height_hill + f(7 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_7->end = dealii::Point<dim>(7 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_8->begin =
-      dealii::Point<dim>(8 * height_hill,
-                         height_hill + f(8 * height_hill, height_hill, length_channel) + eps,
-                         0);
-    vel_8->end = dealii::Point<dim>(8 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_9->begin =
-      dealii::Point<dim>(0 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_9->end = dealii::Point<dim>(9 * height_hill, height_hill + height_channel_minimum - eps, 0);
-    vel_10->begin    = dealii::Point<dim>(0 * height_hill, height_hill + eps, 0);
-    vel_10->end      = dealii::Point<dim>(9 * height_hill, height_hill + eps, 0);
-    vel_10->manifold = std::make_shared<PeriodicHillManifold<dim>>(height_hill,
-                                                                   length_channel,
-                                                                   height_channel_minimum,
-                                                                   grid_stretch_factor);
+    vel_0->begin     = dealii::Point<dim>(0.0 * H, H + f(0.0 * H, H, length) + eps, 0);
+    vel_0->end       = dealii::Point<dim>(0.0 * H, H + height - eps, 0);
+    vel_005->begin   = dealii::Point<dim>(0.05 * H, H + f(0.05 * H, H, length) + eps, 0);
+    vel_005->end     = dealii::Point<dim>(0.05 * H, H + height - eps, 0);
+    vel_05->begin    = dealii::Point<dim>(0.5 * H, H + f(0.5 * H, H, length) + eps, 0);
+    vel_05->end      = dealii::Point<dim>(0.5 * H, H + height - eps, 0);
+    vel_1->begin     = dealii::Point<dim>(1 * H, H + f(1 * H, H, length) + eps, 0);
+    vel_1->end       = dealii::Point<dim>(1 * H, H + height - eps, 0);
+    vel_2->begin     = dealii::Point<dim>(2 * H, H + f(2 * H, H, length) + eps, 0);
+    vel_2->end       = dealii::Point<dim>(2 * H, H + height - eps, 0);
+    vel_3->begin     = dealii::Point<dim>(3 * H, H + f(3 * H, H, length) + eps, 0);
+    vel_3->end       = dealii::Point<dim>(3 * H, H + height - eps, 0);
+    vel_4->begin     = dealii::Point<dim>(4 * H, H + f(4 * H, H, length) + eps, 0);
+    vel_4->end       = dealii::Point<dim>(4 * H, H + height - eps, 0);
+    vel_5->begin     = dealii::Point<dim>(5 * H, H + f(5 * H, H, length) + eps, 0);
+    vel_5->end       = dealii::Point<dim>(5 * H, H + height - eps, 0);
+    vel_6->begin     = dealii::Point<dim>(6 * H, H + f(6 * H, H, length) + eps, 0);
+    vel_6->end       = dealii::Point<dim>(6 * H, H + height - eps, 0);
+    vel_7->begin     = dealii::Point<dim>(7 * H, H + f(7 * H, H, length) + eps, 0);
+    vel_7->end       = dealii::Point<dim>(7 * H, H + height - eps, 0);
+    vel_8->begin     = dealii::Point<dim>(8 * H, H + f(8 * H, H, length) + eps, 0);
+    vel_8->end       = dealii::Point<dim>(8 * H, H + height - eps, 0);
+    vel_9->begin     = dealii::Point<dim>(0 * H, H + height - eps, 0);
+    vel_9->end       = dealii::Point<dim>(9 * H, H + height - eps, 0);
+    vel_10->begin    = dealii::Point<dim>(0 * H, H + eps, 0);
+    vel_10->end      = dealii::Point<dim>(9 * H, H + eps, 0);
+    vel_10->manifold =
+      std::make_shared<PeriodicHillManifold<dim>>(H, length, height, grid_stretch_factor);
 
     // set the number of points along the lines
     vel_0->n_points   = points_per_line;
@@ -1216,8 +797,8 @@ private:
     my_pp_data.mean_velocity_data.write_to_file = true;
 
     std::shared_ptr<PostProcessorBase<dim, Number>> pp;
-    pp.reset(new MyPostProcessor<dim, Number>(
-      my_pp_data, this->mpi_comm, length_channel, *flow_rate_controller));
+    pp.reset(
+      new MyPostProcessor<dim, Number>(my_pp_data, this->mpi_comm, length, *flow_rate_controller));
 
     return pp;
   }
@@ -1227,49 +808,30 @@ private:
   bool   inviscid = false;
   double Re       = 5600.0; // 700, 1400, 5600, 10595, 19000
 
-  // The undeformed box occupies the region
-  // [0, length] x [height_hill, height_hill+height_channel_minimum] x [-width, width],
-  // while after applying the mapping, the lower bottom of the box (lying at y = height_hill) is
-  // mapped in negative y direction to form the classical periodic hill domain, with the
-  // minimum position in y direction being y=0.
-  static double constexpr height_hill            = 0.028;
-  double width_channel                           = 4.5 * height_hill;
-  static double constexpr length_channel         = 9.0 * height_hill;
-  static double constexpr height_channel_minimum = 2.036 * height_hill;
+  double const                H      = 0.028;
+  double                      width  = 4.5 * H;
+  double const                length = 9.0 * H;
+  double const                height = 2.036 * H;
   std::array<unsigned int, 3> coarse_mesh_refinements{{2, 1, 1}};
 
-  // The manufactured solution is defined in a channel domain centered around the origin with
-  // respect to the y coordinate. This compensates for the offset of the constructed domain.
-  static double constexpr y_shift = height_hill + 0.5 * height_channel_minimum;
+  double const bulk_velocity     = 5.6218;
+  double       target_flow_rate  = bulk_velocity * width * height;
+  double const flow_through_time = length / bulk_velocity;
 
-  // For temporal convergence studies, we increase the frequency to increase the temporal error.
-  static bool constexpr convergence_study   = false;
-  static bool constexpr spatial_convergence = true;
-  static double constexpr time_period =
-    2.0 * dealii::numbers::PI * (spatial_convergence ? 1.0 : 1e-4);
-
-  static double constexpr bulk_velocity = 5.6218;
-  double target_flow_rate               = bulk_velocity * width_channel * height_channel_minimum;
-  static double constexpr flow_through_time = length_channel / bulk_velocity;
-
-  // RE_H = u_b * height_hill / nu
-  double viscosity = bulk_velocity * height_hill / Re;
+  // RE_H = u_b * H / nu
+  double viscosity = bulk_velocity * H / Re;
 
   // flow rate controller
   std::shared_ptr<FlowRateController> flow_rate_controller;
 
   // start and end time
   double const start_time         = 0.0;
-  double       end_time_multiples = 10.0;
-  double       end_time = convergence_study ? 0.1 : end_time_multiples * flow_through_time;
-
-  // compute convergence study else execute benchmark
-  bool use_manufactured_solution = true;
+  double       end_time_multiples = 10;
+  double       end_time           = end_time_multiples * flow_through_time;
 
   // grid
-  bool   consider_box_distort = false; // distort the box grid before mapping
-  bool   consider_mapping     = true;  // map the box to give the classic periodic hill geometry
-  double grid_stretch_factor  = 1.6;
+  bool const consider_mapping    = true;
+  double     grid_stretch_factor = 1.6;
 
   // dicretization
   TemporalDiscretization temporal_discretization = TemporalDiscretization::Undefined;

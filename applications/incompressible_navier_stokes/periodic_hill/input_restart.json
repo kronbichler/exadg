@@ -15,9 +15,6 @@
         "RefineTimeMax": "0"
     },
     "Application": {
-        "UseManufacturedSolution": "false",
-        "ConsiderBoxDistort": "false",
-        "ConsiderMapping": "true",
         "TriangulationType": "Distributed",
         "ReadRestart": "true",
         "WriteRestart": "false",
