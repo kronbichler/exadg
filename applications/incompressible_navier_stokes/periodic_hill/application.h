@@ -673,6 +673,17 @@ private:
               std::shared_ptr<dealii::Mapping<dim>> &           mapping,
               std::shared_ptr<MultigridMappings<dim, Number>> & multigrid_mappings) final
   {
+    dealii::Point<dim> p_1;
+    p_1[0] = 0.;
+    p_1[1] = height_hill;
+    if(dim == 3)
+      p_1[2] = -width_channel / 2.0;
+
+    dealii::Point<dim> p_2;
+    p_2[0] = length_channel;
+    p_2[1] = height_hill + height_channel_at_hill_top;
+    if(dim == 3)
+      p_2[2] = width_channel / 2.0;
     auto const lambda_create_triangulation = [&](dealii::Triangulation<dim, dim> & tria,
                                                  std::vector<dealii::GridTools::PeriodicFacePair<
                                                    typename dealii::Triangulation<
@@ -682,18 +693,6 @@ private:
                                                    vector_local_refinements) {
       (void)periodic_face_pairs;
       (void)vector_local_refinements;
-
-      dealii::Point<dim> p_1;
-      p_1[0] = 0.;
-      p_1[1] = height_hill;
-      if(dim == 3)
-        p_1[2] = -width_channel / 2.0;
-
-      dealii::Point<dim> p_2;
-      p_2[0] = length_channel;
-      p_2[1] = height_hill + height_channel_at_hill_top;
-      if(dim == 3)
-        p_2[2] = width_channel / 2.0;
 
       // use 2 cells in x-direction on coarsest grid and 1 cell in y- and z-directions
       std::vector<unsigned int> refinements{
@@ -805,14 +804,16 @@ private:
     // semi-coarsening in the multigrid literature) to get good aspect-ratio
     // cells eventually for multigrid. We store those cells in the respective
     // data structure.
-    const unsigned int n_cells_vertical = coarse_mesh_refinements[1] * (1 << n_global_refinement);
+    const unsigned int global_refinements = grid.triangulation->n_global_levels() - 1;
+    const unsigned int n_cells_vertical   = coarse_mesh_refinements[1] * (1 << global_refinements);
     if(coarse_mesh_refinements[1] == 3 && n_cells_vertical % 24 == 0)
     {
-      auto tria2 = std::make_shared<parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
+      auto tria2 =
+        std::make_shared<dealii::parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
       std::vector<unsigned int> refinements2{4 * coarse_mesh_refinements[0],
                                              9,
                                              4 * coarse_mesh_refinements[2]};
-      GridGenerator::subdivided_hyper_rectangle(*tria2, refinements2, p_1, p_2);
+      dealii::GridGenerator::subdivided_hyper_rectangle(*tria2, refinements2, p_1, p_2);
       for(const auto & cell : tria2->cell_iterators())
       {
         if(cell->at_boundary(0))
@@ -857,25 +858,26 @@ private:
       new_position[16] = p_1[1] + 20 * size_y;
       new_position[17] = p_1[1] + 22 * size_y;
       new_position[18] = p_1[1] + 24 * size_y;
-      AssertThrow(std::abs(new_position[18] - p_2[1]) < 1e-12, ExcInternalError());
-      for(const Point<dim> & p : tria2->get_vertices())
+      AssertThrow(std::abs(new_position[18] - p_2[1]) < 1e-12, dealii::ExcInternalError());
+      for(const dealii::Point<dim> & p : tria2->get_vertices())
       {
         const unsigned int vertical_index =
           static_cast<unsigned int>(18.000001 * (p[1] - p_1[1]) / (p_2[1] - p_1[1]));
-        const_cast<Point<dim> &>(p)[1] = new_position[vertical_index];
+        const_cast<dealii::Point<dim> &>(p)[1] = new_position[vertical_index];
       }
 
-      tria2->refine_global(i - 3);
-      auto mapping2 = std::make_shared<MappingQCache<dim>>(degree);
+      tria2->refine_global(global_refinements - 3);
+      auto mapping2 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
       mapping2->initialize(*tria2, mapping_function_fine);
       grid.coarse_triangulations.push_back(tria2);
       grid.coarse_mappings.push_back(mapping2);
 
-      auto tria3 = std::make_shared<parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
+      auto tria3 =
+        std::make_shared<dealii::parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
       std::vector<unsigned int> refinements3{coarse_mesh_refinements[0],
                                              2,
                                              coarse_mesh_refinements[2]};
-      GridGenerator::subdivided_hyper_rectangle(*tria3, refinements3, p_1, p_2);
+      dealii::GridGenerator::subdivided_hyper_rectangle(*tria3, refinements3, p_1, p_2);
       for(const auto & cell : tria3->cell_iterators())
       {
         if(cell->at_boundary(0))
@@ -912,16 +914,16 @@ private:
         new_position3[i] = p_1[1] + (i + 4) * size_y;
       new_position3[15] = p_1[1] + 20 * size_y;
       new_position3[16] = p_1[1] + 24 * size_y;
-      AssertThrow(std::abs(new_position3[16] - p_2[1]) < 1e-12, ExcInternalError());
-      for(const Point<dim> & p : tria3->get_vertices())
+      AssertThrow(std::abs(new_position3[16] - p_2[1]) < 1e-12, dealii::ExcInternalError());
+      for(const dealii::Point<dim> & p : tria3->get_vertices())
       {
         const unsigned int vertical_index =
           static_cast<unsigned int>(16.000001 * (p[1] - p_1[1]) / (p_2[1] - p_1[1]));
-        const_cast<Point<dim> &>(p)[1] = new_position3[vertical_index];
+        const_cast<dealii::Point<dim> &>(p)[1] = new_position3[vertical_index];
       }
 
-      tria3->refine_global(i - 3);
-      auto mapping3 = std::make_shared<MappingQCache<dim>>(degree);
+      tria3->refine_global(global_refinements - 3);
+      auto mapping3 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
       mapping3->initialize(*tria3, mapping_function_fine);
       grid.coarse_triangulations.push_back(tria3);
       grid.coarse_mappings.push_back(mapping3);
