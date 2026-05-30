@@ -763,10 +763,6 @@ private:
                                                               lambda_create_triangulation,
                                                               {} /* no local refinements */);
 
-    // mappings
-    AssertThrow(get_element_type(*grid.triangulation) == ElementType::Hypercube,
-                dealii::ExcMessage("Only implemented for hypercube elements."));
-
     // dummy FE for compatibility with interface of dealii::FEValues
     dealii::FE_Nothing<dim>         dummy_fe;
     dealii::MappingQ1<dim>          mapping_undeformed;
@@ -776,38 +772,168 @@ private:
                                     dealii::update_quadrature_points);
     const std::vector<unsigned int> hierarchic_to_lexicographic_numbering =
       dealii::FETools::hierarchic_to_lexicographic_numbering<dim>(this->param.mapping_degree);
+    const auto mapping_function_fine =
+      [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
+      -> std::vector<dealii::Point<dim>> {
+      PeriodicHillManifold<dim> manifold(height_hill,
+                                         length_channel,
+                                         height_channel_at_hill_top,
+                                         grid_stretch_factor);
+      fe_values.reinit(cell);
+
+      std::vector<dealii::Point<dim>> points_moved(fe_values.n_quadrature_points);
+      for(unsigned int i = 0; i < fe_values.n_quadrature_points; ++i)
+      {
+        // need to adjust for hierarchic numbering of
+        // dealii::MappingQCache
+        dealii::Point<dim> const point_in_box =
+          box_distort(fe_values.quadrature_point(hierarchic_to_lexicographic_numbering[i]),
+                      consider_box_distort,
+                      length_channel,
+                      height_hill,
+                      height_channel_at_hill_top);
+        if(consider_mapping)
+          points_moved[i] = manifold.push_forward(point_in_box);
+        else
+          points_moved[i] = point_in_box;
+      }
+
+      return points_moved;
+    };
+
+    // Since we use a distorted mesh, apply an anisotropic coarsening (called
+    // semi-coarsening in the multigrid literature) to get good aspect-ratio
+    // cells eventually for multigrid. We store those cells in the respective
+    // data structure.
+    const unsigned int n_cells_vertical = coarse_mesh_refinements[1] * (1 << n_global_refinement);
+    if(coarse_mesh_refinements[1] == 3 && n_cells_vertical % 24 == 0)
+    {
+      auto tria2 = std::make_shared<parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
+      std::vector<unsigned int> refinements2{4 * coarse_mesh_refinements[0],
+                                             9,
+                                             4 * coarse_mesh_refinements[2]};
+      GridGenerator::subdivided_hyper_rectangle(*tria2, refinements2, p_1, p_2);
+      for(const auto & cell : tria2->cell_iterators())
+      {
+        if(cell->at_boundary(0))
+          cell->face(0)->set_all_boundary_ids(0 + 10);
+        if(cell->at_boundary(1))
+          cell->face(1)->set_all_boundary_ids(1 + 10);
+
+        // periodicity in z-direction
+        if(dim == 3)
+        {
+          // left element
+          if(cell->at_boundary(4))
+            cell->face(4)->set_all_boundary_ids(2 + 10);
+          if(cell->at_boundary(5))
+            cell->face(5)->set_all_boundary_ids(3 + 10);
+        }
+      }
+
+      std::vector<
+        dealii::GridTools::PeriodicFacePair<typename dealii::Triangulation<dim>::cell_iterator>>
+        periodic_face_pairs;
+      dealii::GridTools::collect_periodic_faces(*tria2, 0 + 10, 1 + 10, 0, periodic_face_pairs);
+      if(dim == 3)
+      {
+        dealii::GridTools::collect_periodic_faces(*tria2, 2 + 10, 3 + 10, 2, periodic_face_pairs);
+      }
+
+      tria2->add_periodicity(periodic_face_pairs);
+
+      // move vertices, because we only want to refine the layer of cells
+      // closest to the boundary, but match the cells in the interior.
+      tria2->refine_global(1);
+      const dealii::Triangulation<dim> & tria = *grid.triangulation;
+      const double        size_y = tria.begin(3)->vertex(2)[1] - tria.begin(3)->vertex(0)[1];
+      std::vector<double> new_position(19);
+      new_position[0] = p_1[1];
+      new_position[1] = p_1[1] + 2 * size_y;
+      new_position[2] = p_1[1] + 4 * size_y;
+      new_position[3] = p_1[1] + 6 * size_y;
+      for(unsigned int i = 4; i < 16; ++i)
+        new_position[i] = p_1[1] + (i + 3) * size_y;
+      new_position[16] = p_1[1] + 20 * size_y;
+      new_position[17] = p_1[1] + 22 * size_y;
+      new_position[18] = p_1[1] + 24 * size_y;
+      AssertThrow(std::abs(new_position[18] - p_2[1]) < 1e-12, ExcInternalError());
+      for(const Point<dim> & p : tria2->get_vertices())
+      {
+        const unsigned int vertical_index =
+          static_cast<unsigned int>(18.000001 * (p[1] - p_1[1]) / (p_2[1] - p_1[1]));
+        const_cast<Point<dim> &>(p)[1] = new_position[vertical_index];
+      }
+
+      tria2->refine_global(i - 3);
+      auto mapping2 = std::make_shared<MappingQCache<dim>>(degree);
+      mapping2->initialize(*tria2, mapping_function_fine);
+      grid.coarse_triangulations.push_back(tria2);
+      grid.coarse_mappings.push_back(mapping2);
+
+      auto tria3 = std::make_shared<parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
+      std::vector<unsigned int> refinements3{coarse_mesh_refinements[0],
+                                             2,
+                                             coarse_mesh_refinements[2]};
+      GridGenerator::subdivided_hyper_rectangle(*tria3, refinements3, p_1, p_2);
+      for(const auto & cell : tria3->cell_iterators())
+      {
+        if(cell->at_boundary(0))
+          cell->face(0)->set_all_boundary_ids(0 + 10);
+        if(cell->at_boundary(1))
+          cell->face(1)->set_all_boundary_ids(1 + 10);
+
+        // periodicity in z-direction
+        if(dim == 3)
+        {
+          // left element
+          if(cell->at_boundary(4))
+            cell->face(4)->set_all_boundary_ids(2 + 10);
+          if(cell->at_boundary(5))
+            cell->face(5)->set_all_boundary_ids(3 + 10);
+        }
+      }
+
+      periodic_face_pairs.clear();
+      dealii::GridTools::collect_periodic_faces(*tria3, 0 + 10, 1 + 10, 0, periodic_face_pairs);
+      if(dim == 3)
+      {
+        dealii::GridTools::collect_periodic_faces(*tria3, 2 + 10, 3 + 10, 2, periodic_face_pairs);
+      }
+      tria3->add_periodicity(periodic_face_pairs);
+
+      // move vertices to fit with coarser mesh
+      tria3->refine_global(3);
+      std::vector<double> new_position3(17);
+      new_position3[0] = p_1[1];
+      new_position3[1] = p_1[1] + 4 * size_y;
+      new_position3[2] = p_1[1] + 6 * size_y;
+      for(unsigned int i = 3; i < 15; ++i)
+        new_position3[i] = p_1[1] + (i + 4) * size_y;
+      new_position3[15] = p_1[1] + 20 * size_y;
+      new_position3[16] = p_1[1] + 24 * size_y;
+      AssertThrow(std::abs(new_position3[16] - p_2[1]) < 1e-12, ExcInternalError());
+      for(const Point<dim> & p : tria3->get_vertices())
+      {
+        const unsigned int vertical_index =
+          static_cast<unsigned int>(16.000001 * (p[1] - p_1[1]) / (p_2[1] - p_1[1]));
+        const_cast<Point<dim> &>(p)[1] = new_position3[vertical_index];
+      }
+
+      tria3->refine_global(i - 3);
+      auto mapping3 = std::make_shared<MappingQCache<dim>>(degree);
+      mapping3->initialize(*tria3, mapping_function_fine);
+      grid.coarse_triangulations.push_back(tria3);
+      grid.coarse_mappings.push_back(mapping3);
+    }
+
+    // mappings
+    AssertThrow(get_element_type(*grid.triangulation) == ElementType::Hypercube,
+                dealii::ExcMessage("Only implemented for hypercube elements."));
 
     const auto mapping_q_cache =
       std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
-    mapping_q_cache->initialize(
-      *grid.triangulation,
-      [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
-        -> std::vector<dealii::Point<dim>> {
-        PeriodicHillManifold<dim> manifold(height_hill,
-                                           length_channel,
-                                           height_channel_at_hill_top,
-                                           grid_stretch_factor);
-        fe_values.reinit(cell);
-
-        std::vector<dealii::Point<dim>> points_moved(fe_values.n_quadrature_points);
-        for(unsigned int i = 0; i < fe_values.n_quadrature_points; ++i)
-        {
-          // need to adjust for hierarchic numbering of
-          // dealii::MappingQCache
-          dealii::Point<dim> const point_in_box =
-            box_distort(fe_values.quadrature_point(hierarchic_to_lexicographic_numbering[i]),
-                        consider_box_distort,
-                        length_channel,
-                        height_hill,
-                        height_channel_at_hill_top);
-          if(consider_mapping)
-            points_moved[i] = manifold.push_forward(point_in_box);
-          else
-            points_moved[i] = point_in_box;
-        }
-
-        return points_moved;
-      });
+    mapping_q_cache->initialize(*grid.triangulation, mapping_function_fine);
 
     grid.mapping_function = [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
       -> std::vector<dealii::Point<dim>> {
@@ -940,7 +1066,6 @@ private:
     pp_data.error_data_p.time_control_data = pp_data.error_data_u.time_control_data;
     pp_data.error_data_p.time_control_data.trigger_interval =
       convergence_study ? (end_time - start_time) / 10.0 : flow_through_time / 5.0;
-    ;
     pp_data.error_data_p.analytical_solution.reset(
       new ManufacturedSolutionPressure<dim>(length_channel, time_period));
     pp_data.error_data_p.name                      = "pressure";
@@ -1223,7 +1348,7 @@ private:
   static double constexpr y_shift = height_hill + 0.5 * height_channel_at_hill_top;
 
   // For temporal convergence studies, we increase the frequency to increase the temporal error.
-  static bool constexpr convergence_study         = true;
+  static bool constexpr convergence_study         = false;
   static bool constexpr spatial_convergence_study = true;
   static bool constexpr temporal_convergence_study =
     convergence_study and not spatial_convergence_study;

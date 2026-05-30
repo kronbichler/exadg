@@ -238,6 +238,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
     *pde_operator->get_mapping(),
     pde_operator->get_dof_handler_p(),
     cell_vectorization_category,
+    pde_operator->get_grid().coarse_triangulations,
+    pde_operator->get_grid().coarse_mappings,
     pde_operator->get_grid().mapping_function,
     pde_operator->laplace_operator.get_data().kernel_data.IP_factor,
     this->is_test);
