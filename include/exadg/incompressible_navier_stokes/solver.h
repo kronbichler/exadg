@@ -149,7 +149,9 @@ main(int argc, char ** argv)
 
   // k-refinement, including the case where we did not set degree_max and thu
   // run the one degree set by degree_min
-  for(unsigned int degree = spatial.degree_min; degree <= std::max(spatial.degree_max, spatial.degree_min); ++degree)
+  for(unsigned int degree = spatial.degree_min;
+      degree <= std::max(spatial.degree_max, spatial.degree_min);
+      ++degree)
   {
     // h-refinement
     for(unsigned int refine_space = spatial.refine_space_min;

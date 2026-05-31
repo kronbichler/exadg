@@ -974,7 +974,7 @@ public:
                                                                         mg_matrices[level - 1]);
         mg_transfers[level - 1] = std::move(transfer);
       }
-      else if (level > 0)
+      else if(level > 0)
       {
         auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();
         transfer->reinit(dof_h,
