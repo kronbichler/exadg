@@ -234,13 +234,26 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   op_rt->initialize_coupling_pressure(pde_operator->get_dof_handler_p().get_fe(),
                                       laplace_op->get_dof_indices());
 
-  poisson_preconditioner = std::make_shared<LaplaceOperator::PoissonPreconditionerMG<dim, float>>(
-    *pde_operator->get_mapping(),
-    pde_operator->get_dof_handler_p(),
-    cell_vectorization_category,
-    pde_operator->get_grid().mapping_function,
-    pde_operator->laplace_operator.get_data().kernel_data.IP_factor,
-    this->is_test);
+  // depending on whether we have additional grids provided, enter the path
+  // with semi-coarsening possibilities or or
+  if(pde_operator->get_grid().coarse_triangulations.empty())
+    poisson_preconditioner = std::make_shared<LaplaceOperator::PoissonPreconditionerMG<dim, float>>(
+      *pde_operator->get_mapping(),
+      pde_operator->get_dof_handler_p(),
+      cell_vectorization_category,
+      pde_operator->get_grid().mapping_function,
+      pde_operator->laplace_operator.get_data().kernel_data.IP_factor,
+      this->is_test);
+  else
+    poisson_preconditioner = std::make_shared<LaplaceOperator::PoissonPreconditionerMG<dim, float>>(
+      *pde_operator->get_mapping(),
+      pde_operator->get_dof_handler_p(),
+      cell_vectorization_category,
+      pde_operator->get_grid().coarse_triangulations,
+      pde_operator->get_grid().coarse_mappings,
+      pde_operator->get_grid().mapping_function,
+      pde_operator->laplace_operator.get_data().kernel_data.IP_factor,
+      this->is_test);
 
   for(unsigned int i = 0; i < pressure.size(); ++i)
     poisson_preconditioner->get_dg_matrix().initialize_dof_vector(pressure[i]);
