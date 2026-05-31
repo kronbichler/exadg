@@ -147,12 +147,13 @@ main(int argc, char ** argv)
   ExaDG::SpatialResolutionParametersMinMax spatial(input_file);
   ExaDG::TemporalResolutionParameters      temporal(input_file);
 
-  // k-refinement
-  for(unsigned int degree = spatial.degree_min; degree <= spatial.degree_max; ++degree)
+  // k-refinement, including the case where we did not set degree_max and thu
+  // run the one degree set by degree_min
+  for(unsigned int degree = spatial.degree_min; degree <= std::max(spatial.degree_max, spatial.degree_min); ++degree)
   {
     // h-refinement
     for(unsigned int refine_space = spatial.refine_space_min;
-        refine_space <= spatial.refine_space_max;
+        refine_space <= std::max(spatial.refine_space_max, spatial.refine_space_min);
         ++refine_space)
     {
       // dt-refinement

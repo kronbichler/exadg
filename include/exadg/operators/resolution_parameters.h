@@ -57,7 +57,7 @@ struct SpatialResolutionParametersMinMax
                         degree_max,
                         "Maximal polynomial degree of shape functions.",
                         dealii::Patterns::Integer(1),
-                        true);
+                        false);
       prm.add_parameter("RefineSpaceMin",
                         refine_space_min,
                         "Minimal number of mesh refinements.",
@@ -67,7 +67,7 @@ struct SpatialResolutionParametersMinMax
                         refine_space_max,
                         "Maximal number of mesh refinements.",
                         dealii::Patterns::Integer(0, 20),
-                        true);
+                        false);
     }
     prm.leave_subsection();
   }
