@@ -1342,6 +1342,7 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
 
   // Define grid-to-grid projection data for all projections used here.
   ExaDG::GridToGridProjection::GridToGridProjectionData<dim> projection_data;
+  projection_data.grids_and_maps_identical        = false;
   projection_data.solver_data                     = param.restart_data.solver_data;
   projection_data.rpe_data.rtree_level            = param.restart_data.rpe_rtree_level;
   projection_data.rpe_data.tolerance              = param.restart_data.rpe_tolerance_unit_cell;
@@ -1423,6 +1424,8 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
     // but between grids that have the same refinement level and mapping to improve stability by
     // *avoiding* `dealii::RemotePointEvaluation`.
     {
+      projection_data.grids_and_maps_identical = true;
+
       this->pcout << "\n"
                   << "VELOCITY PROJECTION IN DEFORMED GRID\n\n";
 

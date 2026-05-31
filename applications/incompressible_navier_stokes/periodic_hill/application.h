@@ -1052,7 +1052,7 @@ private:
     pp_data.output_data.write_processor_id = true;
 
     // calculation of velocity error
-    pp_data.error_data_u.time_control_data.is_active  = true;
+    pp_data.error_data_u.time_control_data.is_active  = convergence_study;
     pp_data.error_data_u.time_control_data.start_time = start_time;
     pp_data.error_data_u.time_control_data.trigger_interval =
       convergence_study ? (end_time - start_time) / 10.0 : flow_through_time / 5.0;
