@@ -111,12 +111,12 @@ public:
     const double curve_length_sloped  = std::sqrt(1. + slope_assumed * slope_assumed);
     const double curve_length =
       0.5 * (scaling_curved_start + scaling_curved_end) * (curve_length_sloped - 1.) + LENGTH / 2;
-    x_transition_points = {0.0,
-                           curve_length_sloped * scaling_curved_start * LENGTH * 0.5 / curve_length,
-                           LENGTH * 0.5 -
-                             (LENGTH * 0.5 - scaling_curved_end) * LENGTH * 0.5 / curve_length,
-                           LENGTH * 0.5};
-    x_transition_values = {0.0, scaling_curved_start, scaling_curved_end, LENGTH * 0.5};
+    x_transition_points = {
+      {0.0,
+       curve_length_sloped * scaling_curved_start * LENGTH * 0.5 / curve_length,
+       LENGTH * 0.5 - (LENGTH * 0.5 - scaling_curved_end) * LENGTH * 0.5 / curve_length,
+       LENGTH * 0.5}};
+    x_transition_values = {{0.0, scaling_curved_start, scaling_curved_end, LENGTH * 0.5}};
   }
 
   dealii::Point<dim>
