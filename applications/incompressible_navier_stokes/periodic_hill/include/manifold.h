@@ -80,37 +80,56 @@ f(double x_m, double const H, double const LENGTH)
   return mm_to_m(y);
 }
 
+
+
 template<int dim>
 class PeriodicHillManifold : public dealii::ChartManifold<dim>
 {
 public:
-  PeriodicHillManifold(double const H,
-                       double const LENGTH,
-                       double const HEIGHT,
-                       double const GRID_STRETCH_FAC)
+  PeriodicHillManifold(const double H,
+                       const double LENGTH,
+                       const double HEIGHT,
+                       const double GRID_STRETCH_FAC)
     : dealii::ChartManifold<dim>(),
       H(H),
       LENGTH(LENGTH),
       HEIGHT(HEIGHT),
-      GRID_STRETCH_FAC(GRID_STRETCH_FAC)
+      GRID_STRETCH_FAC(GRID_STRETCH_FAC),
+      tanh_gamma(std::tanh(GRID_STRETCH_FAC))
   {
+    // Assume we have a slope of -1.8 (the actual slope extremum is around
+    // -0.86, but due to resolution requirements near the hill top choose a
+    // higher value), and then transition from a steeper path of curve length
+    // to the more flat part. Start by defining a piecewise linear function (a
+    // more complicated function to check the actual path was tried but found
+    // to not be better but just more expensive) and then transition over a
+    // length corresponding to the hill height to the flat part; the actual
+    // evaluation will use a quintic Hermite interpolating polynomial.
+    const double slope_assumed        = -2;
+    const double scaling_curved_start = 0.7 * H;
+    const double scaling_curved_end   = 1.8 * H;
+    const double curve_length_sloped  = std::sqrt(1. + slope_assumed * slope_assumed);
+    const double curve_length =
+      0.5 * (scaling_curved_start + scaling_curved_end) * (curve_length_sloped - 1.) + LENGTH / 2;
+    x_transition_points = {0.0,
+                           curve_length_sloped * scaling_curved_start * LENGTH * 0.5 / curve_length,
+                           LENGTH * 0.5 -
+                             (LENGTH * 0.5 - scaling_curved_end) * LENGTH * 0.5 / curve_length,
+                           LENGTH * 0.5};
+    x_transition_values = {0.0, scaling_curved_start, scaling_curved_end, LENGTH * 0.5};
   }
 
   dealii::Point<dim>
-  push_forward(dealii::Point<dim> const & xi) const final
+  push_forward(const dealii::Point<dim> & xi) const final
   {
     dealii::Point<dim> x = xi;
 
     // transform y-coordinate only
-    double const gamma           = GRID_STRETCH_FAC;
-    double const xi_1_normalized = (xi[1] - H) / HEIGHT;
-    double const xi_1_hat = std::tanh(gamma * (2.0 * xi_1_normalized - 1.0)) / std::tanh(gamma);
-    double const xi_0_a   = x[0] < LENGTH / 2 ? x[0] : LENGTH - x[0];
-    double const xi_0_b =
-      xi_0_a < 0.25 * LENGTH ?
-        ((xi_0_a + 0.2 * LENGTH) * xi_0_a * 0.2 / (0.25 * 0.45 * LENGTH)) :
-        (0.5 * LENGTH - xi_0_a) * (0.2 / 0.25) + (xi_0_a - 0.25 * LENGTH) * (0.5 / 0.25);
-    double const       xi_0 = x[0] < LENGTH / 2 ? xi_0_b : LENGTH - xi_0_b;
+    const double gamma           = GRID_STRETCH_FAC;
+    const double xi_1_normalized = (xi[1] - H) / HEIGHT;
+    const double xi_1_hat        = std::tanh(gamma * (2.0 * xi_1_normalized - 1.0)) / tanh_gamma;
+    const double xi_0 =
+      x[0] < LENGTH / 2 ? get_scaled_x_point(x[0]) : LENGTH - get_scaled_x_point(LENGTH - x[0]);
     dealii::Point<dim> xi_bottom;
     xi_bottom[0] = xi_0;
     xi_bottom[1] = H + f(xi_0, H, LENGTH);
@@ -122,15 +141,15 @@ public:
   }
 
   dealii::Point<dim>
-  pull_back(dealii::Point<dim> const & x) const final
+  pull_back(const dealii::Point<dim> & x) const final
   {
     dealii::Point<dim> xi = x;
 
     // transform y-coordinate only
-    double const f_x      = f(x[0], H, LENGTH);
-    double const xi_1_hat = (2.0 * x[1] - 2.0 * H - HEIGHT - f_x) / (HEIGHT - f_x);
-    double const gamma    = GRID_STRETCH_FAC;
-    xi[1] = HEIGHT / 2.0 * (std::atanh(xi_1_hat * std::tanh(gamma)) / gamma + 1) + H;
+    const double f_x      = f(x[0], H, LENGTH);
+    const double xi_1_hat = (2.0 * x[1] - 2.0 * H - HEIGHT - f_x) / (HEIGHT - f_x);
+    const double gamma    = GRID_STRETCH_FAC;
+    xi[1]                 = HEIGHT / 2.0 * (std::atanh(xi_1_hat * tanh_gamma) / gamma + 1) + H;
 
     return xi;
   }
@@ -141,8 +160,51 @@ public:
     return std::make_unique<PeriodicHillManifold<dim>>(H, LENGTH, HEIGHT, GRID_STRETCH_FAC);
   }
 
+  double
+  get_scaled_x_point(const double x_in) const
+  {
+    if(x_in >= x_transition_points[2])
+      return (x_transition_values[2] * (x_transition_points[3] - x_in) +
+              x_transition_values[3] * (x_in - x_transition_points[2])) /
+             (x_transition_points[3] - x_transition_points[2]);
+    else if(x_in < x_transition_points[1])
+      return (x_transition_values[1] * x_in) / x_transition_points[1];
+    else
+    {
+      // evaluate Hermite interpolating polynomial between
+      // transition_points[1] and transition_points[2]
+      const double x0  = x_transition_points[1];
+      const double x1  = x_transition_points[2];
+      const double y0  = x_transition_values[1];
+      const double y1  = x_transition_values[2];
+      const double yp0 = (x_transition_values[1] - x_transition_values[0]) /
+                         (x_transition_points[1] - x_transition_points[0]);
+      const double yp1 = (x_transition_values[3] - x_transition_values[2]) /
+                         (x_transition_points[3] - x_transition_points[2]);
+      const double t = (x_in - x0) / (x1 - x0);
+
+      // terms for cubic polynomial
+      // const double h00 = (1 + 2*t) * (1 - t) * (1 - t);
+      // const double h10 = t * (1 - t) * (1 - t);
+      // const double h01 = t * t * (3 - 2*t);
+      // const double h11 = t * t * (t - 1);
+
+      // define a quintic polynomial with second derivative zero at the end
+      // points, so ignore the part involving second derivatives, which
+      // leads to four contributions similar to the cubic Hermite polynomial
+      const double h00 = 1. + t * t * t * (-10. + t * (15. - 6. * t));
+      const double h01 = t + t * t * t * (-6. + t * (8. - 3. * t));
+      const double h10 = t * t * t * (10. + t * (-15. + 6. * t));
+      const double h11 = t * t * t * (-4. + t * (7. - 3. * t));
+      return h00 * y0 + h10 * y1 + (x1 - x0) * (h01 * yp0 + h11 * yp1);
+    }
+  }
+
 private:
-  double const H, LENGTH, HEIGHT, GRID_STRETCH_FAC;
+  const double          H, LENGTH, HEIGHT, GRID_STRETCH_FAC;
+  const double          tanh_gamma;
+  std::array<double, 4> x_transition_points;
+  std::array<double, 4> x_transition_values;
 };
 
 } // namespace ExaDG
