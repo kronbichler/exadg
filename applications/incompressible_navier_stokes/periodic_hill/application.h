@@ -503,9 +503,21 @@ private:
     // sample end time is equal to end time, which is read from the input file
     sample_end_time = end_time;
 
-    // need to recompute the width, since we make it dependent on the number of elements in z
-    // direction, or rather, the ratio between elements in x and z direction
-    width_channel = length_channel * coarse_mesh_refinements[2] / coarse_mesh_refinements[0];
+    // We recompute the width, since we make it dependent on the number of elements in z direction,
+    // or rather, the ratio between elements in x and z direction. A certain minimum width of the
+    // domain has to be guaranteed as the flow is in general three-dimensional, which is observed
+    // for higher Reynolds numbers.
+    double const width_factor = static_cast<double>(coarse_mesh_refinements[2]) /
+                                static_cast<double>(coarse_mesh_refinements[0]);
+    width_channel = length_channel * width_factor;
+    AssertThrow(width_factor > 0.5 - 1e-12,
+                dealii::ExcMessage("The width of the channel needs to be at least 4.5 times "
+                                   "the height of the hill, i.e., W >= 4.5 * H = 0.5 * L. "
+                                   "The selected refinement parameters: [" +
+                                   std::to_string(coarse_mesh_refinements[0]) + ", " +
+                                   std::to_string(coarse_mesh_refinements[1]) + ", " +
+                                   std::to_string(coarse_mesh_refinements[2]) +
+                                   "] lead to W = " + std::to_string(width_factor) + " L."));
 
     // recompute target flow rate as it depends on the width
     target_flow_rate = bulk_velocity * width_channel * height_channel_at_hill_top;
