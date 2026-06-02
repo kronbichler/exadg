@@ -1427,7 +1427,7 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
       projection_data.grids_and_maps_identical = true;
 
       this->pcout << "\n"
-                  << "VELOCITY PROJECTION IN DEFORMED GRID\n\n";
+                  << "VELOCITY PROJECTION IN DEFORMED GRID: FAST PATH AVOIDING RPE\n\n";
 
       checkpoint_mapping = this->get_mapping();
 
