@@ -6,9 +6,7 @@
     },
     "SpatialResolution": {
         "DegreeMin": "5",
-        "DegreeMax": "5",
-        "RefineSpaceMin": "3",
-        "RefineSpaceMax": "3"
+        "RefineSpaceMin": "3"
     },
     "TemporalResolution": {
         "RefineTimeMin": "0",
