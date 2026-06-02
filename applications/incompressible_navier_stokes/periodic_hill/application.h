@@ -414,8 +414,8 @@ public:
 
     prm.enter_subsection("Application");
     {
-      prm.add_parameter("UseManufacturedSolution",
-                        use_manufactured_solution,
+      prm.add_parameter("ConvergenceStudy",
+                        convergence_study,
                         "Use a manufactured solution to compute errors in the box domain.",
                         dealii::Patterns::Bool());
       prm.add_parameter("ConsiderBoxDistort",
@@ -860,9 +860,9 @@ private:
   void
   set_field_functions() final
   {
-    if(use_manufactured_solution)
+    if(convergence_study)
     {
-      AssertThrow(use_manufactured_solution == true and consider_mapping == false,
+      AssertThrow(convergence_study == true and consider_mapping == false,
                   dealii::ExcMessage("Manufactured solution is defined on the box grid, "
                                      "cannot consider mapping to periodic hill."));
 
@@ -916,15 +916,13 @@ private:
     pp_data.output_data.write_vorticity           = true;
     pp_data.output_data.write_vorticity_magnitude = false;
     pp_data.output_data.write_q_criterion         = true;
-    pp_data.output_data.degree             = spatial_discretization == SpatialDiscretization::L2 ?
-                                               this->param.degree_u :
-                                               this->param.degree_u - 1;
-    pp_data.output_data.write_higher_order = true;
-    pp_data.output_data.write_aspect_ratio = false;
-    pp_data.output_data.write_processor_id = true;
+    pp_data.output_data.degree                    = this->param.degree_u;
+    pp_data.output_data.write_higher_order        = true;
+    pp_data.output_data.write_aspect_ratio        = false;
+    pp_data.output_data.write_processor_id        = true;
 
     // calculation of velocity error
-    pp_data.error_data_u.time_control_data.is_active  = true;
+    pp_data.error_data_u.time_control_data.is_active  = convergence_study;
     pp_data.error_data_u.time_control_data.start_time = start_time;
     pp_data.error_data_u.time_control_data.trigger_interval =
       convergence_study ? (end_time - start_time) / 10.0 : flow_through_time / 5.0;
@@ -932,8 +930,8 @@ private:
     pp_data.error_data_u.analytical_solution.reset(new ManufacturedSolutionVelocity<dim>(
       height_channel_at_hill_top, length_channel, y_shift, time_period));
     pp_data.error_data_u.name                      = "velocity";
-    pp_data.error_data_u.compute_convergence_table = use_manufactured_solution;
-    pp_data.error_data_u.write_errors_to_file      = use_manufactured_solution;
+    pp_data.error_data_u.compute_convergence_table = convergence_study;
+    pp_data.error_data_u.write_errors_to_file      = convergence_study;
     pp_data.error_data_u.calculate_relative_errors = false;
     pp_data.error_data_u.directory                 = this->output_parameters.directory;
 
@@ -944,8 +942,8 @@ private:
     pp_data.error_data_p.analytical_solution.reset(
       new ManufacturedSolutionPressure<dim>(length_channel, time_period));
     pp_data.error_data_p.name                      = "pressure";
-    pp_data.error_data_p.compute_convergence_table = use_manufactured_solution;
-    pp_data.error_data_p.write_errors_to_file      = use_manufactured_solution;
+    pp_data.error_data_p.compute_convergence_table = convergence_study;
+    pp_data.error_data_p.write_errors_to_file      = convergence_study;
     pp_data.error_data_p.calculate_relative_errors = false;
     pp_data.error_data_p.directory                 = this->output_parameters.directory;
 
@@ -1222,11 +1220,12 @@ private:
   // respect to the y coordinate. This compensates for the offset of the constructed domain.
   static double constexpr y_shift = height_hill + 0.5 * height_channel_at_hill_top;
 
+  // Activates manufactured solution case on undeformed box grid to compute errors.
+  bool convergence_study = false; // read from input file
+
   // For temporal convergence studies, we increase the frequency to increase the temporal error.
-  static bool constexpr convergence_study         = true;
   static bool constexpr spatial_convergence_study = true;
-  static bool constexpr temporal_convergence_study =
-    convergence_study and not spatial_convergence_study;
+  bool temporal_convergence_study = convergence_study and not spatial_convergence_study;
   static double constexpr time_period =
     2.0 * dealii::numbers::PI * (spatial_convergence_study ? 1.0 : 1e-4);
 
@@ -1244,9 +1243,6 @@ private:
   double const start_time         = 0.0;
   double       end_time_multiples = 10.0;
   double       end_time = temporal_convergence_study ? 0.1 : end_time_multiples * flow_through_time;
-
-  // compute convergence study else execute benchmark
-  bool use_manufactured_solution = false;
 
   // grid
   bool   consider_box_distort = false; // distort the box grid before mapping
