@@ -72,7 +72,6 @@ struct SpatialResolutionParametersMinMax
     prm.leave_subsection();
   }
 
-  unsigned int degree_min = 3;
   unsigned int degree_min = 0;
   unsigned int degree_max = 0;
 
