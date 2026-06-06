@@ -56,7 +56,7 @@ struct SpatialResolutionParametersMinMax
       prm.add_parameter("DegreeMax",
                         degree_max,
                         "Maximal polynomial degree of shape functions.",
-                        dealii::Patterns::Integer(1),
+                        dealii::Patterns::Integer(0),
                         false);
       prm.add_parameter("RefineSpaceMin",
                         refine_space_min,
@@ -72,7 +72,7 @@ struct SpatialResolutionParametersMinMax
     prm.leave_subsection();
   }
 
-  unsigned int degree_min = 0;
+  unsigned int degree_min = 1;
   unsigned int degree_max = 0;
 
   unsigned int refine_space_min = 0;
