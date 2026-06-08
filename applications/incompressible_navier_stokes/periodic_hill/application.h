@@ -812,16 +812,27 @@ private:
       return points_moved;
     };
 
-    // Since we use a distorted mesh, apply an anisotropic coarsening (called
-    // semi-coarsening in the multigrid literature) to get good aspect-ratio
-    // cells eventually for multigrid. We store those cells in the respective
-    // data structure.
+    // Since we use a distorted mesh, using an anisotropic coarsening (called
+    // semi-coarsening in the multigrid literature) will allow us to get a
+    // better aspect-ratio cells eventually for multigrid. We hard-code a
+    // variant for a particular set of refinements in y-direction: In case the
+    // user gives us a mesh with 3 coarse grid cells and we additionally have
+    // at least 3 global refinements (giving a multiple of 24 cells in
+    // y-direction), we can use the following coarsening steps: 24 -> 18 -> 16
+    // cells. The number of coarse cells in x and z direction will not be
+    // changed.
     const unsigned int global_refinements = grid.triangulation->n_global_levels() - 1;
-    const unsigned int n_cells_vertical   = coarse_mesh_refinements[1] * (1 << global_refinements);
-    if(coarse_mesh_refinements[1] == 3 && n_cells_vertical % 24 == 0)
+    if(coarse_mesh_refinements[1] == 3 && global_refinements >= 3)
     {
       auto tria2 =
         std::make_shared<dealii::parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
+
+      // We will represent the next coarser mesh starting from a base mesh of
+      // 9 elements in vertical direction, which will be refined once more to
+      // get to 18 cells. Since the 9 mesh elements will be matched with a
+      // 12-cell base mesh, and we assumed the fine-level mesh to have started
+      // from 3 vertical cells, we need to multiply the x and z refinements by
+      // 4 to get the same number of cells.
       std::vector<unsigned int> refinements2{4 * coarse_mesh_refinements[0],
                                              9,
                                              4 * coarse_mesh_refinements[2]};
@@ -855,10 +866,21 @@ private:
 
       tria2->add_periodicity(periodic_face_pairs);
 
-      // move vertices, because we only want to refine the layer of cells
-      // closest to the boundary, but match the cells in the interior.
+      // Move vertices to match the anisotropically coarsened cells with the
+      // ones on the refined side to actually create a geometric nesting of
+      // cells. This is a crucial step, since the 'tria2' object we created
+      // here will have a different positioning of most vertices compared to
+      // the fine level one. Since the anisotropy will be injected by a
+      // mapping rather than represented in the triangulation, the vertex
+      // positions in y-direction will here be moved in steps of 2 of the fine
+      // mesh, using 3 layers both at the y-bottom and y-top region of 3
+      // coarse cells (6 fine cells). On the other hand, the position of the
+      // central part will be matched with the fine size.
       tria2->refine_global(1);
       const dealii::Triangulation<dim> & tria = *grid.triangulation;
+      AssertThrow(tria.n_levels() >= 4,
+                  dealii::ExcMessage("Expected to have at least 4 levels on the mesh when entering "
+                                     "this code path. Do you use more processes than mesh cells?"));
       const double        size_y = tria.begin(3)->vertex(2)[1] - tria.begin(3)->vertex(0)[1];
       std::vector<double> new_position(19);
       new_position[0] = p_1[1];
@@ -878,12 +900,21 @@ private:
         const_cast<dealii::Point<dim> &>(p)[1] = new_position[vertical_index];
       }
 
+      // Apply the remaining refinements and then append this triangulation to
+      // the coarse triangulations stored with the grid, which will be used
+      // for the multigrid setup.
       tria2->refine_global(global_refinements - 3);
       auto mapping2 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
       mapping2->initialize(*tria2, mapping_function_fine);
       grid.coarse_triangulations.push_back(tria2);
       grid.coarse_mappings.push_back(mapping2);
 
+      // Now to the next round of cells: This time, we target 2 coarse mesh
+      // cells with the same refinement applied as for the finest-level grid
+      // (i.e., 16 in refined configuration), which will be matched with the
+      // 18 cells on the next finer grid level. This means that we only
+      // coarsen the 2 cell layers closest to the boundary into 1 layer of
+      // cells.
       auto tria3 =
         std::make_shared<dealii::parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
       std::vector<unsigned int> refinements3{coarse_mesh_refinements[0],
@@ -916,16 +947,19 @@ private:
       }
       tria3->add_periodicity(periodic_face_pairs);
 
-      // move vertices to fit with coarser mesh
+      // Move vertices to fit with the next finer mesh: We want to aggregate 2
+      // layers of mesh elements closest to the boundary from the previous
+      // round into one cell layer. We pick up the values from the previous
+      // round to not make mistakes here.
       tria3->refine_global(3);
       std::vector<double> new_position3(17);
-      new_position3[0] = p_1[1];
-      new_position3[1] = p_1[1] + 4 * size_y;
-      new_position3[2] = p_1[1] + 6 * size_y;
+      new_position3[0] = new_position[0];
+      new_position3[1] = new_position[2];
+      new_position3[2] = new_position[3];
       for(unsigned int i = 3; i < 15; ++i)
-        new_position3[i] = p_1[1] + (i + 4) * size_y;
-      new_position3[15] = p_1[1] + 20 * size_y;
-      new_position3[16] = p_1[1] + 24 * size_y;
+        new_position3[i] = new_position[1 + i];
+      new_position3[15] = new_position[16];
+      new_position3[16] = new_position[18];
       AssertThrow(std::abs(new_position3[16] - p_2[1]) < 1e-12, dealii::ExcInternalError());
       for(const dealii::Point<dim> & p : tria3->get_vertices())
       {

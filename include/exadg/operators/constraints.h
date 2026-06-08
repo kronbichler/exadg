@@ -23,13 +23,64 @@
 #define EXADG_OPERATORS_CONSTRAINTS_H_
 
 // deal.II
+#include <deal.II/base/std_cxx20/type_traits.h>
 #include <deal.II/dofs/dof_tools.h>
+#include <deal.II/lac/affine_constraints.h>
 
 // ExaDG
 #include <exadg/grid/grid_utilities.h>
 
 namespace ExaDG
 {
+// Manually implement periodicity constraints, because the deal.II
+// implementation places the constraints the 'wrong' way around, leading to a
+// case with more unknowns on the processor with the lower rank and less on
+// the higher ranks. This function constrains the unknown on the lower-left
+// boundary by the one on the upper-right boundary. This is coherent with the
+// strategy that DoFs on interfaces of two processes are assigned to the
+// process with lower rank.
+namespace Periodicity
+{
+template<typename FaceIterator, typename Number>
+void
+make_periodicity_constraints_recursively(
+  const FaceIterator &                                     face_1,
+  const dealii::std_cxx20::type_identity_t<FaceIterator> & face_2,
+  dealii::AffineConstraints<Number> &                      affine_constraints)
+{
+  if(face_1->has_children())
+  {
+    if(!face_2->has_children())
+      return;
+    for(unsigned int i = 0; i < face_1->n_children(); ++i)
+      make_periodicity_constraints_recursively(face_1->child(i),
+                                               face_2->child(i),
+                                               affine_constraints);
+  }
+  else
+  {
+    const unsigned int dofs_per_face = face_1->get_fe(0).n_dofs_per_face(0);
+    std::vector<dealii::types::global_dof_index> dofs_1(dofs_per_face);
+    std::vector<dealii::types::global_dof_index> dofs_2(dofs_per_face);
+
+    face_1->get_dof_indices(dofs_1, 0);
+    face_2->get_dof_indices(dofs_2, 0);
+    for(unsigned int i = 0; i < dofs_per_face; ++i)
+      if(dofs_1[i] == dealii::numbers::invalid_dof_index ||
+         dofs_2[i] == dealii::numbers::invalid_dof_index)
+        return;
+    for(unsigned int i = 0; i < dofs_per_face; ++i)
+    {
+      if(!affine_constraints.is_constrained(dofs_1[i]))
+        affine_constraints.add_constraint(dofs_1[i], {{dofs_2[i], 1.0}});
+    }
+  }
+}
+
+} // namespace Periodicity
+
+
+
 /**
  * This function adds hanging-node and periodicity constraints. This function combines these two
  * types of constraints since deal.II requires to add these constraints in a certain order.

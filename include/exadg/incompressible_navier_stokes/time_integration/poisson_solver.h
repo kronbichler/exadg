@@ -42,6 +42,7 @@
 #include <deal.II/numerics/vector_tools.h>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/laplace_operator_extruded.h>
+#include <exadg/operators/constraints.h>
 
 
 namespace LaplaceOperator
@@ -68,53 +69,11 @@ make_zero_mean(const std::vector<unsigned int> &                    constrained_
 
 
 
-// Manually implement periodicity constraints, because the deal.II
-// implementation places the constraints the 'wrong' way around, leading to a
-// case with more unknowns on the processor with the lower rank and less on
-// the higher ranks. This function constrains the unknown on the lower-left
-// boundary by the one on the upper-right boundary. This is coherent with the
-// strategy that DoFs on interfaces of two processes are assigned to the
-// process with lower rank.
-namespace Periodicity
-{
-template<typename FaceIterator, typename Number>
-void
-make_periodicity_constraints_recursively(const FaceIterator &                             face_1,
-                                         const std_cxx20::type_identity_t<FaceIterator> & face_2,
-                                         AffineConstraints<Number> & affine_constraints)
-{
-  if(face_1->has_children())
-  {
-    if(!face_2->has_children())
-      return;
-    for(unsigned int i = 0; i < face_1->n_children(); ++i)
-      make_periodicity_constraints_recursively(face_1->child(i),
-                                               face_2->child(i),
-                                               affine_constraints);
-  }
-  else
-  {
-    const unsigned int                   dofs_per_face = face_1->get_fe(0).n_dofs_per_face(0);
-    std::vector<types::global_dof_index> dofs_1(dofs_per_face);
-    std::vector<types::global_dof_index> dofs_2(dofs_per_face);
-
-    face_1->get_dof_indices(dofs_1, 0);
-    face_2->get_dof_indices(dofs_2, 0);
-    for(unsigned int i = 0; i < dofs_per_face; ++i)
-      if(dofs_1[i] == numbers::invalid_dof_index || dofs_2[i] == numbers::invalid_dof_index)
-        return;
-    for(unsigned int i = 0; i < dofs_per_face; ++i)
-    {
-      if(!affine_constraints.is_constrained(dofs_1[i]))
-        affine_constraints.add_constraint(dofs_1[i], {{dofs_2[i], 1.0}});
-    }
-  }
-}
-
-} // namespace Periodicity
-
-
-
+/**
+ * This is a specialized transfer operator, designed for transfer between
+ * p-levels only, that aims to utilize the fact that we have the same cells
+ * and the same cell order to design a highly efficient transfer operation.
+ */
 template<int dim, typename Number>
 class MGTwoLevelTransferFromOperator
   : public MGTwoLevelTransferBase<dim, LinearAlgebra::distributed::Vector<Number>>
@@ -127,6 +86,63 @@ public:
                                  const LaplaceOperatorFE<dim, Number> & operator_coarse)
     : operator_fine(operator_fine), operator_coarse(operator_coarse)
   {
+    AssertThrow(operator_fine.get_matrix_free()
+                    .get_dof_handler()
+                    .get_triangulation()
+                    .n_global_active_cells() == operator_coarse.get_matrix_free()
+                                                  .get_dof_handler()
+                                                  .get_triangulation()
+                                                  .n_global_active_cells(),
+                ExcMessage("This transfer is designed for polynomial transfer between "
+                           "matrix-free operators defined on the same mesh, but found "
+                           "meshes with " +
+                           std::to_string(operator_fine.get_matrix_free()
+                                            .get_dof_handler()
+                                            .get_triangulation()
+                                            .n_global_active_cells()) +
+                           " and " +
+                           std::to_string(operator_coarse.get_matrix_free()
+                                            .get_dof_handler()
+                                            .get_triangulation()
+                                            .n_global_active_cells()) +
+                           " global cells, respectively."));
+    AssertThrow(
+      operator_fine.get_matrix_free().get_dof_handler().get_triangulation().n_active_cells() ==
+        operator_coarse.get_matrix_free().get_dof_handler().get_triangulation().n_active_cells(),
+      ExcMessage(
+        "This transfer is designed for polynomial transfer between "
+        "matrix-free operators defined on the same mesh partitioned "
+        "in the same way, but found meshes with " +
+        std::to_string(
+          operator_fine.get_matrix_free().get_dof_handler().get_triangulation().n_active_cells()) +
+        " and " +
+        std::to_string(operator_coarse.get_matrix_free()
+                         .get_dof_handler()
+                         .get_triangulation()
+                         .n_active_cells()) +
+        " cells owned on the current MPI process, respectively."));
+    AssertDimension(operator_fine.get_matrix_free().n_cell_batches(),
+                    operator_coarse.get_matrix_free().n_cell_batches());
+    for(unsigned int cell = 0; cell < operator_fine.get_matrix_free().n_cell_batches(); ++cell)
+    {
+      for(unsigned int v = 0;
+          v < operator_fine.get_matrix_free().n_active_entries_per_cell_batch(cell);
+          ++v)
+      {
+        AssertThrow(
+          operator_fine.get_matrix_free().get_cell_iterator(cell, v)->level() ==
+              operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->level() &&
+            operator_fine.get_matrix_free().get_cell_iterator(cell, v)->index() ==
+              operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->index(),
+          ExcMessage(
+            "The cell iterators on refined / coarse side did not match, "
+            "do both MatrixFree objects use the same ordering of cells? Got: " +
+            operator_fine.get_matrix_free().get_cell_iterator(cell, v)->id().to_string() + " vs " +
+            operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->id().to_string() + " " +
+            std::to_string(cell) + " " + std::to_string(v)));
+      }
+    }
+
     // find unique indices of prolongation to identify the actual read pattern
     fine_dof_indices = operator_fine.get_compressed_dof_indices();
     const unsigned int degree_fine =
@@ -143,25 +159,6 @@ public:
         touched_dof[dof] = 1;
       else
         dof = numbers::invalid_unsigned_int;
-
-    for(unsigned int cell = 0; cell < operator_fine.get_matrix_free().n_cell_batches(); ++cell)
-    {
-      for(unsigned int v = 0;
-          v < operator_fine.get_matrix_free().n_active_entries_per_cell_batch(cell);
-          ++v)
-      {
-        AssertThrow(
-          operator_fine.get_matrix_free().get_cell_iterator(cell, v)->level() ==
-              operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->level() &&
-            operator_fine.get_matrix_free().get_cell_iterator(cell, v)->index() ==
-              operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->index(),
-          ExcMessage(
-            "Mismatch in cells " +
-            operator_fine.get_matrix_free().get_cell_iterator(cell, v)->id().to_string() + " vs " +
-            operator_coarse.get_matrix_free().get_cell_iterator(cell, v)->id().to_string() + " " +
-            std::to_string(cell) + " " + std::to_string(v)));
-      }
-    }
 
     all_indices_unconstrained.resize(fine_dof_indices.size() / n_lanes, 0);
 
@@ -187,9 +184,8 @@ public:
   {
     src.update_ghost_values();
 
-    const unsigned int size_fine = prolongation_matrix.n();
-    const unsigned int n_cell_batches =
-      fine_dof_indices.size() / n_lanes / Utilities::pow(std::min(3u, size_fine), dim);
+    const unsigned int size_fine      = prolongation_matrix.n();
+    const unsigned int n_cell_batches = operator_fine.get_matrix_free().n_cell_batches();
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
       if(size_fine == 2)
@@ -223,10 +219,8 @@ public:
   void
   restrict_and_add(VectorType & dst, const VectorType & src) const override
   {
-    const unsigned int size_fine = prolongation_matrix.n();
-    const unsigned int n_cell_batches =
-      fine_dof_indices.size() / n_lanes /
-      Utilities::pow(std::min<unsigned int>(3u, prolongation_matrix.n()), dim);
+    const unsigned int size_fine      = prolongation_matrix.n();
+    const unsigned int n_cell_batches = operator_fine.get_matrix_free().n_cell_batches();
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
       if(size_fine == 2)
@@ -342,6 +336,13 @@ private:
 
 
 
+/**
+ * This is a specialized transfer operator for doing anisotropic transfer,
+ * implemented for nested meshes with all information embedded into the meshes
+ * of operator_fine and operator_coarse. Compared to the deal.II class
+ * MGTwoLevelTransferNonnested, this class aims to be more efficient by
+ * computing a nested transfer.
+ */
 template<int dim, typename Number>
 class MGTwoLevelTransferAnisotropicNested
   : public MGTwoLevelTransferBase<dim, LinearAlgebra::distributed::Vector<Number>>
@@ -1182,7 +1183,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         GridTools::collect_periodic_faces(
           dof_h, periodic_ids[d][0], periodic_ids[d][1], d, periodic_faces);
     for(const auto & face_pair : periodic_faces)
-      Periodicity::make_periodicity_constraints_recursively(
+      ExaDG::Periodicity::make_periodicity_constraints_recursively(
         face_pair.cell[0]->face(face_pair.face_idx[0]),
         face_pair.cell[1]->face(face_pair.face_idx[1]),
         level_constraints);
@@ -1197,7 +1198,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     level_constraints.reinit(dof_h.locally_owned_dofs(),
                              dealii::DoFTools::extract_locally_relevant_dofs(dof_h));
     for(const auto & face_pair : periodic_faces)
-      Periodicity::make_periodicity_constraints_recursively(
+      ExaDG::Periodicity::make_periodicity_constraints_recursively(
         face_pair.cell[0]->face(face_pair.face_idx[0]),
         face_pair.cell[1]->face(face_pair.face_idx[1]),
         level_constraints);

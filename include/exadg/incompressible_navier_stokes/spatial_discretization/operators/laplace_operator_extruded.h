@@ -737,7 +737,7 @@ public:
   template<int fe_degree, int n_q_points_1d, int n_components>
   static void
   read_dof_values_compressed(const VectorType &                    vec_in,
-                             const std::vector<unsigned int> &     compressed_indices,
+                             const std::vector<unsigned int> &     compressed_dof_indices,
                              const std::vector<unsigned char> &    all_indices_unconstrained,
                              const unsigned int                    cell_no,
                              const dealii::AlignedVector<Number> & shape_values_eo,
@@ -745,10 +745,10 @@ public:
                              VectorizedArray<Number> *             dof_values)
   {
     VectorType & vec = const_cast<VectorType &>(vec_in);
-    AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * VectorizedArray<Number>::size(),
-                     compressed_indices.size());
+    AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * n_lanes,
+                     compressed_dof_indices.size());
     const unsigned int * cell_indices =
-      compressed_indices.data() + cell_no * n_lanes * dealii::Utilities::pow(3, dim);
+      compressed_dof_indices.data() + cell_no * n_lanes * dealii::Utilities::pow(3, dim);
     const unsigned char * cell_unconstrained =
       all_indices_unconstrained.data() + cell_no * dealii::Utilities::pow(3, dim);
     constexpr unsigned int dofs_per_comp = dealii::Utilities::pow(n_q_points_1d, dim);
@@ -960,17 +960,17 @@ public:
   static void
   distribute_local_to_global_compressed(
     VectorType &                          vec,
-    const std::vector<unsigned int> &     compressed_indices,
+    const std::vector<unsigned int> &     compressed_dof_indices,
     const std::vector<unsigned char> &    all_indices_unconstrained,
     const unsigned int                    cell_no,
     const dealii::AlignedVector<Number> & shape_values_eo,
     const bool                            is_collocation,
     VectorizedArray<Number> *             dof_values)
   {
-    AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * VectorizedArray<Number>::size(),
-                     compressed_indices.size());
+    AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * n_lanes,
+                     compressed_dof_indices.size());
     const unsigned int * cell_indices =
-      compressed_indices.data() + cell_no * n_lanes * dealii::Utilities::pow(3, dim);
+      compressed_dof_indices.data() + cell_no * n_lanes * dealii::Utilities::pow(3, dim);
     const unsigned char * cell_unconstrained =
       all_indices_unconstrained.data() + cell_no * dealii::Utilities::pow(3, dim);
     constexpr unsigned int dofs_per_comp = dealii::Utilities::pow(n_q_points_1d, dim);

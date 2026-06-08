@@ -235,7 +235,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
                                       laplace_op->get_dof_indices());
 
   // depending on whether we have additional grids provided, enter the path
-  // with semi-coarsening possibilities or or
+  // with semi-coarsening possibilities or the standard path with a classical
+  // polynomial/geometric coarsening
   if(pde_operator->get_grid().coarse_triangulations.empty())
     poisson_preconditioner = std::make_shared<LaplaceOperator::PoissonPreconditionerMG<dim, float>>(
       *pde_operator->get_mapping(),
