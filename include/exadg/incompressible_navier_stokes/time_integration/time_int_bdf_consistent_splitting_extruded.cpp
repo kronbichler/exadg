@@ -463,17 +463,30 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
   const double t_extrapol = timer2.wall_time();
   timer2.restart();
 
-  // solve linear system of equations
-  unsigned int                 n_iter = 0;
-  dealii::SolverControl        control(this->param.solver_data_pressure_poisson.max_iter,
-                                extrapolate_accuracy.first *
-                                  this->param.solver_data_pressure_poisson.rel_tol);
-  dealii::SolverCG<VectorType> solver(control);
-  solver.solve(*laplace_op, pressure_np, pressure_rhs, *poisson_preconditioner);
-  n_iter = control.last_step();
+  // Solve linear system of equations: Try if we can converge in single
+  // precision only without CG directions first. If we fail, use SolverCG as
+  // the more robust choice.
+  std::pair<unsigned int, double> n_iter{0, 1.};
+  n_iter = poisson_preconditioner->solve(*laplace_op,
+                                         pressure_rhs,
+                                         pressure_np,
+                                         3,
+                                         extrapolate_accuracy.first *
+                                           this->param.solver_data_pressure_poisson.rel_tol);
+  if(n_iter.second > this->param.solver_data_pressure_poisson.rel_tol)
+  {
+    dealii::SolverControl        control(this->param.solver_data_pressure_poisson.max_iter,
+                                  extrapolate_accuracy.first *
+                                    this->param.solver_data_pressure_poisson.rel_tol);
+    dealii::SolverCG<VectorType> solver(control);
+    solver.solve(*laplace_op, pressure_np, pressure_rhs, *poisson_preconditioner);
+    n_iter.first += control.last_step();
+    n_iter.second = control.last_value();
+  }
+
 
   iterations_pressure.first += 1;
-  iterations_pressure.second += n_iter;
+  iterations_pressure.second += n_iter.first;
   const double t_sol = timer2.wall_time();
 
   // special case: pressure level is undefined
@@ -489,8 +502,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
                 << std::endl
                 << "Solve pressure step (projection reduced residual from "
                 << extrapolate_accuracy.first << " to " << extrapolate_accuracy.second
-                << " solve to " << control.last_value() << "):";
-    print_solver_info_linear(this->pcout, n_iter, timer.wall_time());
+                << " solve to " << n_iter.second << "):";
+    print_solver_info_linear(this->pcout, n_iter.first, timer.wall_time());
   }
 
   this->timer_tree->insert({"Timeloop", "Pressure step"}, timer.wall_time());

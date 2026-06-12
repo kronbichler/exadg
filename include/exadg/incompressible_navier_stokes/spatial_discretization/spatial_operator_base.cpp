@@ -543,20 +543,25 @@ SpatialOperatorBase<dim, Number>::initialize_operators(std::string const & dof_i
   mass_operator_data.quad_index = get_quad_index_velocity_standard();
   mass_operator.initialize(*matrix_free, constraint_u, mass_operator_data);
 
-  // inverse mass operator velocity
-  InverseMassOperatorData<Number> inverse_mass_operator_data_velocity;
-  inverse_mass_operator_data_velocity.dof_index  = get_dof_index_velocity();
-  inverse_mass_operator_data_velocity.quad_index = get_quad_index_velocity_standard();
-  inverse_mass_operator_data_velocity.parameters = param.inverse_mass_operator;
-  // avoid invalid settings for HDIV, preserving settings if admissible
-  if(param.spatial_discretization == SpatialDiscretization::HDIV)
-    inverse_mass_operator_data_velocity.parameters.implementation_type =
-      InverseMassType::GlobalKrylovSolver;
-  inverse_mass_velocity.initialize(*matrix_free,
-                                   inverse_mass_operator_data_velocity,
-                                   param.spatial_discretization == SpatialDiscretization::L2 ?
-                                     nullptr :
-                                     &constraint_u);
+  // inverse mass operator velocity, except for the 'extruded' operators that
+  // have their own data structures
+  if(param.temporal_discretization != TemporalDiscretization::BDFDualSplittingExtruded &&
+     param.temporal_discretization != TemporalDiscretization::BDFConsistentSplittingExtruded)
+  {
+    InverseMassOperatorData<Number> inverse_mass_operator_data_velocity;
+    inverse_mass_operator_data_velocity.dof_index  = get_dof_index_velocity();
+    inverse_mass_operator_data_velocity.quad_index = get_quad_index_velocity_standard();
+    inverse_mass_operator_data_velocity.parameters = param.inverse_mass_operator;
+    // avoid invalid settings for HDIV, preserving settings if admissible
+    if(param.spatial_discretization == SpatialDiscretization::HDIV)
+      inverse_mass_operator_data_velocity.parameters.implementation_type =
+        InverseMassType::GlobalKrylovSolver;
+    inverse_mass_velocity.initialize(*matrix_free,
+                                     inverse_mass_operator_data_velocity,
+                                     param.spatial_discretization == SpatialDiscretization::L2 ?
+                                       nullptr :
+                                       &constraint_u);
+  }
 
   // inverse mass operator velocity scalar
   InverseMassOperatorData<Number> inverse_mass_operator_data_velocity_scalar;
@@ -656,11 +661,14 @@ SpatialOperatorBase<dim, Number>::initialize_operators(std::string const & dof_i
                                                        not param.non_explicit_convective_problem();
 
   viscous_kernel = std::make_shared<Operators::ViscousKernel<dim, Number>>();
-  viscous_kernel->reinit(*matrix_free,
-                         viscous_kernel_data,
-                         get_dof_index_velocity(),
-                         get_quad_index_velocity_standard(),
-                         use_velocity_own_storage_viscous_kernel);
+  viscous_kernel->reinit(
+    *matrix_free,
+    viscous_kernel_data,
+    get_dof_index_velocity(),
+    get_quad_index_velocity_standard(),
+    (param.temporal_discretization != TemporalDiscretization::BDFDualSplittingExtruded &&
+     param.temporal_discretization != TemporalDiscretization::BDFConsistentSplittingExtruded),
+    use_velocity_own_storage_viscous_kernel);
 
   // initialize and check turbulence model data
   if(param.turbulence_model_data.is_active)

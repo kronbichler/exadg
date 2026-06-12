@@ -826,6 +826,24 @@ private:
                                   prolongation_matrix_data.data(),
                                   indices_interpolation.data(),
                                   interpolation_matrix);
+
+    // a transpose network might be expensive, therefore one could (with AVX2)
+    // also do the following code
+    //__m256i idx   = _mm256_loadu_si256((__m256i*)indices_interpolation.data());
+    //__m256 mask1 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx,
+    //                                   _mm256_set1_epi32(size_coarse * size_fine)));
+    //__m256 mask2 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(idx,
+    //                                   _mm256_set1_epi32(2 * size_coarse * size_fine)));
+    // for (int i = 0; i < size_coarse * size_fine; ++i)
+    //{
+    //  __m256 a = _mm256_set1_ps(prolongation_matrix_data[0 * size_coarse * size_fine + i]);
+    //  __m256 b = _mm256_set1_ps(prolongation_matrix_data[1 * size_coarse * size_fine + i]);
+    //  __m256 c = _mm256_set1_ps(prolongation_matrix_data[2 * size_coarse * size_fine + i]);
+    //  __m256 r = _mm256_blendv_ps(a, b, mask1);
+    //  r = _mm256_blendv_ps(r, c, mask2);
+    //  interpolation_matrix[i].data = r;
+    //}
+
     evaluator.template apply<0, false, false>(interpolation_matrix, tmp, tmp);
     if constexpr(dim > 1)
     {
@@ -929,9 +947,8 @@ public:
         dof_h.distribute_dofs(*fe_hierarchy[level - coarse_triangulations.size() + 1]);
 
       reinit_level_constraints(dof_h,
-                               level + 1 >= coarse_triangulations.size() ?
-                                 cell_vectorization_category :
-                                 std::vector<unsigned int>(),
+                               level >= coarse_triangulations.size() ? cell_vectorization_category :
+                                                                       std::vector<unsigned int>(),
                                level_constraints[level]);
 
       if(level < coarse_triangulations.size())
@@ -1050,7 +1067,9 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       dealii::MappingQ1<dim>            mapping_q1;
       dealii::MappingQCache<dim>        mapping_q1_cache(1);
       const dealii::Mapping<dim> *      mapping = nullptr;
-      if(level < coarser_triangulations.back()->n_global_levels())
+      if(level < (coarser_triangulations.empty() ?
+                    coarse_triangulations.size() :
+                    coarser_triangulations.back()->n_global_levels()))
       {
         dof_h.reinit(*coarse_triangulations[level]);
         dof_h.distribute_dofs(*fe_hierarchy[0]);
@@ -1083,78 +1102,104 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
           mapping = coarser_mappings[max_level - 1 - level].get();
       }
 
+      std::vector<unsigned int> manual_vectorization_category(
+        dof_h.get_triangulation().n_active_cells());
+      if(level < max_level)
+      {
+        if(n_final_geometric_levels == 0 &&
+           manual_vectorization_category.size() == cell_vectorization_category.size())
+          manual_vectorization_category = cell_vectorization_category;
+        else
+        {
+          unsigned int count = 0;
+          for(const auto & cell : dof_h.active_cell_iterators())
+            if(cell->is_locally_owned())
+              manual_vectorization_category[cell->active_cell_index()] = count++;
+        }
+      }
       reinit_level_constraints(dof_h,
-                               level < max_level ? std::vector<unsigned int>() :
+                               level < max_level ? manual_vectorization_category :
                                                    cell_vectorization_category,
                                level_constraints[level]);
 
       mg_matrices[level].reinit(*mapping,
                                 dof_h,
                                 level_constraints[level],
-                                level < max_level ? std::vector<unsigned int>() :
+                                level < max_level ? manual_vectorization_category :
                                                     cell_vectorization_category,
                                 dealii::QGauss<1>(dof_h.get_fe().degree + 1));
 
       // initialize transfer operator
-      if(level > 0 && level <= max_level - n_final_geometric_levels)
+      if(level > 0)
       {
-        auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();
-        transfer->reinit(dof_h,
-                         dof_handler_hierarchy[level - 1],
-                         level_constraints[level],
-                         level_constraints[level - 1]);
-        transfer->enable_inplace_operations_if_possible(
-          mg_matrices[level - 1].get_matrix_free().get_dof_info().vector_partitioner,
-          mg_matrices[level].get_matrix_free().get_dof_info().vector_partitioner);
-
-        mg_transfers[level - 1] = std::move(transfer);
-      }
-      else if(level > max_level - n_final_geometric_levels)
-      {
-        auto transfer = std::make_unique<MGTwoLevelTransferAnisotropicNested<dim, Number>>(
-          mg_matrices[level], mg_matrices[level - 1]);
-        // Compare the nested anisotropic transfer result with the output of
-        // the (more general) non-nested transfer of deal.II to ensure
-        // correctness of the result.
-        bool constexpr perform_check = false;
-        if constexpr(perform_check)
+        if(level <= max_level - n_final_geometric_levels - fe_hierarchy.max_level())
         {
-          MGTwoLevelTransferNonNested<dim, VectorType> transfer_nonnested;
-          MappingQ1<dim>                               mapping;
-          transfer_nonnested.reinit(dof_handler_hierarchy[level],
-                                    dof_handler_hierarchy[level - 1],
-                                    mapping,
-                                    mapping,
-                                    level_constraints[level],
-                                    level_constraints[level - 1]);
-          VectorType v1, v2, v3, v4;
-          mg_matrices[level - 1].initialize_dof_vector(v1);
-          mg_matrices[level - 1].initialize_dof_vector(v4);
-          mg_matrices[level].initialize_dof_vector(v2);
-          mg_matrices[level].initialize_dof_vector(v3);
-          Tensor<1, dim> tens;
-          tens[0] = 1;
-          tens[1] = 1;
-          tens[2] = 1;
-          VectorTools::interpolate(mapping,
-                                   dof_handler_hierarchy[level - 1],
-                                   Functions::Monomial<dim, Number>(tens, 1),
-                                   v1);
-          transfer->prolongate_and_add(v2, v1);
-          transfer_nonnested.prolongate_and_add(v3, v1);
-          std::cout << "Prolongate norms: " << v2.l2_norm() << " " << v3.l2_norm()
-                    << " difference ";
-          v2 -= v3;
-          std::cout << v2.l2_norm() << std::endl;
-          v1 = 0;
-          v4 = 0;
-          transfer->restrict_and_add(v1, v3);
-          transfer_nonnested.restrict_and_add(v4, v3);
-          std::cout << "Restrict norms: " << v1.l2_norm() << " " << v4.l2_norm() << " difference ";
-          v1 -= v4;
-          std::cout << v1.l2_norm() << std::endl;
+          auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();
+          transfer->reinit(dof_h,
+                           dof_handler_hierarchy[level - 1],
+                           level_constraints[level],
+                           level_constraints[level - 1]);
+          transfer->enable_inplace_operations_if_possible(
+            mg_matrices[level - 1].get_matrix_free().get_dof_info().vector_partitioner,
+            mg_matrices[level].get_matrix_free().get_dof_info().vector_partitioner);
+
+          mg_transfers[level - 1] = std::move(transfer);
         }
-        mg_transfers[level - 1] = std::move(transfer);
+        else if(level <= max_level - n_final_geometric_levels)
+        {
+          auto transfer =
+            std::make_unique<MGTwoLevelTransferFromOperator<dim, Number>>(mg_matrices[level],
+                                                                          mg_matrices[level - 1]);
+          mg_transfers[level - 1] = std::move(transfer);
+        }
+        else if(level > max_level - n_final_geometric_levels)
+        {
+          auto transfer = std::make_unique<MGTwoLevelTransferAnisotropicNested<dim, Number>>(
+            mg_matrices[level], mg_matrices[level - 1]);
+          // Compare the nested anisotropic transfer result with the output of
+          // the (more general) non-nested transfer of deal.II to ensure
+          // correctness of the result.
+          bool constexpr perform_check = false;
+          if constexpr(perform_check)
+          {
+            MGTwoLevelTransferNonNested<dim, VectorType> transfer_nonnested;
+            MappingQ1<dim>                               mapping;
+            transfer_nonnested.reinit(dof_handler_hierarchy[level],
+                                      dof_handler_hierarchy[level - 1],
+                                      mapping,
+                                      mapping,
+                                      level_constraints[level],
+                                      level_constraints[level - 1]);
+            VectorType v1, v2, v3, v4;
+            mg_matrices[level - 1].initialize_dof_vector(v1);
+            mg_matrices[level - 1].initialize_dof_vector(v4);
+            mg_matrices[level].initialize_dof_vector(v2);
+            mg_matrices[level].initialize_dof_vector(v3);
+            Tensor<1, dim> tens;
+            tens[0] = 1;
+            tens[1] = 1;
+            tens[2] = 1;
+            VectorTools::interpolate(mapping,
+                                     dof_handler_hierarchy[level - 1],
+                                     Functions::Monomial<dim, Number>(tens, 1),
+                                     v1);
+            transfer->prolongate_and_add(v2, v1);
+            transfer_nonnested.prolongate_and_add(v3, v1);
+            std::cout << "Prolongate norms: " << v2.l2_norm() << " " << v3.l2_norm()
+                      << " difference ";
+            v2 -= v3;
+            std::cout << v2.l2_norm() << std::endl;
+            v1 = 0;
+            v4 = 0;
+            transfer->restrict_and_add(v1, v3);
+            transfer_nonnested.restrict_and_add(v4, v3);
+            std::cout << "Restrict norms: " << v1.l2_norm() << " " << v4.l2_norm()
+                      << " difference ";
+            v1 -= v4;
+            std::cout << v1.l2_norm() << std::endl;
+          }
+          mg_transfers[level - 1] = std::move(transfer);
+        }
       }
     }
 
@@ -1349,16 +1394,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
   {
     std::vector<unsigned int> p_levels({fe.degree});
     while(p_levels.back() > 1)
-    {
-      // pick the next coarser degree as half the previous degree; if
-      // integer division has remainder, use the nearest even degree (i.e.,
-      // we do steps like 2-1, 3-2-1, 4-2-1, 5-2-1, 6-3-2-1, 7-4-2-1, etc)
-      const unsigned int tentative_degree = p_levels.back() / 2;
-      if(p_levels.back() % 2 == 1 && tentative_degree % 2 == 1)
-        p_levels.push_back(tentative_degree + 1);
-      else
-        p_levels.push_back(tentative_degree);
-    }
+      p_levels.push_back(get_coarser_fe_degree(p_levels.back()));
     dealii::MGLevelObject<std::unique_ptr<dealii::FE_Q<dim>>> fes(0, p_levels.size() - 1);
     for(unsigned int level = 0; level < p_levels.size(); ++level)
       fes[level] = std::make_unique<dealii::FE_Q<dim>>(p_levels[p_levels.size() - 1 - level]);
@@ -1369,13 +1405,85 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
   void
   vmult(VectorTypeOuter & dst, const VectorTypeOuter & src) const
   {
-    ++count_times;
     Timer time;
     rhs_dg.copy_locally_owned_data_from(src);
     timings.back()[0] += time.wall_time();
-    time.restart();
 
-    mg_smoother_dg.vmult(solution_update_dg, rhs_dg);
+    do_vcycle(true, false);
+
+    time.restart();
+    dst.copy_locally_owned_data_from(solution_update_dg);
+    timings.back()[0] += time.wall_time();
+  }
+
+  template<typename VectorTypeOuter, typename MatrixTypeOuter>
+  std::pair<unsigned int, double>
+  solve(const MatrixTypeOuter & matrix,
+        const VectorTypeOuter & rhs,
+        VectorTypeOuter &       sol,
+        const unsigned int      n_max_iterations,
+        const double            target_residual) const
+  {
+    VectorTypeOuter tmp;
+    VectorType      tmp2;
+    tmp2.reinit(solution_update_dg);
+    tmp.reinit(sol, true);
+    VectorizedArray<typename VectorTypeOuter::value_type> sum = 0;
+    matrix.vmult(
+      tmp,
+      sol,
+      [&tmp](const unsigned int begin, const unsigned int end) {
+        std::fill(tmp.begin() + begin, tmp.begin() + end, typename VectorTypeOuter::value_type(0));
+      },
+      [&](const unsigned int begin, const unsigned int end) {
+        using VectorizedArrayType          = VectorizedArray<typename VectorTypeOuter::value_type>;
+        constexpr unsigned int n_lanes     = VectorizedArrayType::size();
+        const unsigned int     end_regular = end / n_lanes * n_lanes;
+        for(unsigned int i = begin; i < end_regular; i += n_lanes)
+        {
+          VectorizedArrayType rhs_i, tmp_i;
+          rhs_i.load(rhs.begin() + i);
+          tmp_i.load(tmp.begin() + i);
+          const VectorizedArrayType residual_i = rhs_i - tmp_i;
+          residual_i.store(rhs_dg.begin() + i);
+          sum += residual_i * residual_i;
+        }
+        for(unsigned int i = end_regular; i < end; ++i)
+        {
+          rhs_dg.local_element(i) = rhs.local_element(i) - tmp.local_element(i);
+          sum[i - end_regular] += rhs_dg.local_element(i) * rhs_dg.local_element(i);
+        }
+      });
+    double norm =
+      std::sqrt(Utilities::MPI::sum(sum.sum(), solution_update_dg.get_mpi_communicator()));
+    unsigned int it = 0;
+    for(; it < n_max_iterations && norm > target_residual; ++it)
+    {
+      norm = do_vcycle(it == 0, true);
+    }
+    DEAL_II_OPENMP_SIMD_PRAGMA
+    for(unsigned int i = 0; i < solution_update_dg.locally_owned_size(); ++i)
+      sol.local_element(i) += solution_update_dg.local_element(i);
+
+    return {it, norm};
+  }
+
+  const MatrixTypeDG &
+  get_dg_matrix() const
+  {
+    return dg_matrix;
+  }
+
+private:
+  double
+  do_vcycle(const bool zero_out_start, const bool request_norm) const
+  {
+    ++count_times;
+    Timer time;
+    if(zero_out_start)
+      mg_smoother_dg.vmult(solution_update_dg, rhs_dg);
+    else
+      mg_smoother_dg.step(solution_update_dg, rhs_dg);
     timings.back()[1] += time.wall_time();
     time.restart();
 
@@ -1427,21 +1535,15 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     timings.back()[3] += time.wall_time();
     time.restart();
 
-    mg_smoother_dg.step(solution_update_dg, rhs_dg);
+    double norm = 0;
+    if(request_norm)
+      norm = mg_smoother_dg.step_with_last_norm(solution_update_dg, rhs_dg);
+    else
+      mg_smoother_dg.step(solution_update_dg, rhs_dg);
     timings.back()[1] += time.wall_time();
-    time.restart();
-
-    dst.copy_locally_owned_data_from(solution_update_dg);
-    timings.back()[0] += time.wall_time();
+    return norm;
   }
 
-  const MatrixTypeDG &
-  get_dg_matrix() const
-  {
-    return dg_matrix;
-  }
-
-private:
   std::vector<std::shared_ptr<const dealii::Triangulation<dim>>> coarse_triangulations;
 
   const dealii::MGLevelObject<std::unique_ptr<dealii::FE_Q<dim>>> fe_hierarchy;
