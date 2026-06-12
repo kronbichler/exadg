@@ -202,6 +202,22 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
 
 
 
+// retrieve the coarsening sequence for p multigrid, defined in a central
+// place: pick the next coarser degree as half the previous degree; if integer
+// division has remainder, use the nearest even degree (i.e., we do steps like
+// 2-1, 3-2-1, 4-2-1, 5-2-1, 6-3-2-1, 7-4-2-1, etc)
+constexpr unsigned int
+get_coarser_fe_degree(const unsigned int degree)
+{
+  const unsigned int half = degree / 2;
+  if(degree % 2 == 1 && half % 2 == 1)
+    return half + 1;
+  else
+    return half;
+}
+
+
+
 template<int dim, typename Number = double>
 class LaplaceOperatorFE : public EnableObserverPointer
 {
@@ -449,7 +465,7 @@ public:
                              VectorizedArray<Number> * dof_values,
                              VectorType &              dst) const
   {
-    if(degree <= 2)
+    if constexpr(degree <= 2)
     {
       constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
       const unsigned int *   dof_indices =
@@ -477,7 +493,7 @@ public:
                   const VectorType &        src,
                   VectorizedArray<Number> * dof_values) const
   {
-    if(degree <= 2)
+    if constexpr(degree <= 2)
     {
       constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
       const unsigned int *   dof_indices =
@@ -500,6 +516,11 @@ public:
         src, compressed_dof_indices, all_indices_unconstrained, cell, {}, true, dof_values);
   }
 
+  const std::vector<unsigned int> &
+  get_compressed_dof_indices() const
+  {
+    return compressed_dof_indices;
+  }
 
 private:
   void
@@ -712,21 +733,22 @@ private:
     }
   }
 
+public:
   template<int fe_degree, int n_q_points_1d, int n_components>
-  void
+  static void
   read_dof_values_compressed(const VectorType &                    vec_in,
-                             const std::vector<unsigned int> &     compressed_indices,
+                             const std::vector<unsigned int> &     compressed_dof_indices,
                              const std::vector<unsigned char> &    all_indices_unconstrained,
                              const unsigned int                    cell_no,
                              const dealii::AlignedVector<Number> & shape_values_eo,
                              const bool                            is_collocation,
-                             VectorizedArray<Number> *             dof_values) const
+                             VectorizedArray<Number> *             dof_values)
   {
     VectorType & vec = const_cast<VectorType &>(vec_in);
-    AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * VectorizedArray<Number>::size(),
-                     compressed_indices.size());
+    AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * n_lanes,
+                     compressed_dof_indices.size());
     const unsigned int * cell_indices =
-      compressed_indices.data() + cell_no * n_lanes * dealii::Utilities::pow(3, dim);
+      compressed_dof_indices.data() + cell_no * n_lanes * dealii::Utilities::pow(3, dim);
     const unsigned char * cell_unconstrained =
       all_indices_unconstrained.data() + cell_no * dealii::Utilities::pow(3, dim);
     constexpr unsigned int dofs_per_comp = dealii::Utilities::pow(n_q_points_1d, dim);
@@ -935,20 +957,20 @@ private:
   }
 
   template<int fe_degree, int n_q_points_1d, int n_components>
-  void
+  static void
   distribute_local_to_global_compressed(
     VectorType &                          vec,
-    const std::vector<unsigned int> &     compressed_indices,
+    const std::vector<unsigned int> &     compressed_dof_indices,
     const std::vector<unsigned char> &    all_indices_unconstrained,
     const unsigned int                    cell_no,
     const dealii::AlignedVector<Number> & shape_values_eo,
     const bool                            is_collocation,
-    VectorizedArray<Number> *             dof_values) const
+    VectorizedArray<Number> *             dof_values)
   {
-    AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * VectorizedArray<Number>::size(),
-                     compressed_indices.size());
+    AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * n_lanes,
+                     compressed_dof_indices.size());
     const unsigned int * cell_indices =
-      compressed_indices.data() + cell_no * n_lanes * dealii::Utilities::pow(3, dim);
+      compressed_dof_indices.data() + cell_no * n_lanes * dealii::Utilities::pow(3, dim);
     const unsigned char * cell_unconstrained =
       all_indices_unconstrained.data() + cell_no * dealii::Utilities::pow(3, dim);
     constexpr unsigned int dofs_per_comp = dealii::Utilities::pow(n_q_points_1d, dim);
@@ -1155,6 +1177,174 @@ private:
     }
   }
 
+  template<int fe_degree_templ = -1>
+  void
+  read_dof_values_compressed(const VectorType & vec,
+                             const unsigned int cell_no,
+                             const unsigned int simd_lane,
+                             Number *           dof_values) const
+  {
+    const unsigned int fe_degree =
+      fe_degree_templ > 0 ? fe_degree_templ : matrix_free.get_dof_handler().get_fe().degree;
+    AssertDimension(fe_degree, matrix_free.get_dof_handler().get_fe().degree);
+
+    if(fe_degree == 1)
+    {
+      AssertIndexRange(cell_no * n_lanes * dealii::Utilities::pow(2, dim) + simd_lane,
+                       compressed_dof_indices.size());
+      const unsigned int * cell_indices = compressed_dof_indices.data() +
+                                          cell_no * n_lanes * dealii::Utilities::pow(2, dim) +
+                                          simd_lane;
+      for(unsigned int i = 0; i < dealii::Utilities::pow(2, dim); ++i)
+        if(cell_indices[i * n_lanes] != numbers::invalid_unsigned_int)
+          dof_values[i] = vec.local_element(cell_indices[i * n_lanes]);
+        else
+          dof_values[i] = 0;
+      return;
+    }
+
+    AssertIndexRange(cell_no * n_lanes * dealii::Utilities::pow(3, dim) + simd_lane,
+                     compressed_dof_indices.size());
+    const unsigned int * cell_indices = compressed_dof_indices.data() +
+                                        cell_no * n_lanes * dealii::Utilities::pow(3, dim) +
+                                        simd_lane;
+
+    for(unsigned int i2 = 0, compressed_i2 = 0, offset_i2 = 0;
+        i2 < (dim == 3 ? (fe_degree + 1) : 1);
+        ++i2)
+    {
+      for(unsigned int i1 = 0, i = 0, compressed_i1 = 0, offset_i1 = 0;
+          i1 < (dim > 1 ? (fe_degree + 1) : 1);
+          ++i1)
+      {
+        const unsigned int offset =
+          (compressed_i1 == 1 ? fe_degree - 1 : 1) * offset_i2 + offset_i1;
+        const unsigned int * indices =
+          cell_indices + 3 * n_lanes * (compressed_i2 * 3 + compressed_i1);
+
+        // left end point
+        dof_values[i] = (indices[0] == dealii::numbers::invalid_unsigned_int) ?
+                          0. :
+                          vec.local_element(indices[0] + offset);
+        ++i;
+        indices += n_lanes;
+
+        // interior points of line
+        if(indices[0] != dealii::numbers::invalid_unsigned_int)
+          for(unsigned int i0 = 0; i0 < fe_degree - 1; ++i0, ++i)
+            dof_values[i] = vec.local_element(indices[0] + offset * (fe_degree - 1) + i0);
+        else
+          for(unsigned int i0 = 0; i0 < fe_degree - 1; ++i0, ++i)
+            dof_values[i] = 0.;
+        indices += n_lanes;
+
+        // right end point
+        dof_values[i] = (indices[0] == dealii::numbers::invalid_unsigned_int) ?
+                          0. :
+                          vec.local_element(indices[0] + offset);
+        ++i;
+
+        if(i1 == 0 || i1 == fe_degree - 1)
+        {
+          ++compressed_i1;
+          offset_i1 = 0;
+        }
+        else
+          ++offset_i1;
+      }
+
+      if(i2 == 0 || i2 == fe_degree - 1)
+      {
+        ++compressed_i2;
+        offset_i2 = 0;
+      }
+      else
+        ++offset_i2;
+
+      dof_values += (fe_degree + 1) * (fe_degree + 1);
+    }
+  }
+
+  template<int fe_degree_templ = -1>
+  void
+  distribute_local_to_global_compressed(VectorType &       vec,
+                                        const unsigned int cell_no,
+                                        const unsigned int simd_lane,
+                                        const Number *     dof_values) const
+  {
+    const unsigned int fe_degree =
+      fe_degree_templ > 0 ? fe_degree_templ : matrix_free.get_dof_handler().get_fe().degree;
+    AssertDimension(fe_degree, matrix_free.get_dof_handler().get_fe().degree);
+
+    if(fe_degree == 1)
+    {
+      AssertIndexRange(cell_no * n_lanes * dealii::Utilities::pow(2, dim) + simd_lane,
+                       compressed_dof_indices.size());
+      const unsigned int * cell_indices = compressed_dof_indices.data() +
+                                          cell_no * n_lanes * dealii::Utilities::pow(2, dim) +
+                                          simd_lane;
+      for(unsigned int i = 0; i < dealii::Utilities::pow(2, dim); ++i)
+        if(cell_indices[i * n_lanes] != numbers::invalid_unsigned_int)
+          vec.local_element(cell_indices[i * n_lanes]) += dof_values[i];
+      return;
+    }
+
+    AssertIndexRange(cell_no * n_lanes * dealii::Utilities::pow(3, dim) + simd_lane,
+                     compressed_dof_indices.size());
+    const unsigned int * cell_indices = compressed_dof_indices.data() +
+                                        cell_no * n_lanes * dealii::Utilities::pow(3, dim) +
+                                        simd_lane;
+
+    for(unsigned int i2 = 0, compressed_i2 = 0, offset_i2 = 0;
+        i2 < (dim == 3 ? (fe_degree + 1) : 1);
+        ++i2)
+    {
+      for(unsigned int i1 = 0, i = 0, compressed_i1 = 0, offset_i1 = 0;
+          i1 < (dim > 1 ? (fe_degree + 1) : 1);
+          ++i1)
+      {
+        const unsigned int offset =
+          (compressed_i1 == 1 ? fe_degree - 1 : 1) * offset_i2 + offset_i1;
+        const unsigned int * indices =
+          cell_indices + 3 * n_lanes * (compressed_i2 * 3 + compressed_i1);
+
+        // left end point
+        if(indices[0] != dealii::numbers::invalid_unsigned_int)
+          vec.local_element(indices[0] + offset) += dof_values[i];
+        ++i;
+        indices += n_lanes;
+
+        // interior points of line
+        if(indices[0] != dealii::numbers::invalid_unsigned_int)
+          for(unsigned int i0 = 0; i0 < fe_degree - 1; ++i0, ++i)
+            vec.local_element(indices[0] + (offset * (fe_degree - 1) + i0)) += dof_values[i];
+        indices += n_lanes;
+
+        // right end point
+        if(indices[0] != dealii::numbers::invalid_unsigned_int)
+          vec.local_element(indices[0] + offset) += dof_values[i];
+        ++i;
+
+        if(i1 == 0 || i1 == fe_degree - 1)
+        {
+          ++compressed_i1;
+          offset_i1 = 0;
+        }
+        else
+          ++offset_i1;
+      }
+      if(i2 == 0 || i2 == fe_degree - 1)
+      {
+        ++compressed_i2;
+        offset_i2 = 0;
+      }
+      else
+        ++offset_i2;
+      dof_values += (fe_degree + 1) * (fe_degree + 1);
+    }
+  }
+
+private:
   ObserverPointer<const DoFHandler<dim>> dof_handler;
   MatrixFree<dim, Number>                matrix_free;
   std::vector<unsigned int>              compressed_dof_indices;

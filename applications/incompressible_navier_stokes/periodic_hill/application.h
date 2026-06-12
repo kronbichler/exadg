@@ -685,6 +685,17 @@ private:
               std::shared_ptr<dealii::Mapping<dim>> &           mapping,
               std::shared_ptr<MultigridMappings<dim, Number>> & multigrid_mappings) final
   {
+    dealii::Point<dim> p_1;
+    p_1[0] = 0.;
+    p_1[1] = height_hill;
+    if(dim == 3)
+      p_1[2] = -width_channel / 2.0;
+
+    dealii::Point<dim> p_2;
+    p_2[0] = length_channel;
+    p_2[1] = height_hill + height_channel_at_hill_top;
+    if(dim == 3)
+      p_2[2] = width_channel / 2.0;
     auto const lambda_create_triangulation = [&](dealii::Triangulation<dim, dim> & tria,
                                                  std::vector<dealii::GridTools::PeriodicFacePair<
                                                    typename dealii::Triangulation<
@@ -694,18 +705,6 @@ private:
                                                    vector_local_refinements) {
       (void)periodic_face_pairs;
       (void)vector_local_refinements;
-
-      dealii::Point<dim> p_1;
-      p_1[0] = 0.;
-      p_1[1] = height_hill;
-      if(dim == 3)
-        p_1[2] = -width_channel / 2.0;
-
-      dealii::Point<dim> p_2;
-      p_2[0] = length_channel;
-      p_2[1] = height_hill + height_channel_at_hill_top;
-      if(dim == 3)
-        p_2[2] = width_channel / 2.0;
 
       // use 2 cells in x-direction on coarsest grid and 1 cell in y- and z-directions
       std::vector<unsigned int> refinements{
@@ -775,10 +774,6 @@ private:
                                                               lambda_create_triangulation,
                                                               {} /* no local refinements */);
 
-    // mappings
-    AssertThrow(get_element_type(*grid.triangulation) == ElementType::Hypercube,
-                dealii::ExcMessage("Only implemented for hypercube elements."));
-
     // dummy FE for compatibility with interface of dealii::FEValues
     dealii::FE_Nothing<dim>         dummy_fe;
     dealii::MappingQ1<dim>          mapping_undeformed;
@@ -788,38 +783,205 @@ private:
                                     dealii::update_quadrature_points);
     const std::vector<unsigned int> hierarchic_to_lexicographic_numbering =
       dealii::FETools::hierarchic_to_lexicographic_numbering<dim>(this->param.mapping_degree);
+    const auto mapping_function_fine =
+      [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
+      -> std::vector<dealii::Point<dim>> {
+      PeriodicHillManifold<dim> manifold(height_hill,
+                                         length_channel,
+                                         height_channel_at_hill_top,
+                                         grid_stretch_factor);
+      fe_values.reinit(cell);
+
+      std::vector<dealii::Point<dim>> points_moved(fe_values.n_quadrature_points);
+      for(unsigned int i = 0; i < fe_values.n_quadrature_points; ++i)
+      {
+        // need to adjust for hierarchic numbering of
+        // dealii::MappingQCache
+        dealii::Point<dim> const point_in_box =
+          box_distort(fe_values.quadrature_point(hierarchic_to_lexicographic_numbering[i]),
+                      consider_box_distort,
+                      length_channel,
+                      height_hill,
+                      height_channel_at_hill_top);
+        if(consider_mapping)
+          points_moved[i] = manifold.push_forward(point_in_box);
+        else
+          points_moved[i] = point_in_box;
+      }
+
+      return points_moved;
+    };
+
+    // Since we use a distorted mesh, using an anisotropic coarsening (called
+    // semi-coarsening in the multigrid literature) will allow us to get a
+    // better aspect-ratio cells eventually for multigrid. We hard-code a
+    // variant for a particular set of refinements in y-direction: In case the
+    // user gives us a mesh with 3 coarse grid cells and we additionally have
+    // at least 3 global refinements (giving a multiple of 24 cells in
+    // y-direction), we can use the following coarsening steps: 24 -> 18 -> 16
+    // cells. The number of coarse cells in x and z direction will not be
+    // changed.
+    const unsigned int global_refinements = grid.triangulation->n_global_levels() - 1;
+    if(coarse_mesh_refinements[1] == 3 && global_refinements >= 3)
+    {
+      auto tria2 =
+        std::make_shared<dealii::parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
+
+      // We will represent the next coarser mesh starting from a base mesh of
+      // 9 elements in vertical direction, which will be refined once more to
+      // get to 18 cells. Since the 9 mesh elements will be matched with a
+      // 12-cell base mesh, and we assumed the fine-level mesh to have started
+      // from 3 vertical cells, we need to multiply the x and z refinements by
+      // 4 to get the same number of cells.
+      std::vector<unsigned int> refinements2{4 * coarse_mesh_refinements[0],
+                                             9,
+                                             4 * coarse_mesh_refinements[2]};
+      dealii::GridGenerator::subdivided_hyper_rectangle(*tria2, refinements2, p_1, p_2);
+      for(const auto & cell : tria2->cell_iterators())
+      {
+        if(cell->at_boundary(0))
+          cell->face(0)->set_all_boundary_ids(0 + 10);
+        if(cell->at_boundary(1))
+          cell->face(1)->set_all_boundary_ids(1 + 10);
+
+        // periodicity in z-direction
+        if(dim == 3)
+        {
+          // left element
+          if(cell->at_boundary(4))
+            cell->face(4)->set_all_boundary_ids(2 + 10);
+          if(cell->at_boundary(5))
+            cell->face(5)->set_all_boundary_ids(3 + 10);
+        }
+      }
+
+      std::vector<
+        dealii::GridTools::PeriodicFacePair<typename dealii::Triangulation<dim>::cell_iterator>>
+        periodic_face_pairs;
+      dealii::GridTools::collect_periodic_faces(*tria2, 0 + 10, 1 + 10, 0, periodic_face_pairs);
+      if(dim == 3)
+      {
+        dealii::GridTools::collect_periodic_faces(*tria2, 2 + 10, 3 + 10, 2, periodic_face_pairs);
+      }
+
+      tria2->add_periodicity(periodic_face_pairs);
+
+      // Move vertices to match the anisotropically coarsened cells with the
+      // ones on the refined side to actually create a geometric nesting of
+      // cells. This is a crucial step, since the 'tria2' object we created
+      // here will have a different positioning of most vertices compared to
+      // the fine level one. Since the anisotropy will be injected by a
+      // mapping rather than represented in the triangulation, the vertex
+      // positions in y-direction will here be moved in steps of 2 of the fine
+      // mesh, using 3 layers both at the y-bottom and y-top region of 3
+      // coarse cells (6 fine cells). On the other hand, the position of the
+      // central part will be matched with the fine size.
+      tria2->refine_global(1);
+      const dealii::Triangulation<dim> & tria = *grid.triangulation;
+      AssertThrow(tria.n_levels() >= 4,
+                  dealii::ExcMessage("Expected to have at least 4 levels on the mesh when entering "
+                                     "this code path. Do you use more processes than mesh cells?"));
+      const double        size_y = tria.begin(3)->vertex(2)[1] - tria.begin(3)->vertex(0)[1];
+      std::vector<double> new_position(19);
+      new_position[0] = p_1[1];
+      new_position[1] = p_1[1] + 2 * size_y;
+      new_position[2] = p_1[1] + 4 * size_y;
+      new_position[3] = p_1[1] + 6 * size_y;
+      for(unsigned int i = 4; i < 16; ++i)
+        new_position[i] = p_1[1] + (i + 3) * size_y;
+      new_position[16] = p_1[1] + 20 * size_y;
+      new_position[17] = p_1[1] + 22 * size_y;
+      new_position[18] = p_1[1] + 24 * size_y;
+      AssertThrow(std::abs(new_position[18] - p_2[1]) < 1e-12, dealii::ExcInternalError());
+      for(const dealii::Point<dim> & p : tria2->get_vertices())
+      {
+        const unsigned int vertical_index =
+          static_cast<unsigned int>(18.000001 * (p[1] - p_1[1]) / (p_2[1] - p_1[1]));
+        const_cast<dealii::Point<dim> &>(p)[1] = new_position[vertical_index];
+      }
+
+      // Apply the remaining refinements and then append this triangulation to
+      // the coarse triangulations stored with the grid, which will be used
+      // for the multigrid setup.
+      tria2->refine_global(global_refinements - 3);
+      auto mapping2 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
+      mapping2->initialize(*tria2, mapping_function_fine);
+      grid.coarse_triangulations.push_back(tria2);
+      grid.coarse_mappings.push_back(mapping2);
+
+      // Now to the next round of cells: This time, we target 2 coarse mesh
+      // cells with the same refinement applied as for the finest-level grid
+      // (i.e., 16 in refined configuration), which will be matched with the
+      // 18 cells on the next finer grid level. This means that we only
+      // coarsen the 2 cell layers closest to the boundary into 1 layer of
+      // cells.
+      auto tria3 =
+        std::make_shared<dealii::parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
+      std::vector<unsigned int> refinements3{coarse_mesh_refinements[0],
+                                             2,
+                                             coarse_mesh_refinements[2]};
+      dealii::GridGenerator::subdivided_hyper_rectangle(*tria3, refinements3, p_1, p_2);
+      for(const auto & cell : tria3->cell_iterators())
+      {
+        if(cell->at_boundary(0))
+          cell->face(0)->set_all_boundary_ids(0 + 10);
+        if(cell->at_boundary(1))
+          cell->face(1)->set_all_boundary_ids(1 + 10);
+
+        // periodicity in z-direction
+        if(dim == 3)
+        {
+          // left element
+          if(cell->at_boundary(4))
+            cell->face(4)->set_all_boundary_ids(2 + 10);
+          if(cell->at_boundary(5))
+            cell->face(5)->set_all_boundary_ids(3 + 10);
+        }
+      }
+
+      periodic_face_pairs.clear();
+      dealii::GridTools::collect_periodic_faces(*tria3, 0 + 10, 1 + 10, 0, periodic_face_pairs);
+      if(dim == 3)
+      {
+        dealii::GridTools::collect_periodic_faces(*tria3, 2 + 10, 3 + 10, 2, periodic_face_pairs);
+      }
+      tria3->add_periodicity(periodic_face_pairs);
+
+      // Move vertices to fit with the next finer mesh: We want to aggregate 2
+      // layers of mesh elements closest to the boundary from the previous
+      // round into one cell layer. We pick up the values from the previous
+      // round to not make mistakes here.
+      tria3->refine_global(3);
+      std::vector<double> new_position3(17);
+      new_position3[0] = new_position[0];
+      new_position3[1] = new_position[2];
+      new_position3[2] = new_position[3];
+      for(unsigned int i = 3; i < 15; ++i)
+        new_position3[i] = new_position[1 + i];
+      new_position3[15] = new_position[16];
+      new_position3[16] = new_position[18];
+      AssertThrow(std::abs(new_position3[16] - p_2[1]) < 1e-12, dealii::ExcInternalError());
+      for(const dealii::Point<dim> & p : tria3->get_vertices())
+      {
+        const unsigned int vertical_index =
+          static_cast<unsigned int>(16.000001 * (p[1] - p_1[1]) / (p_2[1] - p_1[1]));
+        const_cast<dealii::Point<dim> &>(p)[1] = new_position3[vertical_index];
+      }
+
+      tria3->refine_global(global_refinements - 3);
+      auto mapping3 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
+      mapping3->initialize(*tria3, mapping_function_fine);
+      grid.coarse_triangulations.push_back(tria3);
+      grid.coarse_mappings.push_back(mapping3);
+    }
+
+    // mappings
+    AssertThrow(get_element_type(*grid.triangulation) == ElementType::Hypercube,
+                dealii::ExcMessage("Only implemented for hypercube elements."));
 
     const auto mapping_q_cache =
       std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
-    mapping_q_cache->initialize(
-      *grid.triangulation,
-      [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
-        -> std::vector<dealii::Point<dim>> {
-        PeriodicHillManifold<dim> manifold(height_hill,
-                                           length_channel,
-                                           height_channel_at_hill_top,
-                                           grid_stretch_factor);
-        fe_values.reinit(cell);
-
-        std::vector<dealii::Point<dim>> points_moved(fe_values.n_quadrature_points);
-        for(unsigned int i = 0; i < fe_values.n_quadrature_points; ++i)
-        {
-          // need to adjust for hierarchic numbering of
-          // dealii::MappingQCache
-          dealii::Point<dim> const point_in_box =
-            box_distort(fe_values.quadrature_point(hierarchic_to_lexicographic_numbering[i]),
-                        consider_box_distort,
-                        length_channel,
-                        height_hill,
-                        height_channel_at_hill_top);
-          if(consider_mapping)
-            points_moved[i] = manifold.push_forward(point_in_box);
-          else
-            points_moved[i] = point_in_box;
-        }
-
-        return points_moved;
-      });
+    mapping_q_cache->initialize(*grid.triangulation, mapping_function_fine);
 
     grid.mapping_function = [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
       -> std::vector<dealii::Point<dim>> {
@@ -920,7 +1082,6 @@ private:
     pp_data.output_data.time_control_data.start_time = start_time;
     pp_data.output_data.time_control_data.trigger_interval =
       convergence_study ? (end_time - start_time) / 10.0 : flow_through_time / 5.0;
-    ;
     pp_data.output_data.directory                 = this->output_parameters.directory + "vtu/";
     pp_data.output_data.filename                  = this->output_parameters.filename;
     pp_data.output_data.write_velocity_magnitude  = false;
@@ -938,7 +1099,6 @@ private:
     pp_data.error_data_u.time_control_data.start_time = start_time;
     pp_data.error_data_u.time_control_data.trigger_interval =
       convergence_study ? (end_time - start_time) / 10.0 : flow_through_time / 5.0;
-    ;
     pp_data.error_data_u.analytical_solution.reset(new ManufacturedSolutionVelocity<dim>(
       height_channel_at_hill_top, length_channel, y_shift, time_period));
     pp_data.error_data_u.name                      = "velocity";
@@ -950,7 +1110,6 @@ private:
     pp_data.error_data_p.time_control_data = pp_data.error_data_u.time_control_data;
     pp_data.error_data_p.time_control_data.trigger_interval =
       convergence_study ? (end_time - start_time) / 10.0 : flow_through_time / 5.0;
-    ;
     pp_data.error_data_p.analytical_solution.reset(
       new ManufacturedSolutionPressure<dim>(length_channel, time_period));
     pp_data.error_data_p.name                      = "pressure";

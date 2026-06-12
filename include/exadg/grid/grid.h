@@ -63,6 +63,11 @@ public:
   std::vector<std::shared_ptr<dealii::Triangulation<dim> const>> coarse_triangulations;
 
   /**
+   * Same for coarser mappings.
+   */
+  std::vector<std::shared_ptr<dealii::Mapping<dim> const>> coarse_mappings;
+
+  /**
    * A vector of dealii::GridTools::PeriodicFacePair's for the coarse triangulations required for
    * h-multigrid with geometric coarsening types that require a vector of triangulations.
    *
