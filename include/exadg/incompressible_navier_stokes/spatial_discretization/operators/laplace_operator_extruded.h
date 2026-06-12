@@ -67,9 +67,9 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
   const Number h_z_inverse = mapping_info.h_z_inverse;
 
   constexpr unsigned int  nn = n_q_points_1d;
-  VectorizedArray<Number> shape_grad[nn * (nn + 1) / 2];
-  AssertDimension(shape_data.shape_gradients_collocation_eo.size(), nn * (nn + 1) / 2);
-  for(unsigned int i = 0; i < nn * (nn + 1) / 2; ++i)
+  VectorizedArray<Number> shape_grad[nn * ((nn + 1) / 2)];
+  AssertDimension(shape_data.shape_gradients_collocation_eo.size(), nn * ((nn + 1) / 2));
+  for(unsigned int i = 0; i < nn * ((nn + 1) / 2); ++i)
     shape_grad[i] = shape_data.shape_gradients_collocation_eo[i];
 
   for(unsigned int i1 = 0; i1 < (dim == 3 ? nn : 1); ++i1)
@@ -759,11 +759,11 @@ public:
     constexpr unsigned int dofs_per_comp = dealii::Utilities::pow(n_q_points_1d, dim);
     dealii::internal::VectorReader<Number, VectorizedArray<Number>> reader;
 
-    dealii::VectorizedArray<Number> shape_val[(fe_degree + 1) * (n_q_points_1d + 1) / 2];
+    dealii::VectorizedArray<Number> shape_val[(fe_degree + 1) * ((n_q_points_1d + 1) / 2)];
     if(is_collocation == false)
     {
-      AssertDimension(shape_values_eo.size(), (fe_degree + 1) * (n_q_points_1d + 1) / 2);
-      for(unsigned int i = 0; i < (fe_degree + 1) * (n_q_points_1d + 1) / 2; ++i)
+      AssertDimension(shape_values_eo.size(), (fe_degree + 1) * ((n_q_points_1d + 1) / 2));
+      for(unsigned int i = 0; i < (fe_degree + 1) * ((n_q_points_1d + 1) / 2); ++i)
         shape_val[i] = shape_values_eo[i];
     }
 
@@ -997,11 +997,11 @@ public:
     constexpr unsigned int dofs_per_comp = dealii::Utilities::pow(n_q_points_1d, dim);
     dealii::internal::VectorDistributorLocalToGlobal<Number, VectorizedArray<Number>> distributor;
 
-    dealii::VectorizedArray<Number> shape_val[(fe_degree + 1) * (n_q_points_1d + 1) / 2];
+    dealii::VectorizedArray<Number> shape_val[(fe_degree + 1) * ((n_q_points_1d + 1) / 2)];
     if(is_collocation == false)
     {
-      AssertDimension(shape_values_eo.size(), (fe_degree + 1) * (n_q_points_1d + 1) / 2);
-      for(unsigned int i = 0; i < (fe_degree + 1) * (n_q_points_1d + 1) / 2; ++i)
+      AssertDimension(shape_values_eo.size(), (fe_degree + 1) * ((n_q_points_1d + 1) / 2));
+      for(unsigned int i = 0; i < (fe_degree + 1) * ((n_q_points_1d + 1) / 2); ++i)
         shape_val[i] = shape_values_eo[i];
     }
 
