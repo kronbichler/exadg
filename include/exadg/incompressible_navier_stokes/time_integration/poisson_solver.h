@@ -1113,41 +1113,47 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       {
         auto transfer = std::make_unique<MGTwoLevelTransferAnisotropicNested<dim, Number>>(
           mg_matrices[level], mg_matrices[level - 1]);
-        /*
-        MGTwoLevelTransferNonNested<dim, VectorType> transfer_nonnested;
-        MappingQ1<dim>                               mapping;
-        transfer_nonnested.reinit(dof_handler_hierarchy[level],
-                                  dof_handler_hierarchy[level - 1],
-                                  mapping,
-                                  mapping,
-                                  level_constraints[level],
-                                  level_constraints[level - 1]);
-        VectorType v1, v2, v3, v4;
-        mg_matrices[level - 1].initialize_dof_vector(v1);
-        mg_matrices[level - 1].initialize_dof_vector(v4);
-        mg_matrices[level].initialize_dof_vector(v2);
-        mg_matrices[level].initialize_dof_vector(v3);
-        Tensor<1, dim> tens;
-        tens[0] = 1;
-        tens[1] = 1;
-        tens[2] = 1;
-        VectorTools::interpolate(mapping,
-                                 dof_handler_hierarchy[level - 1],
-                                 Functions::Monomial<dim, Number>(tens, 1),
-                                 v1);
-        transfer->prolongate_and_add(v2, v1);
-        transfer_nonnested.prolongate_and_add(v3, v1);
-        std::cout << "Prolongate norms: " << v2.l2_norm() << " " << v3.l2_norm() << " difference ";
-        v2 -= v3;
-        std::cout << v2.l2_norm() << std::endl;
-        v1 = 0;
-        v4 = 0;
-        transfer->restrict_and_add(v1, v3);
-        transfer_nonnested.restrict_and_add(v4, v3);
-        std::cout << "Restrict norms: " << v1.l2_norm() << " " << v4.l2_norm() << " difference ";
-        v1 -= v4;
-        std::cout << v1.l2_norm() << std::endl;
-        */
+        // Compare the nested anisotropic transfer result with the output of
+        // the (more general) non-nested transfer of deal.II to ensure
+        // correctness of the result.
+        bool constexpr perform_check = false;
+        if constexpr(perform_check)
+        {
+          MGTwoLevelTransferNonNested<dim, VectorType> transfer_nonnested;
+          MappingQ1<dim>                               mapping;
+          transfer_nonnested.reinit(dof_handler_hierarchy[level],
+                                    dof_handler_hierarchy[level - 1],
+                                    mapping,
+                                    mapping,
+                                    level_constraints[level],
+                                    level_constraints[level - 1]);
+          VectorType v1, v2, v3, v4;
+          mg_matrices[level - 1].initialize_dof_vector(v1);
+          mg_matrices[level - 1].initialize_dof_vector(v4);
+          mg_matrices[level].initialize_dof_vector(v2);
+          mg_matrices[level].initialize_dof_vector(v3);
+          Tensor<1, dim> tens;
+          tens[0] = 1;
+          tens[1] = 1;
+          tens[2] = 1;
+          VectorTools::interpolate(mapping,
+                                   dof_handler_hierarchy[level - 1],
+                                   Functions::Monomial<dim, Number>(tens, 1),
+                                   v1);
+          transfer->prolongate_and_add(v2, v1);
+          transfer_nonnested.prolongate_and_add(v3, v1);
+          std::cout << "Prolongate norms: " << v2.l2_norm() << " " << v3.l2_norm()
+                    << " difference ";
+          v2 -= v3;
+          std::cout << v2.l2_norm() << std::endl;
+          v1 = 0;
+          v4 = 0;
+          transfer->restrict_and_add(v1, v3);
+          transfer_nonnested.restrict_and_add(v4, v3);
+          std::cout << "Restrict norms: " << v1.l2_norm() << " " << v4.l2_norm() << " difference ";
+          v1 -= v4;
+          std::cout << v1.l2_norm() << std::endl;
+        }
         mg_transfers[level - 1] = std::move(transfer);
       }
     }
