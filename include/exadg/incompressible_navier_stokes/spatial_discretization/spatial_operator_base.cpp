@@ -543,10 +543,7 @@ SpatialOperatorBase<dim, Number>::initialize_operators(std::string const & dof_i
   mass_operator_data.quad_index = get_quad_index_velocity_standard();
   mass_operator.initialize(*matrix_free, constraint_u, mass_operator_data);
 
-  // inverse mass operator velocity, except for the 'extruded' operators that
-  // have their own data structures
-  if(param.temporal_discretization != TemporalDiscretization::BDFDualSplittingExtruded &&
-     param.temporal_discretization != TemporalDiscretization::BDFConsistentSplittingExtruded)
+  // inverse mass operator velocity
   {
     InverseMassOperatorData<Number> inverse_mass_operator_data_velocity;
     inverse_mass_operator_data_velocity.dof_index  = get_dof_index_velocity();
