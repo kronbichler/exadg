@@ -1266,8 +1266,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
                 if(need_dissipation)
                 {
-                  auto const S = 0.5 * (velocity_gradient + transpose(velocity_gradient));
-                  auto epsilon_q = 2.0 * viscosity * scalar_product(S,S);
+                  auto const S         = 0.5 * (velocity_gradient + transpose(velocity_gradient));
+                  auto       epsilon_q = 2.0 * viscosity * scalar_product(S, S);
 
                   dissipation += epsilon_q * JxW;
                 }
