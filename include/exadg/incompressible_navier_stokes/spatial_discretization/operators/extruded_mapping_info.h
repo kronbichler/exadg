@@ -117,6 +117,7 @@ group_cells_by_left_neighbors(
       {
         boundary_type += dealii::Utilities::pow(2, d);
       }
+    AssertIndexRange(boundary_type, cells_per_neighbor_value.size());
     cells_per_neighbor_value[boundary_type].emplace_back(lexicographic_index, cell);
   }
   else if(cell->has_children())
@@ -272,7 +273,7 @@ compute_vectorization_category(const dealii::Triangulation<dim> & tria)
     {
       int z_index = std::numeric_limits<int>::max();
       if((lex_ends[0] - lex_ptrs[0]) >= n_lanes)
-        z_index = (lex_ptrs[0] + n_lanes)->first[0];
+        z_index = (lex_ptrs[0] + n_lanes - 1)->first[0];
       while(lex_ptrs[2] != lex_ends[2] && lex_ptrs[2]->first[0] <= z_index)
         assign_category(lex_ptrs[2]);
       while(lex_ptrs[2] != lex_ends[2] && category_counter % n_lanes != 0)
@@ -281,6 +282,7 @@ compute_vectorization_category(const dealii::Triangulation<dim> & tria)
         assign_category(lex_ptrs[1]);
       while(lex_ptrs[1] != lex_ends[1] && category_counter % n_lanes != 0)
         assign_category(lex_ptrs[1]);
+
       do
         assign_category(lex_ptrs[0]);
       while(lex_ptrs[0] != lex_ends[0] && category_counter % n_lanes != 0);
