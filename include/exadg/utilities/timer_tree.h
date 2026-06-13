@@ -54,19 +54,28 @@ public:
    * entry already existing in the tree.
    */
   void
-  insert(std::vector<std::string> const ids, double const wall_time);
+  insert(std::vector<std::string> const & ids, double const wall_time);
+
+  /**
+   * This function inserts a measured wall_time into the tree, by
+   * either creating a new entry in the tree if this function is called
+   * the first time with this ID, or by adding the wall_time to an
+   * entry already existing in the tree.
+   */
+  void
+  insert_leaf(std::string const & id, double const wall_time);
 
   /**
    * This function inserts a whole sub_tree into an existing tree, where
    * the parameter names specifies the place at which to insert the sub_tree.
    * This function allows to combine different timer trees in a modular way.
-   * If a non empty string new_name is provided, the id of  sub_tree is
+   * If a non empty string new_name is provided, the id of sub_tree is
    * replaced by new_name when inserted into the tree.
    */
   void
-  insert(std::vector<std::string>   ids,
-         std::shared_ptr<TimerTree> sub_tree,
-         std::string const          new_name = "");
+  insert(std::vector<std::string> const &   ids,
+         std::shared_ptr<TimerTree> const & sub_tree,
+         std::string const                  new_name = "");
 
   /**
    * Prints wall time of all items of a tree without an analysis of
@@ -193,8 +202,8 @@ private:
 
   std::vector<std::shared_ptr<TimerTree>> sub_trees;
 
-  static unsigned int const offset_per_level = 2;
-  static unsigned int const precision        = 2;
+  unsigned int const offset_per_level = 2;
+  unsigned int const precision        = 2;
 };
 } // namespace ExaDG
 
