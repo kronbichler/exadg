@@ -81,6 +81,7 @@ public:
          ViscousKernelData const &               data,
          unsigned int const                      dof_index,
          unsigned int const                      quad_index,
+         bool const                              compute_penalty_parameter,
          bool const                              use_velocity_own_storage)
   {
     this->data                     = data;
@@ -90,7 +91,8 @@ public:
     dealii::FiniteElement<dim> const & fe = matrix_free.get_dof_handler(dof_index).get_fe();
     this->degree                          = fe.degree;
 
-    calculate_penalty_parameter(matrix_free, dof_index);
+    if(compute_penalty_parameter)
+      calculate_penalty_parameter(matrix_free, dof_index);
 
     AssertThrow(data.viscosity >= 0.0, dealii::ExcMessage("Viscosity is not set!"));
 
