@@ -1405,15 +1405,22 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
   void
   vmult(VectorTypeOuter & dst, const VectorTypeOuter & src) const
   {
-    Timer time;
-    rhs_dg.copy_locally_owned_data_from(src);
-    timings.back()[0] += time.wall_time();
+    if constexpr(std::is_same_v<VectorTypeOuter, VectorType>)
+    {
+      do_vcycle(true, false, src, dst);
+    }
+    else
+    {
+      Timer time;
+      rhs_dg.copy_locally_owned_data_from(src);
+      timings.back()[0] += time.wall_time();
 
-    do_vcycle(true, false);
+      do_vcycle(true, false, rhs_dg, solution_update_dg);
 
-    time.restart();
-    dst.copy_locally_owned_data_from(solution_update_dg);
-    timings.back()[0] += time.wall_time();
+      time.restart();
+      dst.copy_locally_owned_data_from(solution_update_dg);
+      timings.back()[0] += time.wall_time();
+    }
   }
 
   template<typename VectorTypeOuter, typename MatrixTypeOuter>
@@ -1452,14 +1459,26 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         {
           rhs_dg.local_element(i) = rhs.local_element(i) - tmp.local_element(i);
           sum[i - end_regular] += rhs_dg.local_element(i) * rhs_dg.local_element(i);
+          solution_update_dg.local_element(i) = 0.;
         }
       });
     double norm =
       std::sqrt(Utilities::MPI::sum(sum.sum(), solution_update_dg.get_mpi_communicator()));
     unsigned int it = 0;
-    for(; it < n_max_iterations && norm > target_residual; ++it)
+    if constexpr(false)
     {
-      norm = do_vcycle(it == 0, true);
+      for(; it < n_max_iterations && norm > target_residual; ++it)
+      {
+        norm = do_vcycle(it == 0, true, rhs_dg, solution_update_dg);
+      }
+    }
+    else
+    {
+      dealii::IterationNumberControl control(n_max_iterations, target_residual);
+      dealii::SolverCG<VectorType>   solver_cg(control);
+      solver_cg.solve(dg_matrix, solution_update_dg, rhs_dg, *this);
+      norm = control.last_value();
+      it   = control.last_step();
     }
     DEAL_II_OPENMP_SIMD_PRAGMA
     for(unsigned int i = 0; i < solution_update_dg.locally_owned_size(); ++i)
@@ -1476,19 +1495,22 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
 
 private:
   double
-  do_vcycle(const bool zero_out_start, const bool request_norm) const
+  do_vcycle(const bool         zero_out_start,
+            const bool         request_norm,
+            const VectorType & src_rhs,
+            VectorType &       solution) const
   {
     ++count_times;
     Timer time;
     if(zero_out_start)
-      mg_smoother_dg.vmult(solution_update_dg, rhs_dg);
+      mg_smoother_dg.vmult(solution, src_rhs);
     else
-      mg_smoother_dg.step(solution_update_dg, rhs_dg);
+      mg_smoother_dg.step(solution, src_rhs);
     timings.back()[1] += time.wall_time();
     time.restart();
 
-    dg_matrix.vmult_residual_and_restrict_to_fe(rhs_dg,
-                                                solution_update_dg,
+    dg_matrix.vmult_residual_and_restrict_to_fe(src_rhs,
+                                                solution,
                                                 mg_matrices[max_level],
                                                 rhs[max_level]);
     timings.back()[2] += time.wall_time();
@@ -1529,17 +1551,15 @@ private:
       timings[level + 1][1] += time.wall_time();
       time.restart();
     }
-    dg_matrix.prolongate_and_add(solution_update_dg,
-                                 solution_update[max_level],
-                                 mg_matrices[max_level]);
+    dg_matrix.prolongate_and_add(solution, solution_update[max_level], mg_matrices[max_level]);
     timings.back()[3] += time.wall_time();
     time.restart();
 
     double norm = 0;
     if(request_norm)
-      norm = mg_smoother_dg.step_with_last_norm(solution_update_dg, rhs_dg);
+      norm = mg_smoother_dg.step_with_last_norm(solution, src_rhs);
     else
-      mg_smoother_dg.step(solution_update_dg, rhs_dg);
+      mg_smoother_dg.step(solution, src_rhs);
     timings.back()[1] += time.wall_time();
     return norm;
   }

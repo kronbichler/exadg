@@ -456,9 +456,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
   if(this->use_extrapolation)
   {
     pressure[0].copy_locally_owned_data_from(pressure_np);
-    poisson_preconditioner->get_dg_matrix().vmult(pressure_matvec[0], pressure[0]);
+    // poisson_preconditioner->get_dg_matrix().vmult(pressure_matvec[0], pressure[0]);
     extrapolate_accuracy =
       compute_least_squares_fit(pressure_matvec, pressure_rhs, pressure, pressure_np);
+    pressure_matvec.back().copy_locally_owned_data_from(pressure_rhs);
   }
   const double t_extrapol = timer2.wall_time();
   timer2.restart();
@@ -483,7 +484,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
     n_iter.first += control.last_step();
     n_iter.second = control.last_value();
   }
-
 
   iterations_pressure.first += 1;
   iterations_pressure.second += n_iter.first;
