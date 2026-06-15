@@ -56,6 +56,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
     convective_divergence_rhs(this->param.order_extrapolation_pressure_nbc),
     divergences(this->order),
     pressure_nbc_rhs(this->param.order_extrapolation_pressure_nbc),
+    factors_time_step_mass{},
     factor_cfl(-1.0),
     iterations_pressure({0, 0}),
     iterations_viscous({0, {0, 0}}),
@@ -218,7 +219,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
     op_rt_float->initialize_dof_vector(vector);
   for(auto & vector : velocity_matvec)
     op_rt_float->initialize_dof_vector(vector);
-  op_rt_float->initialize_dof_vector(rhs_float);
 
   laplace_op = std::make_shared<LaplaceOperator::LaplaceOperatorDG<dim, Number>>();
   laplace_op->reinit(*pde_operator->get_mapping(),
@@ -653,25 +653,23 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     for(unsigned int j = 0; j < 2 * n_vectors; ++j)
       vec_ptrs[j] = velocity_matvec[j].begin();
     dealii::ndarray<dealii::VectorizedArray<double>, 5, 6> local_sums = {};
+    factors_time_step_mass[0]                                         = factor_mass;
 
-    op_rt_float->set_parameters(0.0, factor_lapl);
-    op_rt_float->vmult_mass_and_laplace(velocity_matvec[1],
-                                        velocity_matvec[0],
-                                        velocity_red[0],
-                                        [&](const unsigned int begin, const unsigned int end) {
-                                          do_compute_inner_products_range<true>(begin,
-                                                                                end,
-                                                                                n_vectors,
-                                                                                factor_mass,
-                                                                                vec_ptrs,
-                                                                                rhs_rt.begin(),
-                                                                                local_sums);
-                                        });
+    op_rt_float->set_parameters(1.0, 0);
+    op_rt_float->vmult(
+      velocity_matvec[1],
+      velocity_red[0],
+      [&](const unsigned int begin, const unsigned int end) {
+        std::fill(velocity_matvec[1].begin() + begin, velocity_matvec[1].begin() + end, 0.f);
+      },
+      [&](const unsigned int begin, const unsigned int end) {
+        do_compute_inner_products_range<true>(
+          begin, end, n_vectors, factors_time_step_mass, vec_ptrs, rhs_rt.begin(), local_sums);
+      });
     extrapolate_accuracy = do_compute_least_squares_fit(solution_rt.get_mpi_communicator(),
                                                         local_sums,
                                                         projection_vector);
-
-    const double t_proj = timer2.wall_time();
+    const double t_proj  = timer2.wall_time();
     timer2.restart();
 
     if(preconditioner_viscous.get_vector().get_partitioner().get() !=
@@ -689,10 +687,15 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       rhs_rt,
       solution_rt,
       [&](const unsigned int begin, const unsigned int end) {
+        std::copy(rhs_rt.begin() + begin,
+                  rhs_rt.begin() + end,
+                  velocity_matvec[velocity_matvec.size() - 2].begin() + begin);
         extrapolate_vectors_range<false>(begin, end, projection_vector, velocity_red, solution_rt);
       },
       [&](const unsigned int begin, const unsigned int end) {
-        std::copy(rhs_rt.begin() + begin, rhs_rt.begin() + end, rhs_float.begin() + begin);
+        std::copy(rhs_rt.begin() + begin,
+                  rhs_rt.begin() + end,
+                  velocity_matvec.back().begin() + begin);
       });
 
     // Do the last tasks before solving: (i) initialize the solution vector to
@@ -715,7 +718,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
     dealii::SolverCG<VectorTypeFloat> solver_cg(control);
     op_rt_float->set_parameters(factor_mass, factor_lapl);
-    solver_cg.solve(*op_rt_float, velocity_red.back(), rhs_float, preconditioner_viscous);
+    solver_cg.solve(*op_rt_float,
+                    velocity_red.back(),
+                    velocity_matvec.back(),
+                    preconditioner_viscous);
     n_iter = control.last_step();
 
     DEAL_II_OPENMP_SIMD_PRAGMA
@@ -775,9 +781,13 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::prepare_vectors_for_next_tim
   swap_back_one_step(divergences);
   swap_back_one_step(pressure_nbc_rhs);
 
-  // swap two steps because we keep viscous and mass vectors for viscosity
+  // swap two steps because we the right-hand side vector and the mass matrix
+  // applied to the velocity field to construct the projection initial guess
   swap_back_one_step(velocity_matvec);
   swap_back_one_step(velocity_matvec);
+
+  for(unsigned int i = factors_time_step_mass.size() - 1; i > 0; --i)
+    std::swap(factors_time_step_mass[i], factors_time_step_mass[i - 1]);
 }
 
 template<int dim, typename Number>
@@ -974,12 +984,17 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
       divergences[i]);
     if(static_cast<std::size_t>(i) < velocity_red.size())
     {
-      // Initialize the old solutions for better extrapolation
+      // Initialize the old solutions for better extrapolation. Note that we
+      // store the right-hand side for later times, but just the viscous
+      // contribution for the restart vectors. This works because we set the
+      // initial weights in the relevant array to zero.
       velocity_red[i].copy_locally_owned_data_from(velocity[i]);
+      op_rt_float->set_parameters(0, this->pde_operator->get_viscous_kernel_data().viscosity);
       op_rt_float->vmult_mass_and_laplace(velocity_matvec[2 * i + 1],
                                           velocity_matvec[2 * i],
                                           velocity_red[i],
                                           [](const unsigned int, const unsigned int) {});
+      factors_time_step_mass[i + 1] = 0.;
     }
 
     if(static_cast<std::size_t>(i) < pressure_nbc_rhs.size())
