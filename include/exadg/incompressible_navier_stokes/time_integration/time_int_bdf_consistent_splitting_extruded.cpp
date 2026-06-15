@@ -456,7 +456,12 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
   if(this->use_extrapolation)
   {
     pressure[0].copy_locally_owned_data_from(pressure_np);
-    // poisson_preconditioner->get_dg_matrix().vmult(pressure_matvec[0], pressure[0]);
+
+    // in first time step, need to get the right-hand side from the mat-vec,
+    // as it is not in restart data, later just store the old right-hand side
+    // vectors
+    if(this->get_time_step_number() == 1)
+      poisson_preconditioner->get_dg_matrix().vmult(pressure_matvec[0], pressure[0]);
     extrapolate_accuracy =
       compute_least_squares_fit(pressure_matvec, pressure_rhs, pressure, pressure_np);
     pressure_matvec.back().copy_locally_owned_data_from(pressure_rhs);
