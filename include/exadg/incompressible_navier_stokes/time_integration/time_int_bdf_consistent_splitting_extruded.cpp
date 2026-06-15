@@ -990,10 +990,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
       // initial weights in the relevant array to zero.
       velocity_red[i].copy_locally_owned_data_from(velocity[i]);
       op_rt_float->set_parameters(0, this->pde_operator->get_viscous_kernel_data().viscosity);
-      op_rt_float->vmult_mass_and_laplace(velocity_matvec[2 * i + 1],
-                                          velocity_matvec[2 * i],
-                                          velocity_red[i],
-                                          [](const unsigned int, const unsigned int) {});
+      op_rt_float->vmult(velocity_matvec[2 * i], velocity_red[i]);
+      op_rt_float->set_parameters(1, 0);
+      op_rt_float->vmult(velocity_matvec[2 * i + 1], velocity_red[i]);
       factors_time_step_mass[i + 1] = 0.;
     }
 
