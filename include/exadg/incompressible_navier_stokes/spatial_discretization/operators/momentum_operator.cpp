@@ -69,7 +69,7 @@ MomentumOperator<dim, Number>::initialize(
                                  operator_data.viscous_kernel_data,
                                  operator_data.dof_index,
                                  operator_data.quad_index,
-                                 true,
+                                 true /* compute_penalty_parameter */,
                                  use_velocity_own_storage_viscous_kernel);
 
     // initialize and check turbulence model data
