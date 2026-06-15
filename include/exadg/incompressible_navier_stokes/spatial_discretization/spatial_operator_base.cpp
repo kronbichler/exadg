@@ -656,11 +656,14 @@ SpatialOperatorBase<dim, Number>::initialize_operators(std::string const & dof_i
                                                        not param.non_explicit_convective_problem();
 
   viscous_kernel = std::make_shared<Operators::ViscousKernel<dim, Number>>();
-  viscous_kernel->reinit(*matrix_free,
-                         viscous_kernel_data,
-                         get_dof_index_velocity(),
-                         get_quad_index_velocity_standard(),
-                         use_velocity_own_storage_viscous_kernel);
+  viscous_kernel->reinit(
+    *matrix_free,
+    viscous_kernel_data,
+    get_dof_index_velocity(),
+    get_quad_index_velocity_standard(),
+    (param.temporal_discretization != TemporalDiscretization::BDFDualSplittingExtruded &&
+     param.temporal_discretization != TemporalDiscretization::BDFConsistentSplittingExtruded),
+    use_velocity_own_storage_viscous_kernel);
 
   // initialize and check turbulence model data
   if(param.turbulence_model_data.is_active)
