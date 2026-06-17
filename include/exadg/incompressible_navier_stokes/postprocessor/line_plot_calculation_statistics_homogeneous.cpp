@@ -1027,8 +1027,10 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
     jacobians_at_nodal_points.size(1));
   std::vector<Number>                                              tmp_array;
   std::array<dealii::ndarray<VectorizedArrayType, 2, dim - 1>, 20> shapes_2d;
+  std::array<dealii::ndarray<VectorizedArrayType, 2, dim>, 20>     shapes_3d;
 
   const unsigned int n_points_in_plane = dealii::Utilities::pow(n_q_points_1d, dim - 1);
+  const unsigned int n_points_in_cell  = dealii::Utilities::pow(n_q_points_1d, dim);
   std::vector<dealii::Tensor<1, dim, Number>>          cell_averaged_velocity;
   std::vector<dealii::SymmetricTensor<2, dim, Number>> cell_averaged_reynolds;
 
@@ -1177,7 +1179,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
         const unsigned int n_chunks = (n_points + n_lanes - 1) / n_lanes;
         for(unsigned int p1_v = 0; p1_v < n_chunks; ++p1_v)
         {
-          dealii::Point<dim - 1, VectorizedArrayType> point_on_line;
+          dealii::Point<dim - 1, VectorizedArrayType> point_on_line_2d;
+          dealii::Point<dim, VectorizedArrayType>     point_on_line_3d;
           dealii::Tensor<2, dim, VectorizedArrayType> inv_jac;
           for(unsigned int d = 0; d < dim; ++d)
             inv_jac[d][d] = 1.0;
@@ -1186,8 +1189,14 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
               ++p1, ++v)
           {
             for(unsigned int d = 0, c = 0; d < dim; ++d)
+            {
               if(d != averaging_direction)
-                point_on_line[c++][v] = point_list[p1].second[d];
+                point_on_line_2d[c++][v] = point_list[p1].second[d];
+
+              if(need_velocity_gradient)
+                point_on_line_3d[d][v] = point_list[p1].second[d];
+            }
+
             dealii::Tensor<2, dim> const inv_jac_v = inverse_jacobians_on_lines[counter_line++];
             for(unsigned int d = 0; d < dim; ++d)
               for(unsigned int e = 0; e < dim; ++e)
@@ -1233,7 +1242,13 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
             1.0 / std::abs(inv_jac[averaging_direction][averaging_direction]);
           dealii::internal::compute_values_of_array(shapes_2d.data(),
                                                     polynomials_nodal,
-                                                    point_on_line);
+                                                    point_on_line_2d);
+          if(need_velocity_gradient)
+          {
+            dealii::internal::compute_values_of_array(shapes_3d.data(),
+                                                      polynomials_nodal,
+                                                      point_on_line_3d);
+          }
 
           const VectorizedArrayType                            length = det;
           dealii::Tensor<1, dim, VectorizedArrayType>          vel;
@@ -1243,7 +1258,9 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
           if constexpr(!evaluate_averaging_by_tensor_product)
           {
             dealii::Tensor<1, dim, VectorizedArrayType> velocity;
+            dealii::Tensor<1, dim, VectorizedArrayType> velocity_3d;
             dealii::Tensor<2, dim, VectorizedArrayType> velocity_gradient;
+            dealii::Tensor<2, dim, VectorizedArrayType> velocity_gradient_3d;
             for(unsigned int q1 = 0; q1 < n_q_points_1d; ++q1)
             {
               VectorizedArrayType const JxW = det * gauss_1d.weight(q1);
@@ -1256,12 +1273,104 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                     VectorizedArrayType>(shapes_2d.data(),
                                          polynomials_nodal.size(),
                                          eval_ptr + q1 * n_points_in_plane);
-                velocity = val_grad[dim - 1];
+
+                auto const val_grad_3d =
+                  dealii::internal::evaluate_tensor_product_value_and_gradient_shapes<
+                    dim,
+                    dealii::Tensor<1, dim, Number>,
+                    VectorizedArrayType>(shapes_3d.data(),
+                                         polynomials_nodal.size(),
+                                         eval_ptr + q1 * n_points_in_cell);
+
+                velocity    = val_grad[dim - 1];
+                velocity_3d = val_grad_3d[dim];
+
+                // Check if the velocities computed vie the 2D and 3D path differ.
+                for(unsigned int v = 0; v < dealii::VectorizedArray<Number>::size(); v++)
+                {
+                  dealii::Tensor<1, dim, Number> u_2d;
+                  dealii::Tensor<1, dim, Number> u_3d;
+                  for(unsigned int i; i < dim; ++i)
+                  {
+                    u_2d[i] = velocity[i][v];
+                    u_3d[i] = velocity_3d[i][v];
+                  }
+                  u_2d -= u_3d;
+
+                  if(u_2d.norm() > 1e-10)
+                    std::cout << "||u_2d - u_3d||_2 = " << u_2d.norm() << "\n";
+                }
+
                 for(unsigned int d = 0; d < dim; ++d)
                 {
-                  for(unsigned int e = 0; e < dim - 1; ++e)
-                    velocity_gradient[d][e] = val_grad[e][d];
-                  velocity_gradient[d] = inv_jac * velocity_gradient[d];
+                  for(unsigned int e = 0; e < dim; ++e)
+                  {
+                    if(e < dim - 1)
+                      velocity_gradient[d][e] = val_grad[e][d];
+
+                    velocity_gradient_3d[d][e] = val_grad[e][d];
+                  }
+                  velocity_gradient[d]    = inv_jac * velocity_gradient[d];
+                  velocity_gradient_3d[d] = inv_jac * velocity_gradient_3d[d];
+                }
+
+                for(unsigned int v = 0; v < dealii::VectorizedArray<Number>::size(); v++)
+                {
+                  // std::cout << "velocity_gradient = "
+                  //           << "[ ";
+                  // for(unsigned int row = 0; row < dim; ++row)
+                  // {
+                  //   for(unsigned int col = 0; col < dim; ++col)
+                  //   {
+                  //     std::cout << " " << velocity_gradient[row][col][v];
+
+                  //     if(col == dim - 1 and row < dim - 1)
+                  //       std::cout << ";";
+                  //   }
+                  // }
+                  // std::cout << " ]\n\n";
+                  // std::cout << "velocity_gradient_3d = "
+                  //           << "[ ";
+                  // for(unsigned int row = 0; row < dim; ++row)
+                  // {
+                  //   for(unsigned int col = 0; col < dim; ++col)
+                  //   {
+                  //     std::cout << " " << velocity_gradient_3d[row][col][v];
+
+                  //     if(col == dim - 1 and row < dim - 1)
+                  //       std::cout << ";";
+                  //   }
+                  // }
+                  // std::cout << " ]\n\n";
+                  Number abs_diff_sum_components_1_2 = 0.0;
+                  for(unsigned int row = 0; row < dim; ++row)
+                  {
+                    for(unsigned int col = 0; col < dim - 1 /* skip last column */; ++col)
+                    {
+                      abs_diff_sum_components_1_2 += std::abs(velocity_gradient[row][col][v] -
+                                                              velocity_gradient_3d[row][col][v]);
+                    }
+                  }
+
+                  if(true or abs_diff_sum_components_1_2 > 1e-10)
+                  {
+                    std::cout << "|grad(u_2d) - grad(u_3d)| = "
+                              << "[ ";
+                    for(unsigned int row = 0; row < dim; ++row)
+                    {
+                      for(unsigned int col = 0; col < dim; ++col)
+                      {
+                        Number const abs_diff = std::abs(velocity_gradient[row][col][v] -
+                                                         velocity_gradient_3d[row][col][v]);
+                        std::cout << " " << abs_diff;
+
+                        if(col == dim - 1 and row < dim - 1)
+                          std::cout << ";";
+                      }
+                    }
+                    std::cout << " ], abs_diff_sum_components_1_2 = " << abs_diff_sum_components_1_2
+                              << "\n\n";
+                  }
                 }
 
                 if(need_dissipation)
