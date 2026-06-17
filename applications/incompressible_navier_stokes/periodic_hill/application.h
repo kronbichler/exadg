@@ -608,7 +608,7 @@ private:
     // RESTART
     this->param.restarted_simulation                        = read_restart;
     this->param.restart_data.write_restart                  = write_restart;
-    this->param.restart_data.write_vectors_to_vtu           = true;
+    this->param.restart_data.write_vectors_to_vtu           = this->output_parameters.write;
     this->param.restart_data.interval_time                  = restart_interval_time;
     this->param.restart_data.directory_coarse_triangulation = restart_directory;
     this->param.restart_data.directory_read                 = restart_directory;
