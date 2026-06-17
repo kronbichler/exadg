@@ -56,6 +56,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
     convective_divergence_rhs(this->param.order_extrapolation_pressure_nbc),
     divergences(this->order),
     pressure_nbc_rhs(this->param.order_extrapolation_pressure_nbc),
+    factors_time_step_mass{},
     factor_cfl(-1.0),
     iterations_pressure({0, 0}),
     iterations_viscous({0, {0, 0}}),
@@ -218,7 +219,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
     op_rt_float->initialize_dof_vector(vector);
   for(auto & vector : velocity_matvec)
     op_rt_float->initialize_dof_vector(vector);
-  op_rt_float->initialize_dof_vector(rhs_float);
 
   laplace_op = std::make_shared<LaplaceOperator::LaplaceOperatorDG<dim, Number>>();
   laplace_op->reinit(*pde_operator->get_mapping(),
@@ -450,15 +450,23 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
 
   const double t_rhs = timer.wall_time();
 
-  // extrapolate old solution to get a good initial estimate for the solver
+  // projection solution from previous time steps to get a good initial
+  // estimate for the solver, following the algorithm by Loehner, 'Projective
+  // prediction of pressure increments', 2004, https://doi.org/10.1002/cnm.743
   dealii::Timer             timer2;
   std::pair<double, double> extrapolate_accuracy(0., 0.);
   if(this->use_extrapolation)
   {
     pressure[0].copy_locally_owned_data_from(pressure_np);
-    poisson_preconditioner->get_dg_matrix().vmult(pressure_matvec[0], pressure[0]);
+
+    // in first time step, need to get the right-hand side from the mat-vec,
+    // as it is not in restart data, later just retreive it from the old
+    // right-hand side vectors
+    if(this->get_time_step_number() == 1)
+      poisson_preconditioner->get_dg_matrix().vmult(pressure_matvec[0], pressure[0]);
     extrapolate_accuracy =
       compute_least_squares_fit(pressure_matvec, pressure_rhs, pressure, pressure_np);
+    pressure_matvec.back().copy_locally_owned_data_from(pressure_rhs);
   }
   const double t_extrapol = timer2.wall_time();
   timer2.restart();
@@ -624,9 +632,16 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     const Number factor_mass = this->get_scaling_factor_time_derivative_term();
     const Number factor_lapl = this->pde_operator->get_viscous_kernel_data().viscosity;
 
-    // Compute least squares fit - use the version that runs the inner product
-    // computations embedded into the matrix-vector product of the current
-    // vector to overlap memory access with computations
+    // Compute least squares fit, again using Loehner's approach - use the
+    // version that runs the inner product computations embedded into the
+    // matrix-vector product for the mass matrix vmult() of the current vector
+    // to overlap memory access with computations on vmult(). We need the
+    // second vector because the size of the mass matrix term changes from
+    // time step to time step, but we do not want to form 'n_vectors' many
+    // matrix-vector product with the momentum operator, so just replace the
+    // difference in the product, which is done inside the evaluation of
+    // do_compute_inner_products_range with the 'factors_time_step_mass'
+    // argument.
     const unsigned int  n_vectors = velocity_red.size();
     std::vector<double> projection_vector(n_vectors);
     AssertDimension(velocity_matvec.size(), 2 * n_vectors);
@@ -635,25 +650,26 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     for(unsigned int j = 0; j < 2 * n_vectors; ++j)
       vec_ptrs[j] = velocity_matvec[j].begin();
     dealii::ndarray<dealii::VectorizedArray<double>, 5, 6> local_sums = {};
+    factors_time_step_mass[0]                                         = factor_mass;
 
-    op_rt_float->set_parameters(0.0, factor_lapl);
-    op_rt_float->vmult_mass_and_laplace(velocity_matvec[1],
-                                        velocity_matvec[0],
-                                        velocity_red[0],
-                                        [&](const unsigned int begin, const unsigned int end) {
-                                          do_compute_inner_products_range<true>(begin,
-                                                                                end,
-                                                                                n_vectors,
-                                                                                factor_mass,
-                                                                                vec_ptrs,
-                                                                                rhs_rt.begin(),
-                                                                                local_sums);
-                                        });
+    // Need to get mass operator to slot '1', the operator from the previous
+    // time step (obtained from right-hand side) is in 'velocity_matvec[0]'
+    // and all other even indices.
+    op_rt_float->set_parameters(1.0, 0);
+    op_rt_float->vmult(
+      velocity_matvec[1],
+      velocity_red[0],
+      [&](const unsigned int begin, const unsigned int end) {
+        std::fill(velocity_matvec[1].begin() + begin, velocity_matvec[1].begin() + end, 0.f);
+      },
+      [&](const unsigned int begin, const unsigned int end) {
+        do_compute_inner_products_range<true>(
+          begin, end, n_vectors, factors_time_step_mass, vec_ptrs, rhs_rt.begin(), local_sums);
+      });
     extrapolate_accuracy = do_compute_least_squares_fit(solution_rt.get_mpi_communicator(),
                                                         local_sums,
                                                         projection_vector);
-
-    const double t_proj = timer2.wall_time();
+    const double t_proj  = timer2.wall_time();
     timer2.restart();
 
     if(preconditioner_viscous.get_vector().get_partitioner().get() !=
@@ -665,16 +681,25 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     // single precision for the subsequent solution with CG. Note we compute
     // the extrapolation from the least-squares projection first at this
     // stage, to benefit from data locality in accessing the solution_rt
-    // vector
+    // vector. Also note that we also copy the right-hand side into the second
+    // to last slot of velocity_matvec for usage in the next time step, and
+    // use the last slot of velocity_matvec for the solver. This vector will
+    // not be needed again, as it is overwritten with the mass matrix mat-vec
+    // in the next time step (done in the code above).
     op_rt->set_parameters(-factor_mass, -factor_lapl);
     op_rt->vmult(
       rhs_rt,
       solution_rt,
       [&](const unsigned int begin, const unsigned int end) {
+        std::copy(rhs_rt.begin() + begin,
+                  rhs_rt.begin() + end,
+                  velocity_matvec[velocity_matvec.size() - 2].begin() + begin);
         extrapolate_vectors_range<false>(begin, end, projection_vector, velocity_red, solution_rt);
       },
       [&](const unsigned int begin, const unsigned int end) {
-        std::copy(rhs_rt.begin() + begin, rhs_rt.begin() + end, rhs_float.begin() + begin);
+        std::copy(rhs_rt.begin() + begin,
+                  rhs_rt.begin() + end,
+                  velocity_matvec.back().begin() + begin);
       });
 
     // Do the last tasks before solving: (i) initialize the solution vector to
@@ -697,7 +722,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
     dealii::SolverCG<VectorTypeFloat> solver_cg(control);
     op_rt_float->set_parameters(factor_mass, factor_lapl);
-    solver_cg.solve(*op_rt_float, velocity_red.back(), rhs_float, preconditioner_viscous);
+    solver_cg.solve(*op_rt_float,
+                    velocity_red.back(),
+                    velocity_matvec.back(),
+                    preconditioner_viscous);
     n_iter = control.last_step();
 
     DEAL_II_OPENMP_SIMD_PRAGMA
@@ -757,9 +785,13 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::prepare_vectors_for_next_tim
   swap_back_one_step(divergences);
   swap_back_one_step(pressure_nbc_rhs);
 
-  // swap two steps because we keep viscous and mass vectors for viscosity
+  // swap two steps because we the right-hand side vector and the mass matrix
+  // applied to the velocity field to construct the projection initial guess
   swap_back_one_step(velocity_matvec);
   swap_back_one_step(velocity_matvec);
+
+  for(unsigned int i = factors_time_step_mass.size() - 1; i > 0; --i)
+    std::swap(factors_time_step_mass[i], factors_time_step_mass[i - 1]);
 }
 
 template<int dim, typename Number>
@@ -956,12 +988,16 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
       divergences[i]);
     if(static_cast<std::size_t>(i) < velocity_red.size())
     {
-      // Initialize the old solutions for better extrapolation
+      // Initialize the old solutions for better extrapolation. Note that we
+      // store the right-hand side for later times, but just the viscous
+      // contribution for the restart vectors. This works because we set the
+      // initial weights in the relevant array to zero.
       velocity_red[i].copy_locally_owned_data_from(velocity[i]);
-      op_rt_float->vmult_mass_and_laplace(velocity_matvec[2 * i + 1],
-                                          velocity_matvec[2 * i],
-                                          velocity_red[i],
-                                          [](const unsigned int, const unsigned int) {});
+      op_rt_float->set_parameters(0, this->pde_operator->get_viscous_kernel_data().viscosity);
+      op_rt_float->vmult(velocity_matvec[2 * i], velocity_red[i]);
+      op_rt_float->set_parameters(1, 0);
+      op_rt_float->vmult(velocity_matvec[2 * i + 1], velocity_red[i]);
+      factors_time_step_mass[i + 1] = 0.;
     }
 
     if(static_cast<std::size_t>(i) < pressure_nbc_rhs.size())

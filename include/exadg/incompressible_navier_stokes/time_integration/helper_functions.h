@@ -310,10 +310,10 @@ compute_least_squares_fit(OperatorType const &            op,
 
 template<bool combine_two, typename Number, typename Number2>
 void
-do_compute_inner_products_range(const unsigned int begin,
-                                const unsigned int end,
-                                const unsigned int n_vectors,
-                                const double       factor_second,
+do_compute_inner_products_range(const unsigned int            begin,
+                                const unsigned int            end,
+                                const unsigned int            n_vectors,
+                                const std::array<double, 6> & factors_change_in_matrix,
                                 const std::array<const Number *, (combine_two ? 10 : 5)> & vec_ptrs,
                                 const Number2 *                                            rhs_ptr,
                                 dealii::ndarray<dealii::VectorizedArray<double>, 5, 6> & local_sums)
@@ -322,6 +322,10 @@ do_compute_inner_products_range(const unsigned int begin,
   unsigned int constexpr n_lanes_4  = 4 * n_lanes;
   unsigned int const regular_size_4 = end / n_lanes_4 * n_lanes_4;
   unsigned int const regular_size   = end / n_lanes * n_lanes;
+
+  std::array<double, 5> compensate_factor;
+  for(unsigned int i = 0; i < n_vectors; ++i)
+    compensate_factor[i] = factors_change_in_matrix[0] - factors_change_in_matrix[i + 1];
 
   unsigned int k = begin;
   for(; k < regular_size_4; k += n_lanes_4)
@@ -336,35 +340,35 @@ do_compute_inner_products_range(const unsigned int begin,
         v_k_2.load(vec_ptrs[2 * i] + k + 2 * n_lanes);
         v_k_3.load(vec_ptrs[2 * i] + k + 3 * n_lanes);
         tmp.load(vec_ptrs[2 * i + 1] + k);
-        v_k_0 += factor_second * tmp;
+        v_k_0 += compensate_factor[i] * tmp;
         tmp.load(vec_ptrs[2 * i + 1] + k + n_lanes);
-        v_k_1 += factor_second * tmp;
+        v_k_1 += compensate_factor[i] * tmp;
         tmp.load(vec_ptrs[2 * i + 1] + k + 2 * n_lanes);
-        v_k_2 += factor_second * tmp;
+        v_k_2 += compensate_factor[i] * tmp;
         tmp.load(vec_ptrs[2 * i + 1] + k + 3 * n_lanes);
-        v_k_3 += factor_second * tmp;
+        v_k_3 += compensate_factor[i] * tmp;
 
         for(unsigned int j = 0; j < i; ++j)
         {
           dealii::VectorizedArray<double> v_j_k, tmp0;
           v_j_k.load(vec_ptrs[2 * j] + k);
           tmp.load(vec_ptrs[2 * j + 1] + k);
-          v_j_k += factor_second * tmp;
+          v_j_k += compensate_factor[j] * tmp;
           tmp0 = v_k_0 * v_j_k;
 
           v_j_k.load(vec_ptrs[2 * j] + k + n_lanes);
           tmp.load(vec_ptrs[2 * j + 1] + k + n_lanes);
-          v_j_k += factor_second * tmp;
+          v_j_k += compensate_factor[j] * tmp;
           tmp0 += v_k_1 * v_j_k;
 
           v_j_k.load(vec_ptrs[2 * j] + k + 2 * n_lanes);
           tmp.load(vec_ptrs[2 * j + 1] + k + 2 * n_lanes);
-          v_j_k += factor_second * tmp;
+          v_j_k += compensate_factor[j] * tmp;
           tmp0 += v_k_2 * v_j_k;
 
           v_j_k.load(vec_ptrs[2 * j] + k + 3 * n_lanes);
           tmp.load(vec_ptrs[2 * j + 1] + k + 3 * n_lanes);
-          v_j_k += factor_second * tmp;
+          v_j_k += compensate_factor[j] * tmp;
           tmp0 += v_k_3 * v_j_k;
 
           local_sums[i][j] += tmp0;
@@ -433,13 +437,13 @@ do_compute_inner_products_range(const unsigned int begin,
       {
         v_k.load(vec_ptrs[2 * i] + k);
         tmp.load(vec_ptrs[2 * i + 1] + k);
-        v_k += factor_second * tmp;
+        v_k += compensate_factor[i] * tmp;
         for(unsigned int j = 0; j < i; ++j)
         {
           dealii::VectorizedArray<double> v_j_k;
           v_j_k.load(vec_ptrs[2 * j] + k);
           tmp.load(vec_ptrs[2 * j + 1] + k);
-          v_j_k += factor_second * tmp;
+          v_j_k += compensate_factor[j] * tmp;
           local_sums[i][j] += v_k * v_j_k;
         }
       }
@@ -465,11 +469,11 @@ do_compute_inner_products_range(const unsigned int begin,
     {
       if(combine_two)
       {
-        const double v_i_k = vec_ptrs[2 * i][k] + factor_second * vec_ptrs[2 * i + 1][k];
+        const double v_i_k = vec_ptrs[2 * i][k] + compensate_factor[i] * vec_ptrs[2 * i + 1][k];
         for(unsigned int j = 0; j < i; ++j)
         {
           local_sums[i][j][k - regular_size] +=
-            v_i_k * (vec_ptrs[2 * j][k] + factor_second * vec_ptrs[2 * j + 1][k]);
+            v_i_k * (vec_ptrs[2 * j][k] + compensate_factor[j] * vec_ptrs[2 * j + 1][k]);
         }
         local_sums[i][i][k - regular_size] += v_i_k * v_i_k;
         local_sums[i][i + 1][k - regular_size] += v_i_k * rhs_ptr[k];
@@ -495,14 +499,14 @@ do_compute_least_squares_fit(
   const dealii::ndarray<dealii::VectorizedArray<double>, 5, 6> & local_sums,
   std::vector<double> &                                          small_vector)
 {
-  const unsigned int         n_vectors = small_vector.size();
-  dealii::FullMatrix<double> matrix(n_vectors, n_vectors);
+  const unsigned int n_vectors = small_vector.size();
   AssertThrow(n_vectors <= 5,
               dealii::ExcNotImplemented("Cannot handle " + std::to_string(n_vectors) +
                                         " vectors in least squares fit yet!"));
 
-  std::array<double, 21> scalar_sums;
-  unsigned int           count = 0;
+  dealii::ndarray<double, 5, 5> matrix;
+  std::array<double, 21>        scalar_sums;
+  unsigned int                  count = 0;
   for(unsigned int i = 0; i < n_vectors; ++i)
     for(unsigned int j = 0; j < i + 2; ++j, ++count)
       scalar_sums[count] = local_sums[i][j].sum();
@@ -513,6 +517,10 @@ do_compute_least_squares_fit(
                               communicator,
                               dealii::ArrayView<double>(scalar_sums.data(), count + 1));
 
+  for(unsigned int c = 0, i = 0; i < n_vectors; ++i, ++c)
+    for(unsigned int j = 0; j <= i; ++j, ++c)
+      matrix[i][j] = scalar_sums[c];
+
   // This algorithm performs a Cholesky (LDLT) factorization of
   // which eventually gives the linear combination sum (alpha_i x_i)
   // minimizing the residual among the given search vectors
@@ -520,23 +528,23 @@ do_compute_least_squares_fit(
   for(unsigned int c = 0; i < n_vectors; ++i, ++c)
   {
     for(unsigned int j = 0; j <= i; ++j, ++c)
-      matrix(i, j) = scalar_sums[c];
+      matrix[i][j] = scalar_sums[c];
 
     // update row in Cholesky factorization associated to matrix of normal
     // equations using the diagonal entry D
     for(unsigned int j = 0; j < i; ++j)
     {
-      double const inv_entry = matrix(i, j) / matrix(j, j);
+      double const inv_entry = matrix[i][j] / matrix[j][j];
       for(unsigned int k = j + 1; k <= i; ++k)
-        matrix(i, k) -= matrix(k, j) * inv_entry;
+        matrix[i][k] -= matrix[k][j] * inv_entry;
     }
-    if(matrix(i, i) < 1e-12 * matrix(0, 0) or matrix(0, 0) < 1e-30)
+    if(matrix[i][i] < 1e-12 * matrix[0][0] or matrix[0][0] < 1e-30)
       break;
 
     // update for the right hand side (forward substitution)
     small_vector[i] = scalar_sums[c];
     for(unsigned int j = 0; j < i; ++j)
-      small_vector[i] -= matrix(i, j) / matrix(j, j) * small_vector[j];
+      small_vector[i] -= matrix[i][j] / matrix[j][j] * small_vector[j];
   }
 
   // backward substitution of Cholesky factorization
@@ -546,8 +554,8 @@ do_compute_least_squares_fit(
   {
     double sum = small_vector[s];
     for(unsigned int j = s + 1; j < i; ++j)
-      sum -= small_vector[j] * matrix(j, s);
-    small_vector[s] = sum / matrix(s, s);
+      sum -= small_vector[j] * matrix[j][s];
+    small_vector[s] = sum / matrix[s][s];
   }
 
   // compute residual norm of resulting minimization problem
@@ -572,9 +580,11 @@ compute_least_squares_fit(std::vector<VectorType1> const & vectors_matvec,
                           VectorType2 const &              rhs,
                           std::vector<VectorType1> const & vectors,
                           VectorType2 &                    result,
-                          double const                     factor_second = 1.0)
+                          std::vector<double> const &      factor_second = {})
 {
   AssertDimension((combine_two ? 2 : 1) * vectors.size(), vectors_matvec.size());
+  if(combine_two)
+    AssertDimension(factor_second.size(), vectors.size() + 1);
   const unsigned int  n_vectors = vectors.size();
   std::vector<double> small_vector(n_vectors);
 
@@ -585,12 +595,21 @@ compute_least_squares_fit(std::vector<VectorType1> const & vectors_matvec,
   std::array<const typename VectorType1::value_type *, (combine_two ? 10 : 5)> vec_ptrs = {};
   for(unsigned int j = 0; j < (combine_two ? 2 * n_vectors : n_vectors); ++j)
     vec_ptrs[j] = vectors_matvec[j].begin();
+  std::array<double, 6> factors_for_combination;
+  if(combine_two)
+    for(unsigned int i = 0; i < factor_second.size() + 1; ++i)
+      factors_for_combination[i] = factor_second[i];
 
   // compute inner products in normal equations (all at once)
   dealii::ndarray<dealii::VectorizedArray<double>, 5, 6> local_sums = {};
 
-  do_compute_inner_products_range<combine_two>(
-    0, result.locally_owned_size(), n_vectors, factor_second, vec_ptrs, rhs.begin(), local_sums);
+  do_compute_inner_products_range<combine_two>(0,
+                                               result.locally_owned_size(),
+                                               n_vectors,
+                                               factors_for_combination,
+                                               vec_ptrs,
+                                               rhs.begin(),
+                                               local_sums);
 
   const auto residuals =
     do_compute_least_squares_fit(result.get_mpi_communicator(), local_sums, small_vector);
