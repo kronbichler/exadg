@@ -66,8 +66,18 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
   const Number h_z         = mapping_info.h_z;
   const Number h_z_inverse = mapping_info.h_z_inverse;
 
-  constexpr unsigned int nn         = n_q_points_1d;
-  const Number *         shape_grad = shape_data.shape_gradients_collocation_eo.data();
+  constexpr unsigned int  nn = n_q_points_1d;
+
+  // Create a local copy to a stack variable of the shape gradients, such that
+  // the compiler can decide on the most optimal placement of variables in
+  // registers, rather than having to consider potential aliasing between the
+  // 'shape_gradients_collocation_eo' variable and the other variables used
+  // during sum factorization.
+  VectorizedArray<Number> shape_grad[nn * ((nn + 1) / 2)];
+  AssertDimension(shape_data.shape_gradients_collocation_eo.size(), nn * ((nn + 1) / 2));
+  for(unsigned int i = 0; i < nn * ((nn + 1) / 2); ++i)
+    shape_grad[i] = shape_data.shape_gradients_collocation_eo[i];
+
   for(unsigned int i1 = 0; i1 < (dim == 3 ? nn : 1); ++i1)
     for(unsigned int i0 = 0; i0 < nn; ++i0)
       internal::apply_matrix_vector_product<internal::evaluate_evenodd,
@@ -203,17 +213,18 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
 
 
 // retrieve the coarsening sequence for p multigrid, defined in a central
-// place: pick the next coarser degree as half the previous degree; if integer
-// division has remainder, use the nearest even degree (i.e., we do steps like
-// 2-1, 3-2-1, 4-2-1, 5-2-1, 6-3-2-1, 7-4-2-1, etc)
+// place: pick the next coarser degree as half the previous degree, but for
+// small degrees we do smaller steps to avoid too aggressive coarsening (i.e.,
+// we do steps like 2-1, 3-2-1, 4-2-1, 5-3-2-1, 6-4-2-1, 7-4-2-1, 8-4-2-1 etc)
 constexpr unsigned int
 get_coarser_fe_degree(const unsigned int degree)
 {
-  const unsigned int half = degree / 2;
-  if(degree % 2 == 1 && half % 2 == 1)
-    return half + 1;
+  if(degree < 4)
+    return degree - 1;
+  else if(degree < 7)
+    return degree - 2;
   else
-    return half;
+    return (degree + 1) / 2;
 }
 
 
@@ -736,13 +747,13 @@ private:
 public:
   template<int fe_degree, int n_q_points_1d, int n_components>
   static void
-  read_dof_values_compressed(const VectorType &                    vec_in,
-                             const std::vector<unsigned int> &     compressed_dof_indices,
-                             const std::vector<unsigned char> &    all_indices_unconstrained,
-                             const unsigned int                    cell_no,
-                             const dealii::AlignedVector<Number> & shape_values_eo,
-                             const bool                            is_collocation,
-                             VectorizedArray<Number> *             dof_values)
+  read_dof_values_compressed(const VectorType &                         vec_in,
+                             const std::vector<unsigned int> &          compressed_dof_indices,
+                             const std::vector<unsigned char> &         all_indices_unconstrained,
+                             const unsigned int                         cell_no,
+                             const dealii::AlignedVector<Number> &      shape_values_eo,
+                             const bool                                 is_collocation,
+                             VectorizedArray<Number> * DEAL_II_RESTRICT dof_values)
   {
     VectorType & vec = const_cast<VectorType &>(vec_in);
     AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * n_lanes,
@@ -754,6 +765,19 @@ public:
     constexpr unsigned int dofs_per_comp = dealii::Utilities::pow(n_q_points_1d, dim);
     dealii::internal::VectorReader<Number, VectorizedArray<Number>> reader;
 
+    // Create a local copy to a stack variable of the shape values, such that
+    // the compiler can decide on the most optimal placement of variables in
+    // registers, rather than having to consider potential aliasing between
+    // the 'shape_values_eo' variable and the other variables used during sum
+    // factorization.
+    dealii::VectorizedArray<Number> shape_val[(fe_degree + 1) * ((n_q_points_1d + 1) / 2)];
+    if(is_collocation == false)
+    {
+      AssertDimension(shape_values_eo.size(), (fe_degree + 1) * ((n_q_points_1d + 1) / 2));
+      for(unsigned int i = 0; i < (fe_degree + 1) * ((n_q_points_1d + 1) / 2); ++i)
+        shape_val[i] = shape_values_eo[i];
+    }
+
     for(unsigned int i2 = 0, compressed_i2 = 0, offset_i2 = 0;
         i2 < (dim == 3 ? (fe_degree + 1) : 1);
         ++i2)
@@ -761,30 +785,27 @@ public:
       bool all_unconstrained = true;
       for(unsigned int i = 0; i < 9; ++i)
         if(cell_unconstrained[9 * compressed_i2 + i] == 0)
+        {
           all_unconstrained = false;
+          break;
+        }
       if(n_components == 1 && fe_degree < 8 && all_unconstrained)
       {
         const unsigned int *   indices       = cell_indices + 9 * n_lanes * compressed_i2;
         constexpr unsigned int dofs_per_line = (fe_degree - 1);
         // first line
-        reader.process_dof_gather(indices,
-                                  vec,
-                                  offset_i2,
-                                  vec.begin() + offset_i2,
-                                  dof_values[0],
-                                  std::integral_constant<bool, true>());
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          dof_values[0][v] = vec.local_element(offset_i2 + indices[v]);
         indices += n_lanes;
         dealii::vectorized_load_and_transpose(dofs_per_line,
                                               vec.begin() + offset_i2 * dofs_per_line,
                                               indices,
                                               dof_values + 1);
         indices += n_lanes;
-        reader.process_dof_gather(indices,
-                                  vec,
-                                  offset_i2,
-                                  vec.begin() + offset_i2,
-                                  dof_values[fe_degree],
-                                  std::integral_constant<bool, true>());
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          dof_values[fe_degree][v] = vec.local_element(offset_i2 + indices[v]);
         indices += n_lanes;
 
         // inner part
@@ -815,24 +836,18 @@ public:
 
         // last line
         constexpr unsigned int i = fe_degree * (fe_degree + 1);
-        reader.process_dof_gather(indices,
-                                  vec,
-                                  offset_i2,
-                                  vec.begin() + offset_i2,
-                                  dof_values[i],
-                                  std::integral_constant<bool, true>());
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          dof_values[i][v] = vec.local_element(offset_i2 + indices[v]);
         indices += n_lanes;
         dealii::vectorized_load_and_transpose(dofs_per_line,
                                               vec.begin() + offset_i2 * dofs_per_line,
                                               indices,
                                               dof_values + i + 1);
         indices += n_lanes;
-        reader.process_dof_gather(indices,
-                                  vec,
-                                  offset_i2,
-                                  vec.begin() + offset_i2,
-                                  dof_values[i + fe_degree],
-                                  std::integral_constant<bool, true>());
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          dof_values[i + fe_degree][v] = vec.local_element(offset_i2 + indices[v]);
         indices += n_lanes;
       }
       else
@@ -919,15 +934,32 @@ public:
         }
       if(!is_collocation)
         for(unsigned int c = 0; c < n_components; ++c)
-          dealii::internal::FEEvaluationImplBasisChange<
-            dealii::internal::evaluate_evenodd,
-            dealii::internal::EvaluatorQuantity::value,
-            2,
-            fe_degree + 1,
-            n_q_points_1d>::do_forward(1,
-                                       shape_values_eo,
-                                       dof_values + c * dofs_per_comp,
-                                       dof_values + c * dofs_per_comp);
+        {
+          for(int i = fe_degree; i >= 0; --i)
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  fe_degree + 1,
+                                                  n_q_points_1d,
+                                                  1,
+                                                  1,
+                                                  true,
+                                                  false>(shape_val,
+                                                         dof_values + i * (fe_degree + 1) +
+                                                           c * dofs_per_comp,
+                                                         dof_values + i * n_q_points_1d +
+                                                           c * dofs_per_comp);
+          for(unsigned int i = 0; i < n_q_points_1d; ++i)
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  fe_degree + 1,
+                                                  n_q_points_1d,
+                                                  n_q_points_1d,
+                                                  n_q_points_1d,
+                                                  true,
+                                                  false>(shape_val,
+                                                         dof_values + i + c * dofs_per_comp,
+                                                         dof_values + i + c * dofs_per_comp);
+        }
 
       if(i2 == 0 || i2 == fe_degree - 1)
       {
@@ -951,7 +983,7 @@ public:
                                                 n_q_points_1d * n_q_points_1d,
                                                 n_q_points_1d * n_q_points_1d,
                                                 true,
-                                                false>(shape_values_eo.data(),
+                                                false>(shape_val,
                                                        dof_values + q1 + c * dofs_per_comp,
                                                        dof_values + q1 + c * dofs_per_comp);
   }
@@ -959,13 +991,13 @@ public:
   template<int fe_degree, int n_q_points_1d, int n_components>
   static void
   distribute_local_to_global_compressed(
-    VectorType &                          vec,
-    const std::vector<unsigned int> &     compressed_dof_indices,
-    const std::vector<unsigned char> &    all_indices_unconstrained,
-    const unsigned int                    cell_no,
-    const dealii::AlignedVector<Number> & shape_values_eo,
-    const bool                            is_collocation,
-    VectorizedArray<Number> *             dof_values)
+    VectorType &                               vec,
+    const std::vector<unsigned int> &          compressed_dof_indices,
+    const std::vector<unsigned char> &         all_indices_unconstrained,
+    const unsigned int                         cell_no,
+    const dealii::AlignedVector<Number> &      shape_values_eo,
+    const bool                                 is_collocation,
+    VectorizedArray<Number> * DEAL_II_RESTRICT dof_values)
   {
     AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * n_lanes,
                      compressed_dof_indices.size());
@@ -975,6 +1007,19 @@ public:
       all_indices_unconstrained.data() + cell_no * dealii::Utilities::pow(3, dim);
     constexpr unsigned int dofs_per_comp = dealii::Utilities::pow(n_q_points_1d, dim);
     dealii::internal::VectorDistributorLocalToGlobal<Number, VectorizedArray<Number>> distributor;
+
+    // Create a local copy to a stack variable of the shape values, such that
+    // the compiler can decide on the most optimal placement of variables in
+    // registers, rather than having to consider potential aliasing between
+    // the 'shape_values_eo' variable and the other variables used during sum
+    // factorization.
+    dealii::VectorizedArray<Number> shape_val[(fe_degree + 1) * ((n_q_points_1d + 1) / 2)];
+    if(is_collocation == false)
+    {
+      AssertDimension(shape_values_eo.size(), (fe_degree + 1) * ((n_q_points_1d + 1) / 2));
+      for(unsigned int i = 0; i < (fe_degree + 1) * ((n_q_points_1d + 1) / 2); ++i)
+        shape_val[i] = shape_values_eo[i];
+    }
 
     if(dim == 3 && !is_collocation)
       for(unsigned int c = 0; c < n_components; ++c)
@@ -986,7 +1031,7 @@ public:
                                                 n_q_points_1d * n_q_points_1d,
                                                 n_q_points_1d * n_q_points_1d,
                                                 false,
-                                                false>(shape_values_eo.data(),
+                                                false>(shape_val,
                                                        dof_values + q1 + c * dofs_per_comp,
                                                        dof_values + q1 + c * dofs_per_comp);
 
@@ -996,16 +1041,32 @@ public:
     {
       if(!is_collocation)
         for(unsigned int c = 0; c < n_components; ++c)
-          dealii::internal::FEEvaluationImplBasisChange<
-            dealii::internal::evaluate_evenodd,
-            dealii::internal::EvaluatorQuantity::value,
-            2,
-            fe_degree + 1,
-            n_q_points_1d>::do_backward(1,
-                                        shape_values_eo,
-                                        false,
-                                        dof_values + c * dofs_per_comp,
-                                        dof_values + c * dofs_per_comp);
+        {
+          for(unsigned int i = 0; i < n_q_points_1d; ++i)
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  fe_degree + 1,
+                                                  n_q_points_1d,
+                                                  n_q_points_1d,
+                                                  n_q_points_1d,
+                                                  false,
+                                                  false>(shape_val,
+                                                         dof_values + i + c * dofs_per_comp,
+                                                         dof_values + i + c * dofs_per_comp);
+          for(unsigned int i = 0; i < fe_degree + 1; ++i)
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  fe_degree + 1,
+                                                  n_q_points_1d,
+                                                  1,
+                                                  1,
+                                                  false,
+                                                  false>(shape_val,
+                                                         dof_values + i * n_q_points_1d +
+                                                           c * dofs_per_comp,
+                                                         dof_values + i * (fe_degree + 1) +
+                                                           c * dofs_per_comp);
+        }
       bool all_unconstrained = true;
       for(unsigned int i = 0; i < 9; ++i)
         if(cell_unconstrained[9 * compressed_i2 + i] == 0)
@@ -1015,22 +1076,14 @@ public:
         const unsigned int *   indices       = cell_indices + 9 * n_lanes * compressed_i2;
         constexpr unsigned int dofs_per_line = fe_degree - 1;
         // first line
-        distributor.process_dof_gather(indices,
-                                       vec,
-                                       offset_i2,
-                                       vec.begin() + offset_i2,
-                                       dof_values[0],
-                                       std::integral_constant<bool, true>());
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          vec.local_element(indices[v] + offset_i2) += dof_values[0][v];
         indices += n_lanes;
         dealii::vectorized_transpose_and_store(
           true, dofs_per_line, dof_values + 1, indices, vec.begin() + offset_i2 * dofs_per_line);
         indices += n_lanes;
-        distributor.process_dof_gather(indices,
-                                       vec,
-                                       offset_i2,
-                                       vec.begin() + offset_i2,
-                                       dof_values[fe_degree],
-                                       std::integral_constant<bool, true>());
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          vec.local_element(indices[v] + offset_i2) += dof_values[fe_degree][v];
         indices += n_lanes;
 
         // inner part
@@ -1061,12 +1114,8 @@ public:
 
         // last line
         constexpr unsigned int i = fe_degree * (fe_degree + 1);
-        distributor.process_dof_gather(indices,
-                                       vec,
-                                       offset_i2,
-                                       vec.begin() + offset_i2,
-                                       dof_values[i],
-                                       std::integral_constant<bool, true>());
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          vec.local_element(indices[v] + offset_i2) += dof_values[i][v];
         indices += n_lanes;
         dealii::vectorized_transpose_and_store(true,
                                                dofs_per_line,
@@ -1074,12 +1123,8 @@ public:
                                                indices,
                                                vec.begin() + offset_i2 * dofs_per_line);
         indices += n_lanes;
-        distributor.process_dof_gather(indices,
-                                       vec,
-                                       offset_i2,
-                                       vec.begin() + offset_i2,
-                                       dof_values[i + fe_degree],
-                                       std::integral_constant<bool, true>());
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          vec.local_element(indices[v] + offset_i2) += dof_values[i + fe_degree][v];
         indices += n_lanes;
       }
       else
