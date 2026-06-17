@@ -26,6 +26,7 @@
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/mg_level_object.h>
 #include <deal.II/base/multithread_info.h>
+#include <deal.II/base/quadrature_lib.h>
 #include <deal.II/dofs/dof_tools.h>
 #include <deal.II/fe/fe_nothing.h>
 #include <deal.II/fe/fe_q.h>
