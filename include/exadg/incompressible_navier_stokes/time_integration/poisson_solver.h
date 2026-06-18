@@ -929,9 +929,8 @@ public:
         dof_h.distribute_dofs(*fe_hierarchy[level - coarse_triangulations.size() + 1]);
 
       reinit_level_constraints(dof_h,
-                               level + 1 >= coarse_triangulations.size() ?
-                                 cell_vectorization_category :
-                                 std::vector<unsigned int>(),
+                               level >= coarse_triangulations.size() ? cell_vectorization_category :
+                                                                       std::vector<unsigned int>(),
                                level_constraints[level]);
 
       if(level < coarse_triangulations.size())
@@ -1050,7 +1049,9 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       dealii::MappingQ1<dim>            mapping_q1;
       dealii::MappingQCache<dim>        mapping_q1_cache(1);
       const dealii::Mapping<dim> *      mapping = nullptr;
-      if(level < coarser_triangulations.back()->n_global_levels())
+      if(level < (coarser_triangulations.empty() ?
+                    coarse_triangulations.size() :
+                    coarser_triangulations.back()->n_global_levels()))
       {
         dof_h.reinit(*coarse_triangulations[level]);
         dof_h.distribute_dofs(*fe_hierarchy[0]);
@@ -1083,78 +1084,104 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
           mapping = coarser_mappings[max_level - 1 - level].get();
       }
 
+      std::vector<unsigned int> manual_vectorization_category(
+        dof_h.get_triangulation().n_active_cells());
+      if(level < max_level)
+      {
+        if(n_final_geometric_levels == 0 &&
+           manual_vectorization_category.size() == cell_vectorization_category.size())
+          manual_vectorization_category = cell_vectorization_category;
+        else
+        {
+          unsigned int count = 0;
+          for(const auto & cell : dof_h.active_cell_iterators())
+            if(cell->is_locally_owned())
+              manual_vectorization_category[cell->active_cell_index()] = count++;
+        }
+      }
       reinit_level_constraints(dof_h,
-                               level < max_level ? std::vector<unsigned int>() :
+                               level < max_level ? manual_vectorization_category :
                                                    cell_vectorization_category,
                                level_constraints[level]);
 
       mg_matrices[level].reinit(*mapping,
                                 dof_h,
                                 level_constraints[level],
-                                level < max_level ? std::vector<unsigned int>() :
+                                level < max_level ? manual_vectorization_category :
                                                     cell_vectorization_category,
                                 dealii::QGauss<1>(dof_h.get_fe().degree + 1));
 
       // initialize transfer operator
-      if(level > 0 && level <= max_level - n_final_geometric_levels)
+      if(level > 0)
       {
-        auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();
-        transfer->reinit(dof_h,
-                         dof_handler_hierarchy[level - 1],
-                         level_constraints[level],
-                         level_constraints[level - 1]);
-        transfer->enable_inplace_operations_if_possible(
-          mg_matrices[level - 1].get_matrix_free().get_dof_info().vector_partitioner,
-          mg_matrices[level].get_matrix_free().get_dof_info().vector_partitioner);
-
-        mg_transfers[level - 1] = std::move(transfer);
-      }
-      else if(level > max_level - n_final_geometric_levels)
-      {
-        auto transfer = std::make_unique<MGTwoLevelTransferAnisotropicNested<dim, Number>>(
-          mg_matrices[level], mg_matrices[level - 1]);
-        // Compare the nested anisotropic transfer result with the output of
-        // the (more general) non-nested transfer of deal.II to ensure
-        // correctness of the result.
-        bool constexpr perform_check = false;
-        if constexpr(perform_check)
+        if(level <= max_level - n_final_geometric_levels - fe_hierarchy.max_level())
         {
-          MGTwoLevelTransferNonNested<dim, VectorType> transfer_nonnested;
-          MappingQ1<dim>                               mapping;
-          transfer_nonnested.reinit(dof_handler_hierarchy[level],
-                                    dof_handler_hierarchy[level - 1],
-                                    mapping,
-                                    mapping,
-                                    level_constraints[level],
-                                    level_constraints[level - 1]);
-          VectorType v1, v2, v3, v4;
-          mg_matrices[level - 1].initialize_dof_vector(v1);
-          mg_matrices[level - 1].initialize_dof_vector(v4);
-          mg_matrices[level].initialize_dof_vector(v2);
-          mg_matrices[level].initialize_dof_vector(v3);
-          Tensor<1, dim> tens;
-          tens[0] = 1;
-          tens[1] = 1;
-          tens[2] = 1;
-          VectorTools::interpolate(mapping,
-                                   dof_handler_hierarchy[level - 1],
-                                   Functions::Monomial<dim, Number>(tens, 1),
-                                   v1);
-          transfer->prolongate_and_add(v2, v1);
-          transfer_nonnested.prolongate_and_add(v3, v1);
-          std::cout << "Prolongate norms: " << v2.l2_norm() << " " << v3.l2_norm()
-                    << " difference ";
-          v2 -= v3;
-          std::cout << v2.l2_norm() << std::endl;
-          v1 = 0;
-          v4 = 0;
-          transfer->restrict_and_add(v1, v3);
-          transfer_nonnested.restrict_and_add(v4, v3);
-          std::cout << "Restrict norms: " << v1.l2_norm() << " " << v4.l2_norm() << " difference ";
-          v1 -= v4;
-          std::cout << v1.l2_norm() << std::endl;
+          auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();
+          transfer->reinit(dof_h,
+                           dof_handler_hierarchy[level - 1],
+                           level_constraints[level],
+                           level_constraints[level - 1]);
+          transfer->enable_inplace_operations_if_possible(
+            mg_matrices[level - 1].get_matrix_free().get_dof_info().vector_partitioner,
+            mg_matrices[level].get_matrix_free().get_dof_info().vector_partitioner);
+
+          mg_transfers[level - 1] = std::move(transfer);
         }
-        mg_transfers[level - 1] = std::move(transfer);
+        else if(level <= max_level - n_final_geometric_levels)
+        {
+          auto transfer =
+            std::make_unique<MGTwoLevelTransferFromOperator<dim, Number>>(mg_matrices[level],
+                                                                          mg_matrices[level - 1]);
+          mg_transfers[level - 1] = std::move(transfer);
+        }
+        else if(level > max_level - n_final_geometric_levels)
+        {
+          auto transfer = std::make_unique<MGTwoLevelTransferAnisotropicNested<dim, Number>>(
+            mg_matrices[level], mg_matrices[level - 1]);
+          // Compare the nested anisotropic transfer result with the output of
+          // the (more general) non-nested transfer of deal.II to ensure
+          // correctness of the result.
+          bool constexpr perform_check = false;
+          if constexpr(perform_check)
+          {
+            MGTwoLevelTransferNonNested<dim, VectorType> transfer_nonnested;
+            MappingQ1<dim>                               mapping;
+            transfer_nonnested.reinit(dof_handler_hierarchy[level],
+                                      dof_handler_hierarchy[level - 1],
+                                      mapping,
+                                      mapping,
+                                      level_constraints[level],
+                                      level_constraints[level - 1]);
+            VectorType v1, v2, v3, v4;
+            mg_matrices[level - 1].initialize_dof_vector(v1);
+            mg_matrices[level - 1].initialize_dof_vector(v4);
+            mg_matrices[level].initialize_dof_vector(v2);
+            mg_matrices[level].initialize_dof_vector(v3);
+            Tensor<1, dim> tens;
+            tens[0] = 1;
+            tens[1] = 1;
+            tens[2] = 1;
+            VectorTools::interpolate(mapping,
+                                     dof_handler_hierarchy[level - 1],
+                                     Functions::Monomial<dim, Number>(tens, 1),
+                                     v1);
+            transfer->prolongate_and_add(v2, v1);
+            transfer_nonnested.prolongate_and_add(v3, v1);
+            std::cout << "Prolongate norms: " << v2.l2_norm() << " " << v3.l2_norm()
+                      << " difference ";
+            v2 -= v3;
+            std::cout << v2.l2_norm() << std::endl;
+            v1 = 0;
+            v4 = 0;
+            transfer->restrict_and_add(v1, v3);
+            transfer_nonnested.restrict_and_add(v4, v3);
+            std::cout << "Restrict norms: " << v1.l2_norm() << " " << v4.l2_norm()
+                      << " difference ";
+            v1 -= v4;
+            std::cout << v1.l2_norm() << std::endl;
+          }
+          mg_transfers[level - 1] = std::move(transfer);
+        }
       }
     }
 
@@ -1349,16 +1376,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
   {
     std::vector<unsigned int> p_levels({fe.degree});
     while(p_levels.back() > 1)
-    {
-      // pick the next coarser degree as half the previous degree; if
-      // integer division has remainder, use the nearest even degree (i.e.,
-      // we do steps like 2-1, 3-2-1, 4-2-1, 5-2-1, 6-3-2-1, 7-4-2-1, etc)
-      const unsigned int tentative_degree = p_levels.back() / 2;
-      if(p_levels.back() % 2 == 1 && tentative_degree % 2 == 1)
-        p_levels.push_back(tentative_degree + 1);
-      else
-        p_levels.push_back(tentative_degree);
-    }
+      p_levels.push_back(get_coarser_fe_degree(p_levels.back()));
     dealii::MGLevelObject<std::unique_ptr<dealii::FE_Q<dim>>> fes(0, p_levels.size() - 1);
     for(unsigned int level = 0; level < p_levels.size(); ++level)
       fes[level] = std::make_unique<dealii::FE_Q<dim>>(p_levels[p_levels.size() - 1 - level]);
