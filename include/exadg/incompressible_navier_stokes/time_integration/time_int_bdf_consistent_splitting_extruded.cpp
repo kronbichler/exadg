@@ -785,8 +785,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::prepare_vectors_for_next_tim
   swap_back_one_step(divergences);
   swap_back_one_step(pressure_nbc_rhs);
 
-  // swap two steps because we the right-hand side vector and the mass matrix
-  // applied to the velocity field to construct the projection initial guess
+  // swap two steps because we need the right-hand side vector and the mass
+  // matrix to construct the projection initial guess based on the velocity field
   swap_back_one_step(velocity_matvec);
   swap_back_one_step(velocity_matvec);
 
