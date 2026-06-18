@@ -460,7 +460,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
     pressure[0].copy_locally_owned_data_from(pressure_np);
 
     // in first time step, need to get the right-hand side from the mat-vec,
-    // as it is not in restart data, later just retreive it from the old
+    // as it is not in restart data, later just retrieve it from the old
     // right-hand side vectors
     if(this->get_time_step_number() == 1)
       poisson_preconditioner->get_dg_matrix().vmult(pressure_matvec[0], pressure[0]);
