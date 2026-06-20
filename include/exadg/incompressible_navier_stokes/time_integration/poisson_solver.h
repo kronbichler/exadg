@@ -1387,18 +1387,80 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
   void
   vmult(VectorTypeOuter & dst, const VectorTypeOuter & src) const
   {
+    if constexpr(std::is_same_v<VectorTypeOuter, VectorType>)
+    {
+      do_vcycle(true, src, dst);
+    }
+    else
+    {
+      Timer time;
+      rhs_dg.copy_locally_owned_data_from(src);
+      timings.back()[0] += time.wall_time();
+
+      do_vcycle(true, rhs_dg, solution_update_dg);
+
+      time.restart();
+      dst.copy_locally_owned_data_from(solution_update_dg);
+      timings.back()[0] += time.wall_time();
+    }
+  }
+
+  template<typename VectorTypeOuter, typename MatrixTypeOuter>
+  std::pair<unsigned int, double>
+  solve(const MatrixTypeOuter & matrix,
+        const VectorTypeOuter & rhs,
+        VectorTypeOuter &       sol,
+        const unsigned int      n_max_iterations,
+        const double            target_residual) const
+  {
+    VectorTypeOuter tmp;
+    tmp.reinit(sol, true);
+    matrix.vmult(
+      tmp,
+      sol,
+      [&tmp](const unsigned int begin, const unsigned int end) {
+        std::fill(tmp.begin() + begin, tmp.begin() + end, typename VectorTypeOuter::value_type(0));
+      },
+      [&](const unsigned int begin, const unsigned int end) {
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int i = begin; i < end; ++i)
+        {
+          rhs_dg.local_element(i)             = rhs.local_element(i) - tmp.local_element(i);
+          solution_update_dg.local_element(i) = 0.;
+        }
+      });
+
+    dealii::IterationNumberControl control(n_max_iterations, target_residual);
+    dealii::SolverCG<VectorType>   solver_cg(control);
+    solver_cg.solve(dg_matrix, solution_update_dg, rhs_dg, *this);
+    DEAL_II_OPENMP_SIMD_PRAGMA
+    for(unsigned int i = 0; i < solution_update_dg.locally_owned_size(); ++i)
+      sol.local_element(i) += solution_update_dg.local_element(i);
+
+    return {control.last_step(), control.last_value()};
+  }
+
+  const MatrixTypeDG &
+  get_dg_matrix() const
+  {
+    return dg_matrix;
+  }
+
+private:
+  void
+  do_vcycle(const bool zero_out_solution, const VectorType & src_rhs, VectorType & solution) const
+  {
     ++count_times;
     Timer time;
-    rhs_dg.copy_locally_owned_data_from(src);
-    timings.back()[0] += time.wall_time();
-    time.restart();
-
-    mg_smoother_dg.vmult(solution_update_dg, rhs_dg);
+    if(zero_out_solution)
+      mg_smoother_dg.vmult(solution, src_rhs);
+    else
+      mg_smoother_dg.step(solution, src_rhs);
     timings.back()[1] += time.wall_time();
     time.restart();
 
-    dg_matrix.vmult_residual_and_restrict_to_fe(rhs_dg,
-                                                solution_update_dg,
+    dg_matrix.vmult_residual_and_restrict_to_fe(src_rhs,
+                                                solution,
                                                 mg_matrices[max_level],
                                                 rhs[max_level]);
     timings.back()[2] += time.wall_time();
@@ -1439,27 +1501,14 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       timings[level + 1][1] += time.wall_time();
       time.restart();
     }
-    dg_matrix.prolongate_and_add(solution_update_dg,
-                                 solution_update[max_level],
-                                 mg_matrices[max_level]);
+    dg_matrix.prolongate_and_add(solution, solution_update[max_level], mg_matrices[max_level]);
     timings.back()[3] += time.wall_time();
     time.restart();
 
-    mg_smoother_dg.step(solution_update_dg, rhs_dg);
+    mg_smoother_dg.step(solution, src_rhs);
     timings.back()[1] += time.wall_time();
-    time.restart();
-
-    dst.copy_locally_owned_data_from(solution_update_dg);
-    timings.back()[0] += time.wall_time();
   }
 
-  const MatrixTypeDG &
-  get_dg_matrix() const
-  {
-    return dg_matrix;
-  }
-
-private:
   std::vector<std::shared_ptr<const dealii::Triangulation<dim>>> coarse_triangulations;
 
   const dealii::MGLevelObject<std::unique_ptr<dealii::FE_Q<dim>>> fe_hierarchy;
