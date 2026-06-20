@@ -577,8 +577,10 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::viscous_step()
     op_rt_float->vmult(velocity_matvec[0], velocity_red[0]);
     op_rt_float->set_parameters(1.0, 0.0);
     op_rt_float->vmult(velocity_matvec[1], velocity_red[0]);
+    std::vector<double> factors_mass(velocity_red.size());
+    factors_mass[0]      = 1.0;
     extrapolate_accuracy = compute_least_squares_fit<VectorTypeFloat, VectorType, true>(
-      velocity_matvec, rhs_rt, velocity_red, solution_rt, factor_mass);
+      velocity_matvec, rhs_rt, velocity_red, solution_rt, factors_mass);
     const double t_proj = timer2.wall_time();
     timer2.restart();
 

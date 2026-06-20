@@ -196,7 +196,7 @@ private:
   VectorType                                                            solution_rt;
   std::vector<VectorType>                                               solutions_convective;
   VectorType                                                            rhs_rt;
-  VectorTypeFloat                                                       rhs_float;
+  std::array<double, 6>                                                 factors_time_step_mass;
 
   double factor_cfl;
 
