@@ -1030,6 +1030,17 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
   std::array<dealii::ndarray<VectorizedArrayType, 2, dim>, 20>     shapes_3d;
   std::array<dealii::ndarray<VectorizedArrayType, 2, dim>, 20>     shapes_3d_check;
 
+  dealii::Table<2, Number> shapes_avg_direction(gauss_1d.size(), polynomials_nodal.size());
+  for (unsigned int q = 0; q < gauss_1d.size(); ++q)
+    for (unsigned int i = 0; i < polynomials_nodal.size(); ++i)
+      {
+        std::array<double, 2> val_and_deriv;
+        polynomials_nodal[i].value(gauss_1d.point(q)[0], 1, val_and_deriv.data());
+        AssertThrow(std::abs(val_and_deriv[0] - (i == q ? 1 : 0)) < 1e-14,
+                    dealii::ExcInternalError());
+        shapes_avg_direction[q][i] = val_and_deriv[1];
+      }
+
   const unsigned int n_points_in_plane = dealii::Utilities::pow(n_q_points_1d, dim - 1);
   std::vector<dealii::Tensor<1, dim, Number>>          cell_averaged_velocity;
   std::vector<dealii::SymmetricTensor<2, dim, Number>> cell_averaged_reynolds;
@@ -1087,7 +1098,6 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                   dealii::ExcMessage(
                     "Dissipation requires QuantitySkinFriction to provide viscosity."));
     }
-
 
     // Do we want to perform averaging on the cell with tensor product first
     // (leads to small aliasing errors for Reynolds stresses, but is faster),
@@ -1247,7 +1257,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                                                     point_on_line_2d);
           if(need_velocity_gradient)
           {
-            dealii::internal::compute_values_of_array(shapes_3d.data(), // ##+
+            dealii::internal::compute_values_of_array(shapes_3d.data(),
                                                       polynomials_nodal,
                                                       point_on_line_3d);
           }
@@ -1278,13 +1288,19 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                                          polynomials_nodal.size(),
                                          eval_ptr + q1 * n_points_in_plane);
 
+                for (unsigned int i = 0; i < polynomials_nodal.size(); ++i)
+                  {
+                    shapes_3d[i][/*value_idx*/0][averaging_direction] = (q1 == i ? 1.0 : 0.0);
+                    shapes_3d[i][/*derivative_idx*/1][averaging_direction] = shapes_avg_direction[q1][i];
+                  }
+
                 auto const val_grad_3d =
                   dealii::internal::evaluate_tensor_product_value_and_gradient_shapes<
                     dim,
                     dealii::Tensor<1, dim, Number>,
                     VectorizedArrayType>(shapes_3d.data(),
                                          polynomials_nodal.size(),
-                                         eval_ptr); // ##+
+                                         eval_ptr);
 
                 // check indexing for the 3D gradient
                 auto point_on_line_3d_check = point_on_line_3d;
@@ -1298,7 +1314,7 @@ std::cout << "q1 = " << q1
                      << ", point_on_line_3d[1] = " 
                      << point_on_line_3d[1] << "\n"
                      << ", gauss_1d.point(q1)[0] = " << gauss_1d.point(q1)[0] << "\n";
-                dealii::internal::compute_values_of_array(shapes_3d_check.data(), // ##+
+                dealii::internal::compute_values_of_array(shapes_3d_check.data(),
                                                           polynomials_nodal,
                                                           point_on_line_3d_check);
                 auto const val_grad_3d_check =
@@ -1321,7 +1337,7 @@ std::cout << "q1 = " << q1
                   dealii::Tensor<1, dim, Number> u_2d;
                   dealii::Tensor<1, dim, Number> u_3d;
                   dealii::Tensor<1, dim, Number> u_3d_check;
-                  for(unsigned int i; i < dim; ++i)
+                  for(unsigned int i = 0; i < dim; ++i)
                   {
                     u_2d[i]       = velocity[i][v];
                     u_3d[i]       = velocity_3d[i][v];
