@@ -1029,6 +1029,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
   std::array<dealii::ndarray<VectorizedArrayType, 2, dim - 1>, 20> shapes_2d;
   std::array<dealii::ndarray<VectorizedArrayType, 2, dim>, 20>     shapes_3d;
   std::array<dealii::ndarray<VectorizedArrayType, 2, dim>, 20>     shapes_3d_check;
+  std::vector<Tensor<1, dim, VectorizedArrayType>> velocities_along_line(n_q_points_1d);
+  std::vector<Tensor<2, dim, VectorizedArrayType>> velocity_gradients_along_line(n_q_points_1d);
 
   dealii::Table<2, Number> shapes_avg_direction(gauss_1d.size(), polynomials_nodal.size());
   for (unsigned int q = 0; q < gauss_1d.size(); ++q)
@@ -1277,9 +1279,6 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
             dealii::Tensor<2, dim, VectorizedArrayType> velocity_gradient_3d_check;
             for(unsigned int q1 = 0; q1 < n_q_points_1d; ++q1)
             {
-              VectorizedArrayType const JxW = det * gauss_1d.weight(q1);
-              if(need_velocity_gradient)
-              {
                 auto const val_grad =
                   dealii::internal::evaluate_tensor_product_value_and_gradient_shapes<
                     dim - 1,
@@ -1287,7 +1286,26 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                     VectorizedArrayType>(shapes_2d.data(),
                                          polynomials_nodal.size(),
                                          eval_ptr + q1 * n_points_in_plane);
+                velocities_along_line[q1] = val_grad[dim - 1];
+                for (unsigned int d = 0; d < dim; ++d)
+                  {
+                    for (unsigned int e = 0; e < dim; ++e)
+                      velocity_gradients_along_line[q1][d][e] = val_grad[e][d];
+                  }
+              }
 
+            for(unsigned int q1 = 0; q1 < n_q_points_1d; ++q1)
+            {
+              VectorizedArrayType const JxW = det * gauss_1d.weight(q1);
+              if(need_velocity_gradient)
+              {
+                Tensor<1, dim, VectorizedArrayType> z_derivative;
+                for (unsigned int q2 = 0; q2 < n_q_points_1d; ++q2)
+                  z_derivative += shapes_avg_direction[q1][q2] * velocities_along_line[q2];
+                velocity          = velocities_along_line[q1];
+                velocity_gradient = velocity_gradients_along_line[q1];
+                for (unsigned int d = 0; d < dim; ++d)
+                  velocity_gradient[d][dim - 1] = z_derivative[d];
                 for (unsigned int i = 0; i < polynomials_nodal.size(); ++i)
                   {
                     shapes_3d[i][/*value_idx*/0][averaging_direction] = (q1 == i ? 1.0 : 0.0);
@@ -1325,7 +1343,6 @@ std::cout << "q1 = " << q1
                                          polynomials_nodal.size(),
                                          eval_ptr); // ##+
 
-                velocity          = val_grad[dim - 1];
                 velocity_3d       = val_grad_3d[dim];
                 velocity_3d_check = val_grad_3d_check[dim];
 
@@ -1357,9 +1374,6 @@ std::cout << "q1 = " << q1
                 {
                   for(unsigned int e = 0; e < dim; ++e)
                   {
-                    if(e < dim - 1)
-                      velocity_gradient[d][e] = val_grad[e][d];
-
                     velocity_gradient_3d[d][e]       = val_grad_3d[e][d];
                     velocity_gradient_3d_check[d][e] = val_grad_3d_check[e][d];
                   }
