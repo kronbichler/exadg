@@ -20,7 +20,6 @@
  */
 
 // deal.II
-#include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/timer.h>
 #include <deal.II/fe/fe_dgq.h>
 #include <deal.II/fe/fe_system.h>
@@ -1102,7 +1101,6 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                     "Dissipation requires QuantitySkinFriction to provide viscosity."));
     }
 
-
     // Do we want to perform averaging on the cell with tensor product first
     // (leads to small aliasing errors for Reynolds stresses, but is faster),
     // and then perform interpolation from 2D data, or do we rather want to
@@ -1184,9 +1182,9 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
           }
         }
 
-        // perform averaging in homogeneous direction. Currently, some indices
-        // in this part are hardcode, so the evaluation only works in the last
-        // direction
+        // Perform averaging in homogeneous direction. Currently, some indices
+        // in this part are hard-coded, so the evaluation only works in the last
+        // direction.
         AssertThrow(averaging_direction == dim - 1, dealii::ExcNotImplemented());
         const unsigned int n_lanes  = VectorizedArrayType::size();
         const unsigned int n_points = point_list.size();
@@ -1209,7 +1207,6 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
               for(unsigned int e = 0; e < dim; ++e)
                 inv_jac[d][e][v] = inv_jac_v[d][e];
           }
-          // bool                                    need_skin_friction = false;
 
           dealii::Tensor<1, dim, VectorizedArrayType> normal;
           dealii::Tensor<1, dim, VectorizedArrayType> tangent;
@@ -1244,7 +1241,6 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                           "Dissipation/SkinFriction requires QuantitySkinFriction"));
           }
 
-
           VectorizedArrayType const det =
             1.0 / std::abs(inv_jac[averaging_direction][averaging_direction]);
           dealii::internal::compute_values_of_array(shapes_2d.data(),
@@ -1271,31 +1267,39 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                 velocities_in_averaging_direction[q1] = val_grad[dim - 1];
                 for(unsigned int d = 0; d < dim; ++d)
                   for(unsigned int e = 0; e < dim - 1; ++e)
+                    // Note that the derivative in the averaging direction,
+                    // hard-coded to `dim-1`, will be reconstructed later
+                    // together with applying the inverse Jacobian.
                     velocity_gradients_in_averaging_direction[q1][d][e] = val_grad[e][d];
               }
             for(unsigned int q1 = 0; q1 < n_q_points_1d; ++q1)
             {
-              dealii::Tensor<1, dim, VectorizedArrayType> velocity;
+              dealii::Tensor<1, dim, VectorizedArrayType> velocity_interpolated;
               VectorizedArrayType const                   JxW = det * gauss_1d.weight(q1);
               if(need_velocity_gradient)
               {
+                // Correct the derivative in the averaging direction,
+                // hard-coded to `dim-1`.
                 dealii::Tensor<1, dim, VectorizedArrayType> z_derivative;
                 for(unsigned int q2 = 0; q2 < n_q_points_1d; ++q2)
                   z_derivative +=
                     shapes_avg_direction[q1][q2] * velocities_in_averaging_direction[q2];
 
-                velocity = velocities_in_averaging_direction[q1];
-                dealii::Tensor<2, dim, VectorizedArrayType> velocity_gradient =
+                velocity_interpolated = velocities_in_averaging_direction[q1];
+                dealii::Tensor<2, dim, VectorizedArrayType> velocity_gradient_interpolated =
                   velocity_gradients_in_averaging_direction[q1];
                 for(unsigned int d = 0; d < dim; ++d)
-                  velocity_gradient[d][dim - 1] = z_derivative[d];
+                  velocity_gradient_interpolated[d][dim - 1] = z_derivative[d];
 
+                // Apply inverse Jacobian of the mapping once the gradient with
+                // respect to the reference coordinates is set up.
                 for(unsigned int d = 0; d < dim; ++d)
-                  velocity_gradient[d] = inv_jac * velocity_gradient[d];
+                  velocity_gradient_interpolated[d] = inv_jac * velocity_gradient_interpolated[d];
 
                 if(need_dissipation)
                 {
-                  auto const S         = 0.5 * (velocity_gradient + transpose(velocity_gradient));
+                  auto const S         = 0.5 * (velocity_gradient_interpolated +
+                                        transpose(velocity_gradient_interpolated));
                   auto       epsilon_q = 2.0 * viscosity * scalar_product(S, S);
 
                   dissipation += epsilon_q * JxW;
@@ -1305,11 +1309,12 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                 {
                   for(unsigned int d = 0; d < dim; ++d)
                     for(unsigned int e = 0; e < dim; ++e)
-                      skin_friction += tangent[d] * velocity_gradient[d][e] * (normal[e] * JxW);
+                      skin_friction +=
+                        tangent[d] * velocity_gradient_interpolated[d][e] * (normal[e] * JxW);
                 }
               }
               else
-                velocity = dealii::internal::evaluate_tensor_product_value_shapes<
+                velocity_interpolated = dealii::internal::evaluate_tensor_product_value_shapes<
                   dim - 1,
                   dealii::Tensor<1, dim, Number>,
                   VectorizedArrayType>(shapes_2d.data(),
@@ -1321,13 +1326,13 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                 if(quantity->type == QuantityType::Velocity)
                 {
                   for(unsigned int d = 0; d < dim; ++d)
-                    vel[d] += velocity[d] * JxW;
+                    vel[d] += velocity_interpolated[d] * JxW;
                 }
                 else if(quantity->type == QuantityType::ReynoldsStresses)
                 {
                   for(unsigned int d = 0; d < dim; ++d)
                     for(unsigned int e = d; e < dim; ++e)
-                      reynolds[d][e] += (velocity[d] * JxW) * velocity[e];
+                      reynolds[d][e] += (velocity_interpolated[d] * JxW) * velocity_interpolated[e];
                 }
               }
             }
