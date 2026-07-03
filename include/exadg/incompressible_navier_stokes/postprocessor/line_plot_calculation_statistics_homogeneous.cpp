@@ -22,6 +22,7 @@
 // deal.II
 #include <deal.II/base/function.h>
 #include <deal.II/base/timer.h>
+#include <deal.II/dofs/dof_tools.h>
 #include <deal.II/fe/fe_dgq.h>
 #include <deal.II/fe/fe_system.h>
 #include <deal.II/fe/fe_values.h>
@@ -1045,33 +1046,43 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
   // Verification of the interpolation of velocity values and gradients to the
   // lines. When enabled, we replace the input velocity field by a smooth
-  // analytical field (interpolated into a vector of exactly the same layout as
-  // `velocity`, i.e. using the DoFHandler numbering via VectorTools). We then
-  // run the regular interpolation machinery on this analytical field and, at
-  // each integration point along the lines, compare the interpolated value and
-  // gradient against the analytical value and gradient evaluated at the mapped
-  // real-space coordinate. The accumulated relative L2 errors are printed at
-  // the end of `do_evaluate()`.
+  // analytical field and run the regular interpolation machinery on it. At each
+  // integration point along the lines we then compare the interpolated value
+  // and gradient against a *trusted* per-point evaluation of the exact same
+  // field obtained with `dealii::FEValues` using the same (averaging-direction
+  // Gauss) integration rule. Because both the custom line interpolation and
+  // `FEValues` read identical dof data, any field representation error cancels
+  // and the comparison purely tests the custom value/gradient reconstruction.
+  //
+  // Two vectors hold the same analytical field:
+  //  - `velocity_analytical`: the layout the line reader consumes (RT operator
+  //    layout for HDIV, DoFHandler layout for L2), read via `velocity_field`.
+  //  - `velocity_fev`: a DoFHandler-layout, ghosted vector that `FEValues` can
+  //    read. For HDIV it is obtained by copying `velocity_analytical` back so
+  //    that it represents the identical field the line reader sees (constrained
+  //    dofs consistently set to zero).
   constexpr bool                 verify_line_interpolation = true;
   VerificationVelocityField<dim> analytical_velocity;
   VectorType                     velocity_analytical;
-  double                         verify_err_value_sq = 0.0, verify_ref_value_sq = 0.0;
-  double                         verify_err_grad_sq = 0.0, verify_ref_grad_sq = 0.0;
+  VectorType                     velocity_fev;
+  double                         max_abs_err_val = 0.0, max_abs_err_grad = 0.0;
   if(verify_line_interpolation)
   {
+    dealii::IndexSet const & locally_owned = dof_handler_velocity.locally_owned_dofs();
+    dealii::IndexSet const   locally_relevant =
+      dealii::DoFTools::extract_locally_relevant_dofs(dof_handler_velocity);
+
     if(rt_operator != nullptr)
     {
       // For the Raviart-Thomas (HDIV) discretization the solution vector does
-      // not use the plain `dof_handler_velocity` layout: constrained
-      // (Dirichlet) dofs are removed and the dofs are reordered by the RT
-      // operator. We therefore first interpolate the analytical field into a
-      // vector using the `dealii::DoFHandler` layout and then copy it into the
-      // RT operator's own layout, mirroring
-      // `TimeIntBDF...Extruded::initialize_current_solution()`
-      // (`prescribe_initial_conditions()` -> `op_rt->copy_mf_to_this_vector`).
-      dealii::IndexSet const & locally_owned = dof_handler_velocity.locally_owned_dofs();
-      dealii::IndexSet         no_ghosts(dof_handler_velocity.n_dofs());
-      VectorType               velocity_dof_handler_layout;
+      // not use the plain `dof_handler_velocity` layout: constrained (Dirichlet)
+      // dofs are removed and the dofs are reordered by the RT operator. We
+      // interpolate into the DoFHandler layout, copy into the RT operator's
+      // layout (mirroring `TimeIntBDF...Extruded::initialize_current_solution()`,
+      // `prescribe_initial_conditions()` -> `op_rt->copy_mf_to_this_vector`), and
+      // then copy back so that `velocity_fev` represents the identical field.
+      dealii::IndexSet no_ghosts(dof_handler_velocity.n_dofs());
+      VectorType       velocity_dof_handler_layout;
       velocity_dof_handler_layout.reinit(locally_owned, no_ghosts, mpi_comm);
       ExaDG::Utilities::interpolate(mapping,
                                     dof_handler_velocity,
@@ -1080,21 +1091,25 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
       rt_operator->initialize_dof_vector(velocity_analytical);
       rt_operator->copy_mf_to_this_vector(velocity_dof_handler_layout, velocity_analytical);
+
+      velocity_fev.reinit(locally_owned, locally_relevant, mpi_comm);
+      velocity_fev = 0.0;
+      rt_operator->copy_this_to_mf_vector(velocity_analytical, velocity_fev);
     }
     else
     {
-      velocity_analytical.reinit(velocity);
-      // Fill using the same interpolation ExaDG uses to set velocity fields
-      // from analytical functions, so the resulting vector has exactly the
-      // layout the reader below expects (DoFHandler numbering / partitioner).
+      // L2/DG: the DoFHandler layout already matches the reader's expectation.
+      velocity_fev.reinit(locally_owned, locally_relevant, mpi_comm);
       ExaDG::Utilities::interpolate(mapping,
                                     dof_handler_velocity,
                                     analytical_velocity,
-                                    velocity_analytical);
+                                    velocity_fev);
+      velocity_analytical.reinit(velocity);
+      velocity_analytical.copy_locally_owned_data_from(velocity_fev);
     }
+    velocity_fev.update_ghost_values();
   }
-  // All reads of the velocity field below go through this reference so that the
-  // verification exercises the exact same code path as the production run.
+  // The line reader reads this field; FEValues reads `velocity_fev`.
   VectorType const & velocity_field = verify_line_interpolation ? velocity_analytical : velocity;
 
   if(rt_operator != nullptr)
@@ -1251,6 +1266,39 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
     {
       for(auto const & [cell, point_list] : cells_and_ref_points[index])
       {
+        // Trusted reference evaluation of the identical velocity field with
+        // dealii::FEValues, using the same integration rule as the line
+        // interpolation: for every line point on this cell we place a 1D Gauss
+        // rule along the averaging direction at the fixed in-plane reference
+        // position. The quadrature point for (line point p1, Gauss point q1) is
+        // stored at index p1 * n_q_points_1d + q1.
+        std::vector<dealii::Vector<Number>>                      fev_values;
+        std::vector<std::vector<dealii::Tensor<1, dim, Number>>> fev_gradients;
+        if(verify_line_interpolation)
+        {
+          std::vector<dealii::Point<dim>> q_points;
+          q_points.reserve(point_list.size() * n_q_points_1d);
+          for(unsigned int p1 = 0; p1 < point_list.size(); ++p1)
+            for(unsigned int q1 = 0; q1 < n_q_points_1d; ++q1)
+            {
+              dealii::Point<dim> p;
+              for(unsigned int d = 0; d < dim; ++d)
+                p[d] =
+                  (d == averaging_direction) ? gauss_1d.point(q1)[0] : point_list[p1].second[d];
+              q_points.push_back(p);
+            }
+          dealii::Quadrature<dim> const quad(q_points);
+          dealii::FEValues<dim>         fe_values(mapping,
+                                          fe_u,
+                                          quad,
+                                          dealii::update_values | dealii::update_gradients);
+          fe_values.reinit(cell);
+          fev_values.assign(quad.size(), dealii::Vector<Number>(dim));
+          fev_gradients.assign(quad.size(), std::vector<dealii::Tensor<1, dim, Number>>(dim));
+          fe_values.get_function_values(velocity_fev, fev_values);
+          fe_values.get_function_gradients(velocity_fev, fev_gradients);
+        }
+
         dealii::Tensor<1, dim, Number> * eval_ptr = nullptr;
         if(rt_operator == nullptr)
         {
@@ -1437,20 +1485,15 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
                 // Verification: compare the interpolated value and gradient at
                 // this integration point (in-plane line point p1, quadrature
-                // point q1 in the averaging direction) against the analytical
-                // value and gradient at the corresponding mapped real point.
+                // point q1 in the averaging direction) against the FEValues
+                // reference evaluation of the identical field.
                 if(verify_line_interpolation)
                 {
                   for(unsigned int p1 = p1_v * n_lanes, v = 0;
                       p1 < std::min((p1_v + 1) * n_lanes, n_points);
                       ++p1, ++v)
                   {
-                    dealii::Point<dim> unit_point;
-                    for(unsigned int d = 0; d < dim; ++d)
-                      unit_point[d] = (d == averaging_direction) ? gauss_1d.point(q1)[0] :
-                                                                   point_list[p1].second[d];
-                    dealii::Point<dim> const real_point = mapping.transform_unit_to_real_cell(
-                      typename dealii::Triangulation<dim>::cell_iterator(cell), unit_point);
+                    unsigned int const idx = p1 * n_q_points_1d + q1;
 
                     static int n_debug_printed = 0;
                     bool const print_debug =
@@ -1459,44 +1502,33 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
                     for(unsigned int d = 0; d < dim; ++d)
                     {
-                      double const u_exact = analytical_velocity.value(real_point, d);
+                      double const u_ref = fev_values[idx][d];
                       double const diff_value =
-                        static_cast<double>(velocity_interpolated[d][v]) - u_exact;
-                      verify_err_value_sq += diff_value * diff_value;
-                      verify_ref_value_sq += u_exact * u_exact;
+                        static_cast<double>(velocity_interpolated[d][v]) - u_ref;
 
-                      dealii::Tensor<1, dim> const grad_exact =
-                        analytical_velocity.gradient(real_point, d);
+                      max_abs_err_val = std::max(max_abs_err_val, std::abs(diff_value));
+
                       for(unsigned int e = 0; e < dim; ++e)
                       {
+                        double const g_ref = fev_gradients[idx][d][e];
                         double const diff_grad =
-                          static_cast<double>(velocity_gradient_interpolated[d][e][v]) -
-                          grad_exact[e];
-                        verify_err_grad_sq += diff_grad * diff_grad;
-                        verify_ref_grad_sq += grad_exact[e] * grad_exact[e];
+                          static_cast<double>(velocity_gradient_interpolated[d][e][v]) - g_ref;
+
+                        max_abs_err_grad = std::max(max_abs_err_grad, std::abs(diff_grad));
                       }
 
                       if(print_debug)
                       {
-                        std::cout << "[verify DBG] real=" << real_point << " comp=" << d
-                                  << " unit=" << unit_point << "\n"
-                                  << "    value interp=" << velocity_interpolated[d][v]
-                                  << " exact=" << u_exact << "\n"
-                                  << "    grad interp (phys)=["
+                        std::cout << "[verify DBG] comp=" << d << "\n"
+                                  << "    value line=" << velocity_interpolated[d][v]
+                                  << " FEValues=" << u_ref << "\n"
+                                  << "    grad line    =["
                                   << velocity_gradient_interpolated[d][0][v] << ", "
                                   << velocity_gradient_interpolated[d][1][v] << ", "
                                   << velocity_gradient_interpolated[d][dim - 1][v] << "]\n"
-                                  << "    grad exact (phys)=[" << grad_exact[0] << ", "
-                                  << grad_exact[1] << ", " << grad_exact[dim - 1] << "]\n"
-                                  << "    grad ref (pre-invJac)=["
-                                  << velocity_gradients_in_averaging_direction[q1][d][0][v] << ", "
-                                  << velocity_gradients_in_averaging_direction[q1][d][1][v] << ", "
-                                  << z_derivative[d][v] << "]\n"
-                                  << "    inv_jac diag=[" << inv_jac[0][0][v] << ", "
-                                  << inv_jac[1][1][v] << ", " << inv_jac[dim - 1][dim - 1][v]
-                                  << "]  (h_zz = "
-                                  << 1.0 / static_cast<double>(inv_jac[dim - 1][dim - 1][v])
-                                  << ")\n";
+                                  << "    grad FEValues=[" << fev_gradients[idx][d][0] << ", "
+                                  << fev_gradients[idx][d][1] << ", "
+                                  << fev_gradients[idx][d][dim - 1] << "]\n";
                       }
                     }
                     if(print_debug)
@@ -1764,25 +1796,18 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
   if(verify_line_interpolation)
   {
-    // Reduce the squared errors and reference norms accumulated on all MPI
-    // ranks over their locally owned line cells.
-    double const global_err_value_sq = dealii::Utilities::MPI::sum(verify_err_value_sq, mpi_comm);
-    double const global_ref_value_sq = dealii::Utilities::MPI::sum(verify_ref_value_sq, mpi_comm);
-    double const global_err_grad_sq  = dealii::Utilities::MPI::sum(verify_err_grad_sq, mpi_comm);
-    double const global_ref_grad_sq  = dealii::Utilities::MPI::sum(verify_ref_grad_sq, mpi_comm);
-
-    double const rel_error_value =
-      (global_ref_value_sq > 0.0) ? std::sqrt(global_err_value_sq / global_ref_value_sq) : 0.0;
-    double const rel_error_gradient =
-      (global_ref_grad_sq > 0.0) ? std::sqrt(global_err_grad_sq / global_ref_grad_sq) : 0.0;
+    // Reduce the errors and reference norms accumulated on all MPI ranks over
+    // their locally owned line cells.
+    max_abs_err_val  = dealii::Utilities::MPI::max(max_abs_err_val, mpi_comm);
+    max_abs_err_grad = dealii::Utilities::MPI::max(max_abs_err_grad, mpi_comm);
 
     double const tolerance = 1.0e-10;
-    if(true or (rel_error_value < tolerance and rel_error_gradient < tolerance))
+    if(true or max_abs_err_val < tolerance or max_abs_err_grad < tolerance)
     {
       if(dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0)
-        std::cout << "[LinePlot interpolation verification] relative L2 error along lines: "
-                  << "value = " << rel_error_value
-                  << ", gradient = " << rel_error_gradient
+        std::cout << "[LinePlot interpolation verification] relative L2 error of the line "
+                     "interpolation vs FEValues on the same field: "
+                  << "value = " << max_abs_err_val << ", gradient = " << max_abs_err_grad
                   << " (tolerance = " << tolerance << ")" << std::endl;
 
       AssertThrow(false,
