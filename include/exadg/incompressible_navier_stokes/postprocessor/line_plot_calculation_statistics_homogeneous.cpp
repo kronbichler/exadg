@@ -20,6 +20,7 @@
  */
 
 // deal.II
+#include <deal.II/base/function.h>
 #include <deal.II/base/timer.h>
 #include <deal.II/fe/fe_dgq.h>
 #include <deal.II/fe/fe_system.h>
@@ -28,7 +29,11 @@
 #include <deal.II/matrix_free/fe_evaluation.h>
 #include <deal.II/matrix_free/fe_point_evaluation.h>
 
+// C/C++
+#include <cmath>
+
 // ExaDG
+#include <exadg/functions_and_boundary_conditions/interpolate.h>
 #include <exadg/grid/grid_data.h>
 #include <exadg/incompressible_navier_stokes/postprocessor/line_plot_calculation_statistics_homogeneous.h>
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/momentum_operator_rt.h>
@@ -38,6 +43,81 @@ namespace ExaDG
 {
 namespace IncNS
 {
+namespace
+{
+// Smooth analytical velocity field with nonzero value and gradient everywhere,
+// used to verify the interpolation of velocity values and gradients to the
+// lines in `LinePlotCalculatorStatisticsHomogeneous::do_evaluate()`.
+// The gradient is the exact derivative of the value below.
+//   u_x = sin(x) * cos(y) * sin(z)
+//   u_y = cos(x) * sin(y) * sin(z)
+//   u_z = cos(x) * sin(y) * cos(z)
+template<int dim>
+class VerificationVelocityField : public dealii::Function<dim>
+{
+public:
+  VerificationVelocityField() : dealii::Function<dim>(dim)
+  {
+  }
+
+  double
+  value(dealii::Point<dim> const & p, unsigned int const component = 0) const override
+  {
+    double const x = p[0];
+    double const y = p[1];
+    double const z = (dim > 2) ? p[dim - 1] : 0.0;
+
+    if(component == 0)
+      return std::sin(x) * std::cos(y) * std::sin(z);
+    else if(component == 1)
+      return std::cos(x) * std::sin(y) * std::sin(z);
+    else
+      return std::cos(x) * std::sin(y) * std::cos(z);
+  }
+
+  dealii::Tensor<1, dim>
+  gradient(dealii::Point<dim> const & p, unsigned int const component = 0) const override
+  {
+    double const x = p[0];
+    double const y = p[1];
+    double const z = (dim > 2) ? p[dim - 1] : 0.0;
+
+    double const sx = std::sin(x), cx = std::cos(x);
+    double const sy = std::sin(y), cy = std::cos(y);
+    double const sz = std::sin(z), cz = std::cos(z);
+
+    // deal.II convention: gradient(p, component) is the gradient of the scalar
+    // component `component`, i.e. row `component` of the Jacobian
+    //   g[e] = d(u_component)/dx_e .
+    dealii::Tensor<1, dim> g;
+    if(component == 0)
+    {
+      // u0 = sin(x) cos(y) sin(z)
+      g[0] = cx * cy * sz;
+      g[1] = -sx * sy * sz;
+      if(dim > 2)
+        g[dim - 1] = sx * cy * cz;
+    }
+    else if(component == 1)
+    {
+      // u1 = cos(x) sin(y) sin(z)
+      g[0] = -sx * sy * sz;
+      g[1] = cx * cy * sz;
+      if(dim > 2)
+        g[dim - 1] = cx * sy * cz;
+    }
+    else
+    {
+      // u2 = cos(x) sin(y) cos(z)
+      g[0] = -sx * sy * cz;
+      g[1] = cx * cy * cz;
+      if(dim > 2)
+        g[dim - 1] = -cx * sy * sz;
+    }
+    return g;
+  }
+};
+} // namespace
 template<int dim, typename Number>
 LinePlotCalculatorStatisticsHomogeneous<dim, Number>::LinePlotCalculatorStatisticsHomogeneous(
   dealii::DoFHandler<dim> const & dof_handler_velocity_in,
@@ -963,14 +1043,68 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
 
   dealii::FiniteElement<dim> const & fe_u = dof_handler_velocity.get_fe();
 
+  // Verification of the interpolation of velocity values and gradients to the
+  // lines. When enabled, we replace the input velocity field by a smooth
+  // analytical field (interpolated into a vector of exactly the same layout as
+  // `velocity`, i.e. using the DoFHandler numbering via VectorTools). We then
+  // run the regular interpolation machinery on this analytical field and, at
+  // each integration point along the lines, compare the interpolated value and
+  // gradient against the analytical value and gradient evaluated at the mapped
+  // real-space coordinate. The accumulated relative L2 errors are printed at
+  // the end of `do_evaluate()`.
+  constexpr bool                 verify_line_interpolation = true;
+  VerificationVelocityField<dim> analytical_velocity;
+  VectorType                     velocity_analytical;
+  double                         verify_err_value_sq = 0.0, verify_ref_value_sq = 0.0;
+  double                         verify_err_grad_sq = 0.0, verify_ref_grad_sq = 0.0;
+  if(verify_line_interpolation)
+  {
+    if(rt_operator != nullptr)
+    {
+      // For the Raviart-Thomas (HDIV) discretization the solution vector does
+      // not use the plain `dof_handler_velocity` layout: constrained
+      // (Dirichlet) dofs are removed and the dofs are reordered by the RT
+      // operator. We therefore first interpolate the analytical field into a
+      // vector using the `dealii::DoFHandler` layout and then copy it into the
+      // RT operator's own layout, mirroring
+      // `TimeIntBDF...Extruded::initialize_current_solution()`
+      // (`prescribe_initial_conditions()` -> `op_rt->copy_mf_to_this_vector`).
+      dealii::IndexSet const & locally_owned = dof_handler_velocity.locally_owned_dofs();
+      dealii::IndexSet         no_ghosts(dof_handler_velocity.n_dofs());
+      VectorType               velocity_dof_handler_layout;
+      velocity_dof_handler_layout.reinit(locally_owned, no_ghosts, mpi_comm);
+      ExaDG::Utilities::interpolate(mapping,
+                                    dof_handler_velocity,
+                                    analytical_velocity,
+                                    velocity_dof_handler_layout);
+
+      rt_operator->initialize_dof_vector(velocity_analytical);
+      rt_operator->copy_mf_to_this_vector(velocity_dof_handler_layout, velocity_analytical);
+    }
+    else
+    {
+      velocity_analytical.reinit(velocity);
+      // Fill using the same interpolation ExaDG uses to set velocity fields
+      // from analytical functions, so the resulting vector has exactly the
+      // layout the reader below expects (DoFHandler numbering / partitioner).
+      ExaDG::Utilities::interpolate(mapping,
+                                    dof_handler_velocity,
+                                    analytical_velocity,
+                                    velocity_analytical);
+    }
+  }
+  // All reads of the velocity field below go through this reference so that the
+  // verification exercises the exact same code path as the production run.
+  VectorType const & velocity_field = verify_line_interpolation ? velocity_analytical : velocity;
+
   if(rt_operator != nullptr)
   {
-    velocity.update_ghost_values();
+    velocity_field.update_ghost_values();
     dealii::AlignedVector<dealii::Tensor<1, dim, VectorizedArrayType>> eval_field(
       evaluated_dg_values_on_cells.size(1));
     for(unsigned int i = 0; i < list_of_cells_to_evaluate.size(); ++i)
     {
-      rt_operator->evaluate_field(velocity, list_of_cells_to_evaluate[i], eval_field);
+      rt_operator->evaluate_field(velocity_field, list_of_cells_to_evaluate[i], eval_field);
       std::array<unsigned int, VectorizedArrayType::size()> store_indices;
       for(unsigned int j = 0; j < store_indices.size(); ++j)
         store_indices[j] = j * dim * eval_field.size();
@@ -1048,7 +1182,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
   std::vector<dealii::SymmetricTensor<2, dim, Number>> cell_averaged_reynolds;
 
   if(rt_operator == nullptr)
-    velocity.update_ghost_values();
+    velocity_field.update_ghost_values();
   if(dof_handler_pressure.get_fe().dofs_per_vertex > 0)
     pressure.update_ghost_values();
 
@@ -1101,6 +1235,11 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                     "Dissipation requires QuantitySkinFriction to provide viscosity."));
     }
 
+    // During verification we always reconstruct the velocity gradient so that
+    // it can be compared against the analytical gradient, even if no quantity
+    // requiring the gradient (SkinFriction/Dissipation) was requested.
+    bool const compute_gradient = need_velocity_gradient || verify_line_interpolation;
+
     // Do we want to perform averaging on the cell with tensor product first
     // (leads to small aliasing errors for Reynolds stresses, but is faster),
     // and then perform interpolation from 2D data, or do we rather want to
@@ -1121,7 +1260,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
           if(cell_indices[1] != dealii::numbers::invalid_unsigned_int)
           {
             read_rt_cell_values(fe_u.degree,
-                                velocity.begin(),
+                                velocity_field.begin(),
                                 shape_values_eo_n,
                                 shape_values_eo_t,
                                 cell_indices,
@@ -1144,7 +1283,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                                                        Number>
                 eval(
                   shape_values_eo_dgq.data(), nullptr, nullptr, fe_u.degree + 1, fe_u.degree + 1);
-              eval.template values<0, true, false>(velocity.begin() + cell_indices[0] +
+              eval.template values<0, true, false>(velocity_field.begin() + cell_indices[0] +
                                                      c * velocity_dgq_on_cell.size(),
                                                    tmp_array.data());
               if constexpr(dim == 3)
@@ -1254,7 +1393,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
           VectorizedArrayType                                  dissipation   = 0.0;
           if constexpr(!evaluate_averaging_by_tensor_product)
           {
-            if(need_velocity_gradient)
+            if(compute_gradient)
               for(unsigned int q1 = 0; q1 < n_q_points_1d; ++q1)
               {
                 auto const val_grad =
@@ -1276,7 +1415,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
             {
               dealii::Tensor<1, dim, VectorizedArrayType> velocity_interpolated;
               VectorizedArrayType const                   JxW = det * gauss_1d.weight(q1);
-              if(need_velocity_gradient)
+              if(compute_gradient)
               {
                 // Correct the derivative in the averaging direction,
                 // hard-coded to `dim-1`.
@@ -1295,6 +1434,75 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                 // respect to the reference coordinates is set up.
                 for(unsigned int d = 0; d < dim; ++d)
                   velocity_gradient_interpolated[d] = inv_jac * velocity_gradient_interpolated[d];
+
+                // Verification: compare the interpolated value and gradient at
+                // this integration point (in-plane line point p1, quadrature
+                // point q1 in the averaging direction) against the analytical
+                // value and gradient at the corresponding mapped real point.
+                if(verify_line_interpolation)
+                {
+                  for(unsigned int p1 = p1_v * n_lanes, v = 0;
+                      p1 < std::min((p1_v + 1) * n_lanes, n_points);
+                      ++p1, ++v)
+                  {
+                    dealii::Point<dim> unit_point;
+                    for(unsigned int d = 0; d < dim; ++d)
+                      unit_point[d] = (d == averaging_direction) ? gauss_1d.point(q1)[0] :
+                                                                   point_list[p1].second[d];
+                    dealii::Point<dim> const real_point = mapping.transform_unit_to_real_cell(
+                      typename dealii::Triangulation<dim>::cell_iterator(cell), unit_point);
+
+                    static int n_debug_printed = 0;
+                    bool const print_debug =
+                      (n_debug_printed < 4) &&
+                      (dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0);
+
+                    for(unsigned int d = 0; d < dim; ++d)
+                    {
+                      double const u_exact = analytical_velocity.value(real_point, d);
+                      double const diff_value =
+                        static_cast<double>(velocity_interpolated[d][v]) - u_exact;
+                      verify_err_value_sq += diff_value * diff_value;
+                      verify_ref_value_sq += u_exact * u_exact;
+
+                      dealii::Tensor<1, dim> const grad_exact =
+                        analytical_velocity.gradient(real_point, d);
+                      for(unsigned int e = 0; e < dim; ++e)
+                      {
+                        double const diff_grad =
+                          static_cast<double>(velocity_gradient_interpolated[d][e][v]) -
+                          grad_exact[e];
+                        verify_err_grad_sq += diff_grad * diff_grad;
+                        verify_ref_grad_sq += grad_exact[e] * grad_exact[e];
+                      }
+
+                      if(print_debug)
+                      {
+                        std::cout << "[verify DBG] real=" << real_point << " comp=" << d
+                                  << " unit=" << unit_point << "\n"
+                                  << "    value interp=" << velocity_interpolated[d][v]
+                                  << " exact=" << u_exact << "\n"
+                                  << "    grad interp (phys)=["
+                                  << velocity_gradient_interpolated[d][0][v] << ", "
+                                  << velocity_gradient_interpolated[d][1][v] << ", "
+                                  << velocity_gradient_interpolated[d][dim - 1][v] << "]\n"
+                                  << "    grad exact (phys)=[" << grad_exact[0] << ", "
+                                  << grad_exact[1] << ", " << grad_exact[dim - 1] << "]\n"
+                                  << "    grad ref (pre-invJac)=["
+                                  << velocity_gradients_in_averaging_direction[q1][d][0][v] << ", "
+                                  << velocity_gradients_in_averaging_direction[q1][d][1][v] << ", "
+                                  << z_derivative[d][v] << "]\n"
+                                  << "    inv_jac diag=[" << inv_jac[0][0][v] << ", "
+                                  << inv_jac[1][1][v] << ", " << inv_jac[dim - 1][dim - 1][v]
+                                  << "]  (h_zz = "
+                                  << 1.0 / static_cast<double>(inv_jac[dim - 1][dim - 1][v])
+                                  << ")\n";
+                      }
+                    }
+                    if(print_debug)
+                      ++n_debug_printed;
+                  }
+                }
 
                 if(need_dissipation)
                 {
@@ -1472,7 +1680,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
     offset_arrays += line.n_points;
   }
 
-  velocity.zero_out_ghost_values();
+  velocity_field.zero_out_ghost_values();
   if(dof_handler_pressure.get_fe().dofs_per_vertex > 0)
     pressure.zero_out_ghost_values();
 
@@ -1552,6 +1760,35 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
       }
     }
     offset_arrays += n_points_on_line;
+  }
+
+  if(verify_line_interpolation)
+  {
+    // Reduce the squared errors and reference norms accumulated on all MPI
+    // ranks over their locally owned line cells.
+    double const global_err_value_sq = dealii::Utilities::MPI::sum(verify_err_value_sq, mpi_comm);
+    double const global_ref_value_sq = dealii::Utilities::MPI::sum(verify_ref_value_sq, mpi_comm);
+    double const global_err_grad_sq  = dealii::Utilities::MPI::sum(verify_err_grad_sq, mpi_comm);
+    double const global_ref_grad_sq  = dealii::Utilities::MPI::sum(verify_ref_grad_sq, mpi_comm);
+
+    double const rel_error_value =
+      (global_ref_value_sq > 0.0) ? std::sqrt(global_err_value_sq / global_ref_value_sq) : 0.0;
+    double const rel_error_gradient =
+      (global_ref_grad_sq > 0.0) ? std::sqrt(global_err_grad_sq / global_ref_grad_sq) : 0.0;
+
+    double const tolerance = 1.0e-10;
+    if(true or (rel_error_value < tolerance and rel_error_gradient < tolerance))
+    {
+      if(dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0)
+        std::cout << "[LinePlot interpolation verification] relative L2 error along lines: "
+                  << "value = " << rel_error_value
+                  << ", gradient = " << rel_error_gradient
+                  << " (tolerance = " << tolerance << ")" << std::endl;
+
+      AssertThrow(false,
+                  dealii::ExcMessage("Verified the error; for a static "
+                                     "grid this error will not change."));
+    }
   }
 
   time_all += time.wall_time();
