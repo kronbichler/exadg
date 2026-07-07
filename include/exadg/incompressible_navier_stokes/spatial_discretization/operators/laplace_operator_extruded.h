@@ -66,7 +66,7 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
   const Number h_z         = mapping_info.h_z;
   const Number h_z_inverse = mapping_info.h_z_inverse;
 
-  constexpr unsigned int  nn = n_q_points_1d;
+  constexpr unsigned int nn = n_q_points_1d;
 
   // Create a local copy to a stack variable of the shape gradients, such that
   // the compiler can decide on the most optimal placement of variables in
