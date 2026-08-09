@@ -90,6 +90,8 @@ ArchiveVector<dim>::write_and_read()
     boost::archive::text_oarchive output_archive(stream);
 
     output_archive & number_to_archive;
+    output_archive & number_to_archive * 2.0;
+    output_archive & number_to_archive * 4.0;
   }
 
   std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -102,6 +104,9 @@ ArchiveVector<dim>::write_and_read()
     boost::archive::text_iarchive input_archive(stream);
 
     input_archive & number_read_from_archive;
+    input_archive & number_read_from_archive;
+    input_archive & number_read_from_archive;
+    number_read_from_archive *= 0.25;
   }
 }
 

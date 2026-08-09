@@ -136,7 +136,7 @@ public:
   }
 
   void
-  write_restart_data(boost::archive::binary_oarchive & archive) const override
+  write_restart_data(boost::archive::text_oarchive & archive) const override
   {
     const auto parameters =
       flow_rate_controller.get_parameters_for_serialization(true /* print_parameters */);
@@ -146,7 +146,7 @@ public:
   // The information is always read on rank zero and then broadcast to all
   // ranks by the additional function `broadcast_function_parameters()`
   void
-  read_restart_data(boost::archive::binary_iarchive & archive) override
+  read_restart_data(boost::archive::text_iarchive & archive) override
   {
     // get right data type for parameters by getting (at this point invalid)
     // data from the controller...
