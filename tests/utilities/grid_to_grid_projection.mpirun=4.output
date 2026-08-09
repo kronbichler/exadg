@@ -8,15 +8,28 @@
             2176 (continuous)
     SOURCE: 10240
             4800 (continuous)
+time: RPE reinit         4.0275e-01 s
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+time: RPE interpolate    2.6738e-02 s
+time: inverse mass rhs   8.9958e-05 s
+time: inverse mass apply 4.9767e-04 s
+time: RPE reinit         3.9059e-01 s
+global CG iterations in projection : 14
+global CG iterations in projection : 14
+time: RPE interpolate    1.7426e-02 s
+time: inverse mass rhs   7.9919e-05 s
+time: inverse mass apply 1.0736e-02 s
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 1.40436e-06
+  Relative error (L2-norm): 1.40870e-06
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 1.40436e-06
+  Relative error (L2-norm): 1.40870e-06
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 1.40436e-06
+  Relative error (L2-norm): 1.40870e-06
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 1.51442e-06
@@ -35,15 +48,28 @@ Calculate error for all fields for initial data:
             4352 (continuous)
     SOURCE: 20480
             9600 (continuous)
+time: RPE reinit         3.9323e-01 s
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+time: RPE interpolate    2.8414e-02 s
+time: inverse mass rhs   1.6159e-04 s
+time: inverse mass apply 9.8466e-03 s
+time: RPE reinit         3.9425e-01 s
+global CG iterations in projection : 15
+global CG iterations in projection : 15
+time: RPE interpolate    1.8686e-02 s
+time: inverse mass rhs   1.6171e-04 s
+time: inverse mass apply 1.1430e-02 s
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 1.59669e-06
+  Relative error (L2-norm): 1.60148e-06
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 1.59669e-06
+  Relative error (L2-norm): 1.60148e-06
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 1.59669e-06
+  Relative error (L2-norm): 1.60148e-06
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 1.91480e-06
@@ -62,6 +88,19 @@ Calculate error for all fields for initial data:
             1152 (continuous)
     SOURCE: 2400
             2496 (continuous)
+time: RPE reinit         1.7927e-02 s
+global CG iterations in projection : 29
+global CG iterations in projection : 29
+global CG iterations in projection : 29
+time: RPE interpolate    2.6661e-03 s
+time: inverse mass rhs   9.3825e-05 s
+time: inverse mass apply 2.1189e-03 s
+time: RPE reinit         1.2427e-02 s
+global CG iterations in projection : 15
+global CG iterations in projection : 15
+time: RPE interpolate    4.2269e-03 s
+time: inverse mass rhs   5.1336e-05 s
+time: inverse mass apply 4.7584e-04 s
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 1.91093e-04
@@ -89,6 +128,19 @@ Calculate error for all fields for initial data:
             29376 (continuous)
     SOURCE: 86400
             93600 (continuous)
+time: RPE reinit         9.8257e-01 s
+global CG iterations in projection : 29
+global CG iterations in projection : 29
+global CG iterations in projection : 29
+time: RPE interpolate    1.2153e-01 s
+time: inverse mass rhs   1.9278e-03 s
+time: inverse mass apply 1.0179e-01 s
+time: RPE reinit         9.6348e-01 s
+global CG iterations in projection : 15
+global CG iterations in projection : 15
+time: RPE interpolate    3.2405e-01 s
+time: inverse mass rhs   6.7604e-04 s
+time: inverse mass apply 7.1946e-03 s
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 5.50903e-03
@@ -116,6 +168,19 @@ Calculate error for all fields for initial data:
             1152 (continuous)
     SOURCE: 4096
             2496 (continuous)
+time: RPE reinit         1.2548e-02 s
+global CG iterations in projection : 29
+global CG iterations in projection : 29
+global CG iterations in projection : 29
+time: RPE interpolate    2.8069e-03 s
+time: inverse mass rhs   9.9736e-05 s
+time: inverse mass apply 2.2888e-03 s
+time: RPE reinit         1.2604e-02 s
+global CG iterations in projection : 14
+global CG iterations in projection : 14
+time: RPE interpolate    2.0411e-03 s
+time: inverse mass rhs   5.1546e-05 s
+time: inverse mass apply 4.7342e-04 s
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 1.91093e-04
@@ -143,6 +208,19 @@ Calculate error for all fields for initial data:
             29376 (continuous)
     SOURCE: 196608
             93600 (continuous)
+time: RPE reinit         9.5925e-01 s
+global CG iterations in projection : 29
+global CG iterations in projection : 29
+global CG iterations in projection : 29
+time: RPE interpolate    1.2120e-01 s
+time: inverse mass rhs   1.9029e-03 s
+time: inverse mass apply 9.0474e-02 s
+time: RPE reinit         9.5347e-01 s
+global CG iterations in projection : 14
+global CG iterations in projection : 14
+time: RPE interpolate    8.0514e-02 s
+time: inverse mass rhs   5.4225e-04 s
+time: inverse mass apply 6.8211e-03 s
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 5.50903e-03
@@ -170,15 +248,28 @@ Calculate error for all fields for initial data:
             1152 (continuous)
     SOURCE: 2400
             2496 (continuous)
+time: RPE reinit         1.2824e-02 s
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+time: RPE interpolate    2.8115e-03 s
+time: inverse mass rhs   6.6424e-05 s
+time: inverse mass apply 9.2600e-03 s
+time: RPE reinit         1.2392e-02 s
+global CG iterations in projection : 15
+global CG iterations in projection : 15
+time: RPE interpolate    4.2459e-03 s
+time: inverse mass rhs   5.0034e-05 s
+time: inverse mass apply 5.4177e-04 s
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.90768e-05
+  Relative error (L2-norm): 3.90784e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.90768e-05
+  Relative error (L2-norm): 3.90784e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.90768e-05
+  Relative error (L2-norm): 3.90784e-05
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 2.73476e-03
@@ -197,15 +288,28 @@ Calculate error for all fields for initial data:
             29376 (continuous)
     SOURCE: 86400
             93600 (continuous)
+time: RPE reinit         9.5191e-01 s
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+time: RPE interpolate    1.2181e-01 s
+time: inverse mass rhs   6.5511e-04 s
+time: inverse mass apply 9.5068e-03 s
+time: RPE reinit         9.6387e-01 s
+global CG iterations in projection : 15
+global CG iterations in projection : 15
+time: RPE interpolate    3.3630e-01 s
+time: inverse mass rhs   6.0196e-04 s
+time: inverse mass apply 7.3611e-03 s
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 2.93434e-05
+  Relative error (L2-norm): 2.93445e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 2.93434e-05
+  Relative error (L2-norm): 2.93445e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 2.93434e-05
+  Relative error (L2-norm): 2.93445e-05
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 3.39129e-03
@@ -224,15 +328,28 @@ Calculate error for all fields for initial data:
             1152 (continuous)
     SOURCE: 4096
             2496 (continuous)
+time: RPE reinit         1.2635e-02 s
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+time: RPE interpolate    2.7549e-03 s
+time: inverse mass rhs   6.9288e-05 s
+time: inverse mass apply 3.9895e-05 s
+time: RPE reinit         1.2732e-02 s
+global CG iterations in projection : 14
+global CG iterations in projection : 14
+time: RPE interpolate    1.9033e-03 s
+time: inverse mass rhs   5.2448e-05 s
+time: inverse mass apply 5.4808e-04 s
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.90768e-05
+  Relative error (L2-norm): 3.90784e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.90768e-05
+  Relative error (L2-norm): 3.90784e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.90768e-05
+  Relative error (L2-norm): 3.90784e-05
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 3.93064e-05
@@ -251,15 +368,28 @@ Calculate error for all fields for initial data:
             29376 (continuous)
     SOURCE: 196608
             93600 (continuous)
+time: RPE reinit         1.0010e+00 s
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+time: RPE interpolate    1.2968e-01 s
+time: inverse mass rhs   6.7903e-04 s
+time: inverse mass apply 1.5429e-04 s
+time: RPE reinit         1.0146e+00 s
+global CG iterations in projection : 14
+global CG iterations in projection : 14
+time: RPE interpolate    7.8931e-02 s
+time: inverse mass rhs   5.1917e-04 s
+time: inverse mass apply 6.7165e-03 s
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 2.93434e-05
+  Relative error (L2-norm): 2.93445e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 2.93434e-05
+  Relative error (L2-norm): 2.93445e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 2.93434e-05
+  Relative error (L2-norm): 2.93445e-05
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 2.95529e-05
@@ -278,15 +408,28 @@ Calculate error for all fields for initial data:
             576 (continuous)
     SOURCE: 2048
             1248 (continuous)
+time: RPE reinit         1.2837e-02 s
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+time: RPE interpolate    2.2059e-03 s
+time: inverse mass rhs   4.6216e-05 s
+time: inverse mass apply 3.2731e-05 s
+time: RPE reinit         1.2428e-02 s
+global CG iterations in projection : 14
+global CG iterations in projection : 14
+time: RPE interpolate    1.4871e-03 s
+time: inverse mass rhs   3.3883e-05 s
+time: inverse mass apply 3.6841e-04 s
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.48717e-05
+  Relative error (L2-norm): 3.48731e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.48717e-05
+  Relative error (L2-norm): 3.48731e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.48717e-05
+  Relative error (L2-norm): 3.48731e-05
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 3.47141e-05
@@ -305,15 +448,28 @@ Calculate error for all fields for initial data:
             9792 (continuous)
     SOURCE: 65536
             31200 (continuous)
+time: RPE reinit         9.9035e-01 s
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+global CG iterations in projection : 0
+time: RPE interpolate    6.7964e-02 s
+time: inverse mass rhs   1.3587e-04 s
+time: inverse mass apply 5.4957e-04 s
+time: RPE reinit         9.7117e-01 s
+global CG iterations in projection : 14
+global CG iterations in projection : 14
+time: RPE interpolate    4.4480e-02 s
+time: inverse mass rhs   1.1945e-04 s
+time: inverse mass apply 2.4140e-03 s
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.48717e-05
+  Relative error (L2-norm): 3.48731e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.48717e-05
+  Relative error (L2-norm): 3.48731e-05
 
 Calculate error for all fields for initial data:
-  Relative error (L2-norm): 3.48717e-05
+  Relative error (L2-norm): 3.48731e-05
 
 Calculate error for all fields for initial data:
   Relative error (L2-norm): 3.47141e-05
