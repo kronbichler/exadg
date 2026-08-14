@@ -886,7 +886,7 @@ public:
     dealii::PreconditionChebyshev<MatrixType, VectorType, SmootherPreconditionerType>;
   using SmootherTypeDG =
     dealii::PreconditionChebyshev<MatrixTypeDG, VectorType, SmootherPreconditionerType>;
-  using MGTransferType = dealii::MGTransferGlobalCoarsening<dim, VectorType>;
+  using MGTransferType = dealii::MGTransferMatrixFree<dim, Number>;
 
   PoissonPreconditionerMG(
     const dealii::Mapping<dim> &                                   mapping_fine,
