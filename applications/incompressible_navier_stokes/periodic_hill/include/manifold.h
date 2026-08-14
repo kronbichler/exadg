@@ -207,6 +207,67 @@ private:
   std::array<double, 4> x_transition_values;
 };
 
+
+
+/**
+ * A manifold class used when constructing anisotropically coarsened
+ * meshes. We realize this by independent meshes with different numbers of
+ * cells in one of the directions (currently hardcoded as the y
+ * direction). We then want to match cells in the two triangulations, for
+ * which we want to shift the cells to create a nested space. This shift is
+ * implemented by the present manifold class.
+ */
+template<int dim>
+class PiecewiseLinearManifold : public dealii::ChartManifold<dim>
+{
+public:
+  PiecewiseLinearManifold(const std::vector<std::array<double, 2>> & pieces) : pieces(pieces)
+  {
+  }
+
+  virtual std::unique_ptr<dealii::Manifold<dim, dim>>
+  clone() const override
+  {
+    return std::make_unique<PiecewiseLinearManifold<dim>>(pieces);
+  }
+
+  virtual dealii::Point<dim>
+  pull_back(const dealii::Point<dim> & space_point) const override
+  {
+    dealii::Point<dim> chart_point = space_point;
+    for(unsigned int i = 0; i < pieces.size() - 1; ++i)
+      if(space_point[1] < pieces[i + 1][1])
+      {
+        chart_point[1] = pieces[i][0] + (space_point[1] - pieces[i][1]) *
+                                          (pieces[i + 1][0] - pieces[i][0]) /
+                                          (pieces[i + 1][1] - pieces[i][1]);
+        return chart_point;
+      }
+
+    return chart_point;
+  }
+
+  virtual dealii::Point<dim>
+  push_forward(const dealii::Point<dim> & chart_point) const override
+  {
+    dealii::Point<dim> space_point = chart_point;
+
+    for(unsigned int i = 0; i < pieces.size() - 1; ++i)
+      if(chart_point[1] < pieces[i + 1][0])
+      {
+        space_point[1] = pieces[i][1] + (chart_point[1] - pieces[i][0]) *
+                                          (pieces[i + 1][1] - pieces[i][1]) /
+                                          (pieces[i + 1][0] - pieces[i][0]);
+        return space_point;
+      }
+
+    return space_point;
+  }
+
+private:
+  const std::vector<std::array<double, 2>> pieces;
+};
+
 } // namespace ExaDG
 
 
