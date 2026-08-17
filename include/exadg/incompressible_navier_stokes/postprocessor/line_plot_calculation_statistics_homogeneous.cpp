@@ -59,34 +59,104 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::LinePlotCalculatorStatisti
               dealii::ExcMessage("Only implemented for hypercube elements."));
 }
 
-template<int dim>
-dealii::Point<dim>
-find_unit_point(dealii::Mapping<dim, dim> const &                               mapping,
-                typename dealii::Triangulation<dim, dim>::cell_iterator const & cell,
-                dealii::Point<dim> const &                                      point)
-{
-  // coarse search first that identifies candidates by affine approximation
-  auto const vertices = mapping.get_vertices(cell);
-  auto const A_b      = dealii::GridTools::affine_cell_approximation<dim, dim>(vertices);
-  dealii::DerivativeForm<1, dim, dim> const A_inv = A_b.first.covariant_form().transpose();
-  dealii::Point<dim>                        p_unit(apply_transformation(A_inv, point - A_b.second));
 
-  // if point is far away in affine approximation of unit cell, do not try
-  // more accurate search to limit computational costs
-  if(dealii::GeometryInfo<dim>::is_inside_unit_cell(p_unit, 1.0))
+
+template<int dim, typename Number>
+bool
+LinePlotCalculatorStatisticsHomogeneous<dim, Number>::extract_line_data_on_cell(
+  const typename dealii::DoFHandler<dim>::active_cell_iterator & cell)
+{
+  // use a tolerance to check whether a point is inside the unit cell; we
+  // also use this as bias to make sure exactly one cell finds points
+  // located at the cell boundary
+  double const tolerance = 1.e-8;
+
+  // Get bounding box from mapping, and slightly increase its size to
+  // account for strongly deformed cells by increasing the relative size
+  // by a factor 1.2
+  dealii::BoundingBox<dim> const mapping_bounding_box = mapping.get_bounding_box(cell);
+  dealii::BoundingBox<dim> const bounding_box = mapping_bounding_box.create_extended_relative(0.2);
+
+  bool evaluates_velocity_on_any_line = false;
+
+  unsigned int line_iterator = 0;
+  for(const std::shared_ptr<Line<dim>> & line : data.lines)
   {
-    try
+    AssertThrow(line->quantities.size() > 0,
+                dealii::ExcMessage("No quantities specified for line."));
+
+    bool velocity_has_to_be_evaluated = false;
+    bool pressure_has_to_be_evaluated = false;
+    for(const std::shared_ptr<Quantity> & quantity : line->quantities)
     {
-      p_unit = mapping.transform_real_to_unit_cell(cell, point);
+      if(quantity->type == QuantityType::Velocity or quantity->type == QuantityType::SkinFriction or
+         quantity->type == QuantityType::ReynoldsStresses)
+      {
+        velocity_has_to_be_evaluated = true;
+      }
+
+      if(quantity->type == QuantityType::Pressure)
+        pressure_has_to_be_evaluated = true;
     }
-    catch(...)
+
+    if(velocity_has_to_be_evaluated == true || pressure_has_to_be_evaluated == true)
     {
-      // A point that does not lie on the reference cell.
-      p_unit[0] = 2.0;
+      bool found_a_point_on_this_cell = false;
+      // cells and reference points for all points along a line
+      for(unsigned int p = 0; p < line->n_points; ++p)
+      {
+        // First, we move the line to the position of the current cell (vertex 0) in
+        // averaging direction and check whether this new point is inside the current cell
+        dealii::Point<dim> translated_point   = global_points[line_iterator][p];
+        translated_point[averaging_direction] = cell->vertex(0)[averaging_direction];
+
+        // If the new point lies in the bounding box of the current
+        // cell, we have to take the current cell into account
+        if(bounding_box.point_inside(translated_point))
+          try
+          {
+            dealii::Point<dim> const p_unit =
+              mapping.transform_real_to_unit_cell(cell, translated_point);
+
+            // Use a relaxed tolerance if we are at the boundary in
+            // a certain direction
+            bool point_within_cell = true;
+            for(unsigned int d = 0; d < dim; ++d)
+              if(d != averaging_direction)
+              {
+                if(p_unit[d] <= -tolerance && !cell->at_boundary(2 * d))
+                  point_within_cell = false;
+                // bias to always consider point on one cell,
+                // should be stable also with multiple MPI ranks
+                if(p_unit[d] >= 1. - tolerance && !cell->at_boundary(2 * d + 1))
+                  point_within_cell = false;
+              }
+
+            if(point_within_cell)
+            {
+              evaluates_velocity_on_any_line = true;
+              if(not found_a_point_on_this_cell)
+              {
+                cells_and_ref_points[line_iterator].emplace_back(
+                  cell, std::vector<std::pair<unsigned int, dealii::Point<dim>>>());
+                found_a_point_on_this_cell = true;
+              }
+              cells_and_ref_points[line_iterator].back().second.emplace_back(
+                p, dealii::GeometryInfo<dim>::project_to_unit_cell(p_unit));
+            }
+          }
+          catch(dealii::Mapping<dim>::ExcTransformationFailed &)
+          {
+          }
+      }
     }
+    ++line_iterator;
   }
-  return p_unit;
+
+  return evaluates_velocity_on_any_line;
 }
+
+
 
 template<int dim, typename Number>
 void
@@ -169,11 +239,6 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
     // Save all cells and corresponding points on unit cell
     // that are relevant for a given point along the line.
 
-    // use a tolerance to check whether a point is inside the unit cell; we
-    // also use this as bias to make sure exactly one cell finds points
-    // located at the cell boundary
-    double const tolerance = 1.e-8;
-
     pressure_dof_indices_on_cell.resize(dof_handler_velocity.get_triangulation().n_active_cells(),
                                         dealii::numbers::invalid_unsigned_int);
     std::vector<dealii::types::global_dof_index> pressure_dof_indices(
@@ -183,81 +248,17 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
     {
       if(cell->is_locally_owned())
       {
-        unsigned int line_iterator = 0;
-        for(const std::shared_ptr<Line<dim>> & line : data.lines)
-        {
-          AssertThrow(line->quantities.size() > 0,
-                      dealii::ExcMessage("No quantities specified for line."));
+        extract_line_data_on_cell(cell);
 
-          bool velocity_has_to_be_evaluated = false;
-          bool pressure_has_to_be_evaluated = false;
-          for(const std::shared_ptr<Quantity> & quantity : line->quantities)
-          {
-            if(quantity->type == QuantityType::Velocity or
-               quantity->type == QuantityType::SkinFriction or
-               quantity->type == QuantityType::ReynoldsStresses)
-            {
-              velocity_has_to_be_evaluated = true;
-            }
-
-            if(quantity->type == QuantityType::Pressure)
-              pressure_has_to_be_evaluated = true;
-          }
-
-          if(velocity_has_to_be_evaluated == true || pressure_has_to_be_evaluated == true)
-          {
-            bool found_a_point_on_this_cell = false;
-            // cells and reference points for all points along a line
-            for(unsigned int p = 0; p < line->n_points; ++p)
-            {
-              // First, we move the line to the position of the current cell (vertex 0) in
-              // averaging direction and check whether this new point is inside the current cell
-              dealii::Point<dim> translated_point   = global_points[line_iterator][p];
-              translated_point[averaging_direction] = cell->vertex(0)[averaging_direction];
-
-              // If the new point lies in the current cell, we have to take the current cell into
-              // account
-              dealii::Point<dim> const p_unit = find_unit_point(mapping, cell, translated_point);
-
-              // Use a relaxed tolerance if we are at the boundary in a certain direction
-              bool point_within_cell = true;
-              for(unsigned int d = 0; d < dim; ++d)
-                if(d != averaging_direction)
-                {
-                  if(p_unit[d] <= -tolerance && !cell->at_boundary(2 * d))
-                    point_within_cell = false;
-                  // bias to always consider point on one cell, should be
-                  // stable also with multiple MPI ranks
-                  if(p_unit[d] >= 1. - tolerance && !cell->at_boundary(2 * d + 1))
-                    point_within_cell = false;
-                }
-
-              if(point_within_cell)
-              {
-                if(not found_a_point_on_this_cell)
-                {
-                  cells_and_ref_points[line_iterator].emplace_back(
-                    cell, std::vector<std::pair<unsigned int, dealii::Point<dim>>>());
-                  found_a_point_on_this_cell = true;
-                }
-                cells_and_ref_points[line_iterator].back().second.emplace_back(
-                  p, dealii::GeometryInfo<dim>::project_to_unit_cell(p_unit));
-              }
-            }
-          }
-
-          if(pressure_has_to_be_evaluated)
-          {
-            typename dealii::DoFHandler<dim>::active_cell_iterator cell_p =
-              cell->as_dof_handler_iterator(dof_handler_pressure);
-            cell_p->get_dof_indices(pressure_dof_indices);
-            pressure_dof_indices_on_cell[cell_p->active_cell_index()] =
-              dof_handler_pressure.locally_owned_dofs().index_within_set(pressure_dof_indices[0]);
-          }
-          ++line_iterator;
-        }
+        typename dealii::DoFHandler<dim>::active_cell_iterator cell_p =
+          cell->as_dof_handler_iterator(dof_handler_pressure);
+        cell_p->get_dof_indices(pressure_dof_indices);
+        pressure_dof_indices_on_cell[cell_p->active_cell_index()] =
+          dof_handler_pressure.locally_owned_dofs().index_within_set(pressure_dof_indices[0]);
       }
     }
+
+    double const tolerance = 1.e-8;
 
     // Save all cells and corresponding points on unit cell that are relevant for a given point
     // along the line.
@@ -290,13 +291,24 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
 
               // If the new point lies in the current cell, we have to take the current cell into
               // account
-              dealii::Point<dim> const p_unit = find_unit_point(mapping, cell, translated_point);
-              if(dealii::GeometryInfo<dim>::is_inside_unit_cell(p_unit, tolerance))
-              {
-                cells_and_ref_points_ref_pressure[line_iterator].push_back(
-                  std::pair<typename dealii::DoFHandler<dim>::active_cell_iterator,
-                            dealii::Point<dim>>(cell, p_unit));
-              }
+              dealii::BoundingBox<dim> const mapping_bounding_box = mapping.get_bounding_box(cell);
+              dealii::BoundingBox<dim> const bounding_box =
+                mapping_bounding_box.create_extended_relative(0.2);
+              if(bounding_box.point_inside(translated_point))
+                try
+                {
+                  dealii::Point<dim> const p_unit =
+                    mapping.transform_real_to_unit_cell(cell, translated_point);
+                  if(dealii::GeometryInfo<dim>::is_inside_unit_cell(p_unit, tolerance))
+                  {
+                    cells_and_ref_points_ref_pressure[line_iterator].push_back(
+                      std::pair<typename dealii::DoFHandler<dim>::active_cell_iterator,
+                                dealii::Point<dim>>(cell, p_unit));
+                  }
+                }
+                catch(dealii::Mapping<dim>::ExcTransformationFailed &)
+                {
+                }
             }
           }
           ++line_iterator;
@@ -417,6 +429,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
   }
 }
 
+
+
 template<int dim, typename Number>
 void
 LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
@@ -500,11 +514,6 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
     // Save all cells and corresponding points on unit cell
     // that are relevant for a given point along the line.
 
-    // use a tolerance to check whether a point is inside the unit cell; we
-    // also use this as bias to make sure exactly one cell finds points
-    // located at the cell boundary
-    double const tolerance = 1.e-8;
-
     const dealii::Triangulation<dim> & tria = dof_handler_velocity.get_triangulation();
     std::vector<unsigned int>          tmp_list_of_cells_to_evaluate;
     active_cell_index_to_evaluate_index.clear();
@@ -526,92 +535,23 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
             &dof_handler_velocity);
           AssertThrow(cell->is_locally_owned(), dealii::ExcInternalError());
 
-          bool         cell_was_not_yet_considered = true;
-          unsigned int line_iterator               = 0;
-          for(const std::shared_ptr<Line<dim>> & line : data.lines)
+          bool const evaluates_velocity = extract_line_data_on_cell(cell);
+
+          if(evaluates_velocity)
           {
-            AssertThrow(line->quantities.size() > 0,
-                        dealii::ExcMessage("No quantities specified for line."));
-
-            bool velocity_has_to_be_evaluated = false;
-            bool pressure_has_to_be_evaluated = false;
-            for(const std::shared_ptr<Quantity> & quantity : line->quantities)
-            {
-              if(quantity->type == QuantityType::Velocity or
-                 quantity->type == QuantityType::SkinFriction or
-                 quantity->type == QuantityType::ReynoldsStresses)
-              {
-                velocity_has_to_be_evaluated = true;
-              }
-
-              if(quantity->type == QuantityType::Pressure)
-                pressure_has_to_be_evaluated = true;
-            }
-
-            if(velocity_has_to_be_evaluated == true || pressure_has_to_be_evaluated == true)
-            {
-              bool found_a_point_on_this_cell = false;
-              // cells and reference points for all points along a line
-              for(unsigned int p = 0; p < line->n_points; ++p)
-              {
-                // First, we move the line to the position of the current cell (vertex 0) in
-                // averaging direction and check whether this new point is inside the current cell
-                dealii::Point<dim> translated_point   = global_points[line_iterator][p];
-                translated_point[averaging_direction] = cell->vertex(0)[averaging_direction];
-
-                // If the new point lies in the current cell, we have to take the current cell into
-                // account
-                dealii::Point<dim> const p_unit = find_unit_point(mapping, cell, translated_point);
-
-                bool point_within_cell = true;
-                for(unsigned int d = 0; d < dim; ++d)
-                  if(d != averaging_direction)
-                  {
-                    if(p_unit[d] <= -tolerance && !cell->at_boundary(2 * d))
-                      point_within_cell = false;
-                    // bias to always consider point on one cell, should be
-                    // stable also with multiple MPI ranks
-                    if(p_unit[d] >= 1. - tolerance && !cell->at_boundary(2 * d + 1))
-                      point_within_cell = false;
-                  }
-
-                if(point_within_cell)
-                {
-                  if(not found_a_point_on_this_cell)
-                  {
-                    cells_and_ref_points[line_iterator].emplace_back(
-                      cell, std::vector<std::pair<unsigned int, dealii::Point<dim>>>());
-                    found_a_point_on_this_cell = true;
-                  }
-                  cells_and_ref_points[line_iterator].back().second.emplace_back(
-                    p, dealii::GeometryInfo<dim>::project_to_unit_cell(p_unit));
-                }
-              }
-              if(velocity_has_to_be_evaluated && found_a_point_on_this_cell &&
-                 cell_was_not_yet_considered)
-              {
-                active_cell_index_to_evaluate_index[cell->active_cell_index()] =
-                  tmp_list_of_cells_to_evaluate.size();
-                tmp_list_of_cells_to_evaluate.push_back(
-                  ic * dealii::VectorizedArray<Number>::size() + il);
-                cell_was_not_yet_considered = false;
-              }
-            }
-
-            if(pressure_has_to_be_evaluated)
-            {
-              typename dealii::DoFHandler<dim>::active_cell_iterator cell_p(
-                &tria,
-                rt_operator.get_cell_level_index()[ic][il][0],
-                rt_operator.get_cell_level_index()[ic][il][1],
-                &dof_handler_pressure);
-              cell_p->get_dof_indices(pressure_dof_indices);
-              pressure_dof_indices_on_cell[cell_p->active_cell_index()] =
-                dof_handler_pressure.locally_owned_dofs().index_within_set(pressure_dof_indices[0]);
-            }
-            ++line_iterator;
+            active_cell_index_to_evaluate_index[cell->active_cell_index()] =
+              tmp_list_of_cells_to_evaluate.size();
+            tmp_list_of_cells_to_evaluate.push_back(ic * dealii::VectorizedArray<Number>::size() +
+                                                    il);
           }
+
+          typename dealii::DoFHandler<dim>::active_cell_iterator cell_p =
+            cell->as_dof_handler_iterator(dof_handler_pressure);
+          cell_p->get_dof_indices(pressure_dof_indices);
+          pressure_dof_indices_on_cell[cell_p->active_cell_index()] =
+            dof_handler_pressure.locally_owned_dofs().index_within_set(pressure_dof_indices[0]);
         }
+
     list_of_cells_to_evaluate.resize(
       (tmp_list_of_cells_to_evaluate.size() + dealii::VectorizedArray<Number>::size() - 1) /
       dealii::VectorizedArray<Number>::size());
@@ -622,6 +562,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
     evaluated_dg_values_on_cells.reinit(
       list_of_cells_to_evaluate.size() * dealii::VectorizedArray<Number>::size(),
       dealii::Utilities::pow(dof_handler_velocity.get_fe().degree + 1, dim));
+
+    double const tolerance = 1.e-8;
 
     // Save all cells and corresponding points on unit cell that are relevant for a given point
     // along the line.
@@ -651,13 +593,24 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
 
               // If the new point lies in the current cell, we have to take the current cell into
               // account
-              dealii::Point<dim> const p_unit = find_unit_point(mapping, cell, translated_point);
-              if(dealii::GeometryInfo<dim>::is_inside_unit_cell(p_unit, tolerance))
-              {
-                cells_and_ref_points_ref_pressure[line_iterator].push_back(
-                  std::pair<typename dealii::DoFHandler<dim>::active_cell_iterator,
-                            dealii::Point<dim>>(cell, p_unit));
-              }
+              dealii::BoundingBox<dim> const mapping_bounding_box = mapping.get_bounding_box(cell);
+              dealii::BoundingBox<dim> const bounding_box =
+                mapping_bounding_box.create_extended_relative(0.2);
+              if(bounding_box.point_inside(translated_point))
+                try
+                {
+                  dealii::Point<dim> const p_unit =
+                    mapping.transform_real_to_unit_cell(cell, translated_point);
+                  if(dealii::GeometryInfo<dim>::is_inside_unit_cell(p_unit, tolerance))
+                  {
+                    cells_and_ref_points_ref_pressure[line_iterator].push_back(
+                      std::pair<typename dealii::DoFHandler<dim>::active_cell_iterator,
+                                dealii::Point<dim>>(cell, p_unit));
+                  }
+                }
+                catch(dealii::Mapping<dim>::ExcTransformationFailed &)
+                {
+                }
             }
           }
           ++line_iterator;
@@ -723,6 +676,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
     create_directories(data.directory, mpi_comm);
   }
 }
+
+
 
 template<int dim, typename Number>
 void

@@ -86,6 +86,9 @@ public:
   TimeControlStatistics time_control_statistics;
 
 private:
+  bool
+  extract_line_data_on_cell(const typename dealii::DoFHandler<dim>::active_cell_iterator &cell);
+
   void
   print_headline(std::ofstream & f, unsigned int const number_of_samples) const;
 
