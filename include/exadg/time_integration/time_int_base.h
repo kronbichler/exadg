@@ -23,8 +23,6 @@
 #define EXADG_TIME_INTEGRATION_TIME_INT_BASE_H_
 
 // C/C++
-#include <boost/archive/binary_iarchive.hpp>
-#include <boost/archive/binary_oarchive.hpp>
 #include <boost/archive/text_iarchive.hpp>
 #include <boost/archive/text_oarchive.hpp>
 
@@ -47,12 +45,11 @@ namespace ExaDG
 class TimeIntBase
 {
 public:
-  // Archive type used for serialization. Binary type for reduced file size.
-  typedef boost::archive::binary_iarchive BoostInputArchiveType;
-  typedef boost::archive::binary_oarchive BoostOutputArchiveType;
-  // Alternative human-readable type for debugging.
-  // typedef boost::archive::text_iarchive BoostInputArchiveType;
-  // typedef boost::archive::text_oarchive BoostOutputArchiveType;
+  // Archive type used for serialization. Human-readable text type preferred,
+  // since data (parameters only!) are small enough and boost version conflicts
+  // between machines can be resolved manually.
+  typedef boost::archive::text_iarchive BoostInputArchiveType;
+  typedef boost::archive::text_oarchive BoostOutputArchiveType;
 
   TimeIntBase(double const &      start_time_,
               double const &      end_time_,

@@ -19,7 +19,12 @@
  *  ______________________________________________________________________
  */
 
-#pragma once
+#ifndef EXADG_UTILITIES_SERIALIZABLE_FUNCTION_H_
+#define EXADG_UTILITIES_SERIALIZABLE_FUNCTION_H_
+
+// C/C++
+#include <boost/archive/text_iarchive.hpp>
+#include <boost/archive/text_oarchive.hpp>
 
 // deal.II
 #include <deal.II/base/function.h>
@@ -40,22 +45,26 @@ public:
   {
   }
 
-  /*
-   * These functions define the interface for the added functionality to serialize and deserialize
-   * the parameters of derived classes.
+  /**
+   * These functions define the interface for the added functionality to
+   * serialize and deserialize the parameters of derived classes.
    */
 
   // Add data to be serialized to the archive.
   virtual void
-  write_restart_data(boost::archive::binary_oarchive & archive) const = 0;
+  write_restart_data(boost::archive::text_oarchive & archive) const = 0;
 
-  // Read serialized data from th archive. Note that the information is always read on rank 0 and
-  // then broadcast to all ranks by the additional function `broadcast_function_parameters()`
+  // Read serialized data from the archive. Note that the information is always
+  // read on rank 0 and then broadcast to all ranks by the additional function
+  // `broadcast_function_parameters()`
   virtual void
-  read_restart_data(boost::archive::binary_iarchive & archive) = 0;
+  read_restart_data(boost::archive::text_iarchive & archive) = 0;
 
-  // Broadcast the de-/serialized parameters from `root_rank` to all other ranks.
+  // Broadcast the de-/serialized parameters from `root_rank` to all others.
   virtual void
   broadcast_function_parameters(const MPI_Comm mpi_comm, const unsigned int root_rank = 0) = 0;
 };
+
 } // namespace ExaDG
+
+#endif /* EXADG_UTILITIES_SERIALIZABLE_FUNCTION_H_ */

@@ -23,8 +23,6 @@
 #define EXADG_TIME_INTEGRATION_RESTART_H_
 
 // C/C++
-#include <boost/archive/binary_iarchive.hpp>
-#include <boost/archive/binary_oarchive.hpp>
 #include <boost/archive/text_iarchive.hpp>
 #include <boost/archive/text_oarchive.hpp>
 #include <fstream>
@@ -214,9 +212,8 @@ write_deserialization_parameters(MPI_Comm const &                       mpi_comm
     std::ofstream stream(filename);
     AssertThrow(stream, dealii::ExcMessage("Could not write deserialization parameters to file."));
 
-    // Text archive type for debugging purposes.
-    // boost::archive::text_oarchive output_archive(stream);
-    boost::archive::binary_oarchive output_archive(stream);
+    // Serialized data is small and should be human-readable.
+    boost::archive::text_oarchive output_archive(stream);
 
     // Sequence has to match `read_deserialization_parameters()`.
     output_archive & parameters.degree;
@@ -257,9 +254,8 @@ read_deserialization_parameters(MPI_Comm const &                 mpi_comm,
     std::ifstream stream(filename);
     AssertThrow(stream, dealii::ExcMessage("Could not read deserialization parameters from file."));
 
-    // Text archive type for debugging purposes.
-    // boost::archive::text_iarchive input_archive(stream);
-    boost::archive::binary_iarchive input_archive(stream);
+    // Archive type (binary or text) matches the output type.
+    boost::archive::text_iarchive input_archive(stream);
 
     // Sequence has to match `write_deserialization_parameters()`.
     input_archive & parameters.degree;
