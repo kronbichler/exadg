@@ -223,6 +223,16 @@ class PiecewiseLinearManifold : public dealii::ChartManifold<dim>
 public:
   PiecewiseLinearManifold(const std::vector<std::array<double, 2>> & pieces) : pieces(pieces)
   {
+    AssertThrow(pieces.size() >= 2,
+                dealii::ExcMessage("Can only construct a transformation "
+                                   "manifold when given at least two pieces."));
+    for(unsigned int i = 1; i < pieces.size(); ++i)
+    {
+      AssertThrow(pieces[i][0] > pieces[i - 1][0],
+                  dealii::ExcMessage("Pieces need to be strictly increasing"));
+      AssertThrow(pieces[i][1] > pieces[i - 1][1],
+                  dealii::ExcMessage("Pieces need to be strictly increasing"));
+    }
   }
 
   virtual std::unique_ptr<dealii::Manifold<dim, dim>>
