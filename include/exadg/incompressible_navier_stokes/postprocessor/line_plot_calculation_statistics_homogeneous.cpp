@@ -63,17 +63,26 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::LinePlotCalculatorStatisti
 
 template<int dim, typename Number>
 bool
-LinePlotCalculatorStatisticsHomogeneous<dim, Number>::extract_line_data_on_cell(
+LinePlotCalculatorStatisticsHomogeneous<dim, Number>::intersect_lines_with_cell(
   const typename dealii::DoFHandler<dim>::active_cell_iterator & cell)
 {
   // use a tolerance to check whether a point is inside the unit cell; we
   // also use this as bias to make sure exactly one cell finds points
   // located at the cell boundary
-  double const tolerance = 1.e-8;
+  double const tolerance = 1.e-6;
 
-  // Get bounding box from mapping, and slightly increase its size to
-  // account for strongly deformed cells by increasing the relative size
-  // by a factor 1.2
+  // Get bounding box from mapping, and slightly increase its size to account
+  // for strongly deformed cells by increasing the relative size by a factor
+  // 1.2. The factor is heuristic; a worst-case estimate would be to take the
+  // Lebesgue constant of the LGL points, but that does not exclude the cases
+  // that are only possible when the mapping inside the cell is not
+  // invertible. For valid mappings and with reasonable mesh quality, taking a
+  // 20% larger box compared to the union of all support points of a
+  // polynomial is very generous because leaving this enlarged box requires
+  // extreme polynomial deformation to have a point outside the bounding box
+  // of all support points. Inside the algorithm, we assert the case that we
+  // actually found all points on all lines exactly once and throw an
+  // assertion of that assumption fails, to cover up the invalid case.
   dealii::BoundingBox<dim> const mapping_bounding_box = mapping.get_bounding_box(cell);
   dealii::BoundingBox<dim> const bounding_box = mapping_bounding_box.create_extended_relative(0.2);
 
@@ -134,7 +143,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::extract_line_data_on_cell(
 
             if(point_within_cell)
             {
-              evaluates_velocity_on_any_line = true;
+              if(velocity_has_to_be_evaluated == true)
+                evaluates_velocity_on_any_line = true;
               if(not found_a_point_on_this_cell)
               {
                 cells_and_ref_points[line_iterator].emplace_back(
@@ -243,12 +253,13 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
                                         dealii::numbers::invalid_unsigned_int);
     std::vector<dealii::types::global_dof_index> pressure_dof_indices(
       dof_handler_pressure.get_fe().dofs_per_cell);
-    // For velocity and pressure quantities:
+
+    // Main loop to identify the line points
     for(auto const & cell : dof_handler_velocity.active_cell_iterators())
     {
       if(cell->is_locally_owned())
       {
-        extract_line_data_on_cell(cell);
+        intersect_lines_with_cell(cell);
 
         typename dealii::DoFHandler<dim>::active_cell_iterator cell_p =
           cell->as_dof_handler_iterator(dof_handler_pressure);
@@ -349,6 +360,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
         for(unsigned int i = 0; i < pts.size(); ++i)
           inverse_jacobians_on_lines.push_back(fe_point_eval.jacobian(i).covariant_form());
       }
+
+    assert_all_line_points_are_found();
 
     dof_indices_on_cell.clear();
     dealii::internal::MatrixFreeFunctions::ShapeInfo<Number> shape_info(
@@ -535,7 +548,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
             &dof_handler_velocity);
           AssertThrow(cell->is_locally_owned(), dealii::ExcInternalError());
 
-          bool const evaluates_velocity = extract_line_data_on_cell(cell);
+          bool const evaluates_velocity = intersect_lines_with_cell(cell);
 
           if(evaluates_velocity)
           {
@@ -642,6 +655,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
           inverse_jacobians_on_lines.push_back(fe_point_eval.jacobian(i).covariant_form());
       }
 
+    assert_all_line_points_are_found();
+
     polynomials_nodal =
       dealii::Polynomials::generate_complete_Lagrange_basis(gauss_1d.get_points());
 
@@ -689,12 +704,16 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::evaluate(
   do_evaluate(velocity, pressure, time_step_size_for_sampling);
 }
 
+
+
 template<int dim, typename Number>
 void
 LinePlotCalculatorStatisticsHomogeneous<dim, Number>::write_output() const
 {
   do_write_output();
 }
+
+
 
 template<int dim, typename Number>
 void
@@ -705,6 +724,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::print_headline(
   f << "number of samples: N = " << number_of_samples << " representing a time span of "
     << accumulated_time << std::endl;
 }
+
+
 
 void
 mpi_sum_at_root(double * data_ptr, const unsigned int size, const MPI_Comm mpi_comm)
@@ -722,19 +743,18 @@ mpi_sum_at_root(double * data_ptr, const unsigned int size, const MPI_Comm mpi_c
 }
 
 
-using namespace dealii;
 
 template<int templ_stride_in, int templ_stride_out, typename Number>
 void
-apply_matrix_vector_vect_eo(const VectorizedArray<Number> * matrix,
-                            const Number *                  in,
-                            Number *                        out,
-                            const int                       n_rows,
-                            const int                       n_cols,
-                            const int                       run_stride_in  = 0,
-                            const int                       run_stride_out = 0)
+apply_matrix_vector_vect_eo(const dealii::VectorizedArray<Number> * matrix,
+                            const Number *                          in,
+                            Number *                                out,
+                            const int                               n_rows,
+                            const int                               n_cols,
+                            const int                               run_stride_in  = 0,
+                            const int                               run_stride_out = 0)
 {
-  const unsigned int n_lanes    = VectorizedArray<Number>::size();
+  const unsigned int n_lanes    = dealii::VectorizedArray<Number>::size();
   const int          stride_in  = templ_stride_in > 0 ? templ_stride_in : run_stride_in;
   const int          stride_out = templ_stride_out > 0 ? templ_stride_out : run_stride_out;
 
@@ -744,10 +764,10 @@ apply_matrix_vector_vect_eo(const VectorizedArray<Number> * matrix,
   const int      n_actual_cols = (n_cols + 1) / 2;
   if(n_chunks == 1)
   {
-    Number                  x_p   = (*in + *in_back);
-    Number                  x_m   = (*in - *in_back);
-    VectorizedArray<Number> sum_p = matrix[0] * x_p;
-    VectorizedArray<Number> sum_m = matrix[1] * x_m;
+    Number                          x_p   = (*in + *in_back);
+    Number                          x_m   = (*in - *in_back);
+    dealii::VectorizedArray<Number> sum_p = matrix[0] * x_p;
+    dealii::VectorizedArray<Number> sum_m = matrix[1] * x_m;
     for(int i = 1; i < n_actual_cols; ++i)
     {
       in += stride_in;
@@ -757,8 +777,8 @@ apply_matrix_vector_vect_eo(const VectorizedArray<Number> * matrix,
       sum_p += matrix[2 * i] * x_p;
       sum_m += matrix[2 * i + 1] * x_m;
     }
-    const VectorizedArray<Number> result_p = sum_p + sum_m;
-    const VectorizedArray<Number> result_m = sum_p - sum_m;
+    const dealii::VectorizedArray<Number> result_p = sum_p + sum_m;
+    const dealii::VectorizedArray<Number> result_m = sum_p - sum_m;
     for(int i = 0; i < n_actual_rows; ++i, out += stride_out)
       *out = result_p[i];
     for(int i = n_rows / 2 - 1; i >= 0; --i, out += stride_out)
@@ -766,7 +786,8 @@ apply_matrix_vector_vect_eo(const VectorizedArray<Number> * matrix,
   }
   else
     AssertThrow(false,
-                ExcNotImplemented("Implement some loop unrolling n=" + std::to_string(n_rows)));
+                dealii::ExcNotImplemented("Implement some loop unrolling n=" +
+                                          std::to_string(n_rows)));
 }
 
 
@@ -983,9 +1004,10 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
   std::vector<Number>                                              tmp_array;
   std::array<dealii::ndarray<VectorizedArrayType, 2, dim - 1>, 20> shapes_2d;
 
-  std::vector<Tensor<1, dim, VectorizedArrayType>> velocities_in_averaging_direction(n_q_points_1d);
-  std::vector<Tensor<2, dim, VectorizedArrayType>> velocity_gradients_in_averaging_direction(
+  std::vector<dealii::Tensor<1, dim, VectorizedArrayType>> velocities_in_averaging_direction(
     n_q_points_1d);
+  std::vector<dealii::Tensor<2, dim, VectorizedArrayType>>
+    velocity_gradients_in_averaging_direction(n_q_points_1d);
 
   dealii::Table<2, Number> shapes_avg_direction(gauss_1d.size(), polynomials_nodal.size());
   for(unsigned int q = 0; q < gauss_1d.size(); ++q)
@@ -1512,6 +1534,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
   time_all += time.wall_time();
 }
 
+
+
 template<int dim, typename Number>
 void
 LinePlotCalculatorStatisticsHomogeneous<dim, Number>::average_pressure_for_given_point(
@@ -1566,6 +1590,98 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::average_pressure_for_given
     }
   }
 }
+
+
+
+template<int dim, typename Number>
+void
+LinePlotCalculatorStatisticsHomogeneous<dim, Number>::assert_all_line_points_are_found() const
+{
+  std::size_t total_length = 0;
+  for(auto const & line : data.lines)
+    total_length += line->n_points;
+
+  unsigned int        offset_arrays = 0;
+  unsigned int        counter_line  = 0;
+  std::vector<double> computed_z_length(total_length, 0.);
+  for(unsigned int index = 0; index < data.lines.size(); ++index)
+  {
+    for(auto const & [_, point_list] : cells_and_ref_points[index])
+      for(const auto & point_id : point_list)
+        computed_z_length[offset_arrays + point_id.first] +=
+          1.0 /
+          inverse_jacobians_on_lines[counter_line++][averaging_direction][averaging_direction];
+    offset_arrays += data.lines[index]->n_points;
+  }
+  AssertThrow(counter_line == inverse_jacobians_on_lines.size(),
+              dealii::ExcDimensionMismatch(counter_line, inverse_jacobians_on_lines.size()));
+
+  mpi_sum_at_root(computed_z_length.data(),
+                  computed_z_length.size(),
+                  dof_handler_velocity.get_mpi_communicator());
+
+  // on the root process, actually generate the error message in case we
+  // failed
+  if(dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0)
+  {
+    // Determine the expected length of the channel by finding the smallest
+    // non-zero length of the computed lengths (we don't know it at this point
+    // and don't want to compute it separately). We expect possible errors to
+    // be multiples of this value.
+    double expected_length = std::numeric_limits<double>::infinity();
+    for(const double a : computed_z_length)
+      if(a > 0)
+        expected_length = std::min(expected_length, a);
+    std::vector<std::array<unsigned int, 2>> points_not_found;
+    std::vector<std::array<unsigned int, 3>> points_found_several_times;
+    for(unsigned int line = 0, index = 0; line < data.lines.size(); ++line)
+    {
+      for(unsigned int i = 0; i < data.lines[line]->n_points; ++i, ++index)
+        if(computed_z_length[index] == 0)
+          points_not_found.push_back(std::array<unsigned int, 2>{{line, i}});
+        else if(std::abs(computed_z_length[index] - expected_length) > 1e-12 * expected_length)
+          points_found_several_times.push_back(std::array<unsigned int, 3>{
+            {line,
+             i,
+             static_cast<unsigned int>(1.00001 * computed_z_length[index] / expected_length)}});
+    }
+    if(!points_not_found.empty() || !points_found_several_times.empty())
+    {
+      std::string error_string = "The identification of points for line plots was not ";
+      error_string += "successful. There were " + std::to_string(points_not_found.size()) +
+                      +" points not found at all ";
+      for(const auto & pt : points_not_found)
+      {
+        error_string += "[on line " + std::to_string(pt[0]) + " coord (";
+        for(unsigned int d = 0; d < dim; ++d)
+          error_string += std::to_string(global_points[pt[0]][pt[1]][d]) + (d + 1 < dim ? " " : "");
+        error_string += ")] ";
+      }
+      error_string += "and " + std::to_string(points_found_several_times.size()) +
+                      +" points found on multiple cells ";
+      for(const auto & pt : points_found_several_times)
+      {
+        error_string += "[on line " + std::to_string(pt[0]) + " coord (";
+        for(unsigned int d = 0; d < dim; ++d)
+          error_string += std::to_string(global_points[pt[0]][pt[1]][d]) + (d + 1 < dim ? " " : "");
+        error_string += ") found " + std::to_string(pt[2]) + " times] ";
+      }
+      error_string += '\n';
+      error_string += "Possible reasons are: \n";
+      error_string += "  - Point outside mesh (most likely) -> check manifold and tolerances\n";
+      error_string += "  - Geometry not uniformly sized in averaging direction -> check geometry\n";
+      error_string += "  - Points found on several cells -> check tolerances in" +
+                      std::string(" LinePlotCalculatorStatisticsHomogeneous\n");
+      error_string += "  - Search for cells surrounding point failed because" +
+                      std::string("bounding box around mapping support point was too tight") +
+                      " -> check tolerances in LinePlotCalculatorStatisticsHomogeneous";
+      AssertThrow(points_not_found.empty() && points_found_several_times.empty(),
+                  dealii::ExcMessage(error_string));
+    }
+  }
+}
+
+
 
 template<int dim, typename Number>
 void

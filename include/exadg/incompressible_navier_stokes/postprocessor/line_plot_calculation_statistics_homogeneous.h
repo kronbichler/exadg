@@ -86,8 +86,20 @@ public:
   TimeControlStatistics time_control_statistics;
 
 private:
+  /**
+   * This function computes, for every line in the given line plot statistics,
+   * whether the given cell intersects with the line and if it does, stores
+   * the reference coordinates of the line points on that cell in the
+   * cells_and_ref_points data member of this class. The function returns a
+   * 'true' value in case any of the points on the lines intersects with the
+   * cell and needs the velocity, in order to be able to construct the related
+   * solution representation.
+   */
   bool
-  extract_line_data_on_cell(const typename dealii::DoFHandler<dim>::active_cell_iterator &cell);
+  intersect_lines_with_cell(const typename dealii::DoFHandler<dim>::active_cell_iterator & cell);
+
+  void
+  assert_all_line_points_are_found() const;
 
   void
   print_headline(std::ofstream & f, unsigned int const number_of_samples) const;
