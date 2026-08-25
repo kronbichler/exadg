@@ -829,10 +829,10 @@ private:
 
       // We will represent the next coarser mesh starting from a base mesh of
       // 9 elements in vertical direction, which will be refined once more to
-      // get to 18 cells. Since the 9 mesh elements will be matched with a
-      // 12-cell base mesh, and we assumed the fine-level mesh to have started
-      // from 3 vertical cells, we need to multiply the x and z refinements by
-      // 4 to get the same number of cells.
+      // get to 18 cells for the coarsening. Since the 9 mesh elements will be
+      // matched with a 12-cell base mesh, and we assumed the fine-level mesh
+      // to have started from 3 vertical cells, we need to multiply the x and
+      // z refinements by 4 to get the same number of cells.
       std::vector<unsigned int> refinements2{4 * coarse_mesh_refinements[0],
                                              9,
                                              4 * coarse_mesh_refinements[2]};
@@ -860,9 +860,7 @@ private:
         periodic_face_pairs;
       dealii::GridTools::collect_periodic_faces(*tria2, 0 + 10, 1 + 10, 0, periodic_face_pairs);
       if(dim == 3)
-      {
         dealii::GridTools::collect_periodic_faces(*tria2, 2 + 10, 3 + 10, 2, periodic_face_pairs);
-      }
 
       tria2->add_periodicity(periodic_face_pairs);
 
@@ -876,34 +874,31 @@ private:
       // mesh, using 3 layers both at the y-bottom and y-top region of 3
       // coarse cells (6 fine cells). On the other hand, the position of the
       // central part will be matched with the fine size.
-      tria2->refine_global(1);
-      const dealii::Triangulation<dim> & tria = *grid.triangulation;
-      AssertThrow(tria.n_levels() >= 4,
-                  dealii::ExcMessage("Expected to have at least 4 levels on the mesh when entering "
-                                     "this code path. Do you use more processes than mesh cells?"));
-      const double        size_y = tria.begin(3)->vertex(2)[1] - tria.begin(3)->vertex(0)[1];
-      std::vector<double> new_position(19);
-      new_position[0] = p_1[1];
-      new_position[1] = p_1[1] + 2 * size_y;
-      new_position[2] = p_1[1] + 4 * size_y;
-      new_position[3] = p_1[1] + 6 * size_y;
-      for(unsigned int i = 4; i < 16; ++i)
-        new_position[i] = p_1[1] + (i + 3) * size_y;
-      new_position[16] = p_1[1] + 20 * size_y;
-      new_position[17] = p_1[1] + 22 * size_y;
-      new_position[18] = p_1[1] + 24 * size_y;
-      AssertThrow(std::abs(new_position[18] - p_2[1]) < 1e-12, dealii::ExcInternalError());
-      for(const dealii::Point<dim> & p : tria2->get_vertices())
+
+      // We use a manifold class for this intermediate process because in a
+      // massively parallel computation different scenarios may appear in
+      // articifical cells, which change during refinement and the associated
+      // partitioning.
       {
-        const unsigned int vertical_index =
-          static_cast<unsigned int>(18.000001 * (p[1] - p_1[1]) / (p_2[1] - p_1[1]));
-        const_cast<dealii::Point<dim> &>(p)[1] = new_position[vertical_index];
+        const double                       size_y   = (p_2[1] - p_1[1]) / 24;
+        const double                       size_y_2 = (p_2[1] - p_1[1]) / 18;
+        std::vector<std::array<double, 2>> pieces(4);
+        pieces[0] = {{p_1[1], p_1[1]}};
+        pieces[1] = {{p_1[1] + 3 * size_y_2, p_1[1] + 6 * size_y}};
+        pieces[2] = {{p_1[1] + 15 * size_y_2, p_1[1] + 18 * size_y}};
+        pieces[3] = {{p_1[1] + 18 * size_y_2, p_1[1] + 24 * size_y}};
+        PiecewiseLinearManifold<dim> manifold_2(pieces);
+
+        for(const dealii::Point<dim> & p : tria2->get_vertices())
+          const_cast<dealii::Point<dim> &>(p)[1] = manifold_2.push_forward(p)[1];
+        tria2->set_all_manifold_ids(1);
+        tria2->set_manifold(1, manifold_2);
       }
 
       // Apply the remaining refinements and then append this triangulation to
       // the coarse triangulations stored with the grid, which will be used
       // for the multigrid setup.
-      tria2->refine_global(global_refinements - 3);
+      tria2->refine_global(global_refinements - 2);
       auto mapping2 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
       mapping2->initialize(*tria2, mapping_function_fine);
       grid.coarse_triangulations.push_back(tria2);
@@ -942,33 +937,32 @@ private:
       periodic_face_pairs.clear();
       dealii::GridTools::collect_periodic_faces(*tria3, 0 + 10, 1 + 10, 0, periodic_face_pairs);
       if(dim == 3)
-      {
         dealii::GridTools::collect_periodic_faces(*tria3, 2 + 10, 3 + 10, 2, periodic_face_pairs);
-      }
+
       tria3->add_periodicity(periodic_face_pairs);
 
       // Move vertices to fit with the next finer mesh: We want to aggregate 2
       // layers of mesh elements closest to the boundary from the previous
-      // round into one cell layer. We pick up the values from the previous
-      // round to not make mistakes here.
-      tria3->refine_global(3);
-      std::vector<double> new_position3(17);
-      new_position3[0] = new_position[0];
-      new_position3[1] = new_position[2];
-      new_position3[2] = new_position[3];
-      for(unsigned int i = 3; i < 15; ++i)
-        new_position3[i] = new_position[1 + i];
-      new_position3[15] = new_position[16];
-      new_position3[16] = new_position[18];
-      AssertThrow(std::abs(new_position3[16] - p_2[1]) < 1e-12, dealii::ExcInternalError());
-      for(const dealii::Point<dim> & p : tria3->get_vertices())
+      // round into one cell layer.
       {
-        const unsigned int vertical_index =
-          static_cast<unsigned int>(16.000001 * (p[1] - p_1[1]) / (p_2[1] - p_1[1]));
-        const_cast<dealii::Point<dim> &>(p)[1] = new_position3[vertical_index];
+        const double                       size_y   = (p_2[1] - p_1[1]) / 24;
+        const double                       size_y_3 = (p_2[1] - p_1[1]) / 16;
+        std::vector<std::array<double, 2>> pieces(6);
+        pieces[0] = {{p_1[1], p_1[1]}};
+        pieces[1] = {{p_1[1] + size_y_3, p_1[1] + 4 * size_y}};
+        pieces[2] = {{p_1[1] + 2 * size_y_3, p_1[1] + 6 * size_y}};
+        pieces[3] = {{p_1[1] + 14 * size_y_3, p_1[1] + 18 * size_y}};
+        pieces[4] = {{p_1[1] + 15 * size_y_3, p_1[1] + 20 * size_y}};
+        pieces[5] = {{p_1[1] + 16 * size_y_3, p_1[1] + 24 * size_y}};
+        PiecewiseLinearManifold<dim> manifold_3(pieces);
+
+        for(const dealii::Point<dim> & p : tria3->get_vertices())
+          const_cast<dealii::Point<dim> &>(p)[1] = manifold_3.push_forward(p)[1];
+        tria3->set_all_manifold_ids(1);
+        tria3->set_manifold(1, manifold_3);
       }
 
-      tria3->refine_global(global_refinements - 3);
+      tria3->refine_global(global_refinements);
       auto mapping3 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
       mapping3->initialize(*tria3, mapping_function_fine);
       grid.coarse_triangulations.push_back(tria3);
