@@ -200,13 +200,23 @@ private:
 
   double factor_cfl;
 
-  // iteration counts
-  std::pair<unsigned int /* calls */, unsigned long long /* iteration counts */>
-    iterations_pressure;
-  std::pair<
-    unsigned int /* calls */,
-    std::tuple<unsigned long long, unsigned long long> /* iteration counts {Newton, linear} */>
-    iterations_viscous;
+  // iteration counts and solver info
+  Utilities::StatisticalQuantity stat_pressure_iterations;
+  Utilities::StatisticalQuantity stat_pressure_rhs_norm;
+  Utilities::StatisticalQuantity stat_pressure_residual_start;
+  Utilities::StatisticalQuantity stat_pressure_residual_stop;
+  Utilities::StatisticalQuantity stat_pressure_time_rhs;
+  Utilities::StatisticalQuantity stat_pressure_time_projection;
+  Utilities::StatisticalQuantity stat_pressure_time_solve;
+
+  Utilities::StatisticalQuantity stat_momentum_iterations;
+  Utilities::StatisticalQuantity stat_momentum_rhs_norm;
+  Utilities::StatisticalQuantity stat_momentum_residual_start;
+  Utilities::StatisticalQuantity stat_momentum_residual_stop;
+  Utilities::StatisticalQuantity stat_momentum_time_rhs;
+  Utilities::StatisticalQuantity stat_momentum_time_projection;
+  Utilities::StatisticalQuantity stat_momentum_time_dp_residual;
+  Utilities::StatisticalQuantity stat_momentum_time_solve;
 
   // time integrator constants: extrapolation scheme
   ExtrapolationConstants extra_pressure_nbc;
