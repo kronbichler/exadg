@@ -478,6 +478,9 @@ public:
                         points_per_line,
                         "Points per line in vertical direction.",
                         dealii::Patterns::Integer(1, 10000));
+      prm.add_parameter("SubdirectoryStatisticsData",
+                        subdirectory_statistics,
+                        "Subdirectory for storing statistical data analysis.");
       prm.add_parameter("CoarseMeshRefinements",
                         coarse_mesh_refinements,
                         "Number of elements in coarse mesh in x,y,z-direction.");
@@ -1116,7 +1119,8 @@ private:
     my_pp_data.pp_data = pp_data;
 
     // line plot data: calculate statistics along lines
-    my_pp_data.line_plot_data.directory = this->output_parameters.directory;
+    my_pp_data.line_plot_data.directory =
+      this->output_parameters.directory + subdirectory_statistics;
 
     // mean velocity
     std::shared_ptr<Quantity> quantity_velocity;
@@ -1351,8 +1355,9 @@ private:
 
     // calculation of flow rate (use volume-based computation)
     my_pp_data.mean_velocity_data.calculate = true;
-    my_pp_data.mean_velocity_data.directory = this->output_parameters.directory;
-    my_pp_data.mean_velocity_data.filename  = this->output_parameters.filename + "_flow_rate";
+    my_pp_data.mean_velocity_data.directory =
+      this->output_parameters.directory + subdirectory_statistics;
+    my_pp_data.mean_velocity_data.filename = this->output_parameters.filename + "_flow_rate";
     dealii::Tensor<1, dim, double> direction;
     direction[0]                                = 1.0;
     my_pp_data.mean_velocity_data.direction     = direction;
@@ -1375,9 +1380,9 @@ private:
   // while after applying the mapping, the lower bottom of the box (lying at y = height_hill) is
   // mapped in negative y direction to form the classical periodic hill domain, with the
   // minimum position in y direction being y=0.
-  static double constexpr height_hill                = 0.028;
-  double width_channel                               = 4.5 * height_hill;
-  static double constexpr length_channel             = 9.0 * height_hill;
+  static double constexpr height_hill    = 0.028;
+  double width_channel                   = 4.5 * height_hill;
+  static double constexpr length_channel = 9.0 * height_hill;
   // Note that the 2.03*6* is not a typo, but matches
   // Breuer et al., 2009, Computers & Fluids, https://doi.org/10.1016/j.compfluid.2008.05.002
   static double constexpr height_channel_at_hill_top = 2.036 * height_hill;
@@ -1436,6 +1441,7 @@ private:
   double       sample_end_time        = end_time;
   unsigned int sample_every_timesteps = 1;
   unsigned int points_per_line        = 40;
+  std::string  subdirectory_statistics;
 };
 
 } // namespace IncNS
