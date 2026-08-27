@@ -1616,9 +1616,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::assert_all_line_points_are
   AssertThrow(counter_line == inverse_jacobians_on_lines.size(),
               dealii::ExcDimensionMismatch(counter_line, inverse_jacobians_on_lines.size()));
 
-  mpi_sum_at_root(computed_z_length.data(),
-                  computed_z_length.size(),
-                  dof_handler_velocity.get_mpi_communicator());
+  mpi_sum_at_root(computed_z_length.data(), computed_z_length.size(), mpi_comm);
 
   // on the root process, actually generate the error message in case we
   // failed
@@ -1649,7 +1647,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::assert_all_line_points_are
     {
       std::string error_string = "The identification of points for line plots was not ";
       error_string += "successful. There were " + std::to_string(points_not_found.size()) +
-                      +" points not found at all ";
+                      " points not found at all ";
       for(const auto & pt : points_not_found)
       {
         error_string += "[on line " + std::to_string(pt[0]) + " coord (";
@@ -1658,7 +1656,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::assert_all_line_points_are
         error_string += ")] ";
       }
       error_string += "and " + std::to_string(points_found_several_times.size()) +
-                      +" points found on multiple cells ";
+                      " points found on multiple cells ";
       for(const auto & pt : points_found_several_times)
       {
         error_string += "[on line " + std::to_string(pt[0]) + " coord (";
