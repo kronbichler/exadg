@@ -1381,9 +1381,9 @@ private:
   // while after applying the mapping, the lower bottom of the box (lying at y = height_hill) is
   // mapped in negative y direction to form the classical periodic hill domain, with the
   // minimum position in y direction being y=0.
-  static double constexpr height_hill                = 0.028;
-  double width_channel                               = 4.5 * height_hill;
-  static double constexpr length_channel             = 9.0 * height_hill;
+  static double constexpr height_hill    = 0.028;
+  double width_channel                   = 4.5 * height_hill;
+  static double constexpr length_channel = 9.0 * height_hill;
   // Note that the 2.03*6* is not a typo, but matches
   // Breuer et al., 2009, Computers & Fluids, https://doi.org/10.1016/j.compfluid.2008.05.002
   static double constexpr height_channel_at_hill_top = 2.036 * height_hill;
