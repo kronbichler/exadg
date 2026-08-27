@@ -22,6 +22,10 @@
 #ifndef EXADG_UTILITIES_NUMBERS_H_
 #define EXADG_UTILITIES_NUMBERS_H_
 
+// deal.II
+#include <deal.II/base/mpi.h>
+#include <deal.II/base/numbers.h>
+
 // C/C++
 #include <cmath>
 #include <iomanip>
@@ -110,14 +114,38 @@ struct StatisticalQuantity
 
   template<typename StreamType>
   void
-  print_statistics(StreamType & stream, const std::string & name, const unsigned int width) const
+  print_statistics(StreamType &        stream,
+                   const std::string & name,
+                   const unsigned int  width,
+                   MPI_Comm const *    mpi_comm = nullptr) const
   {
+    double      min_print  = n_samples > 0 ? min_value : std::numeric_limits<double>::quiet_NaN();
+    double      max_print  = n_samples > 0 ? max_value : std::numeric_limits<double>::quiet_NaN();
+    double      mean_print = get_mean();
+    double      geometric_mean_print = get_geometric_mean();
+    std::size_t max_index_print      = max_index;
+    std::size_t min_index_print      = min_index;
+    if(mpi_comm != nullptr)
+    {
+      // Consider the maximum over all participating ranks.
+      min_print            = dealii::Utilities::MPI::max(min_print, *mpi_comm);
+      max_print            = dealii::Utilities::MPI::max(max_print, *mpi_comm);
+      mean_print           = dealii::Utilities::MPI::max(mean_print, *mpi_comm);
+      geometric_mean_print = dealii::Utilities::MPI::max(geometric_mean_print, *mpi_comm);
+
+      // The index information is not communicated.
+      max_index_print = dealii::numbers::invalid_size_type;
+      min_index_print = dealii::numbers::invalid_size_type;
+    }
+
     stream << "  " << std::left << std::setw(width) << name << " " << std::right << std::setw(8)
-           << std::setprecision(2) << min_value << " (idx" << std::setw(6) << min_index << ")  "
-           << std::setw(8) << get_geometric_mean() << "  " << std::setw(8) << get_mean() << "  (idx"
-           << std::setw(6) << max_index << ") " << std::setw(8) << max_value << std::endl;
+           << std::setprecision(2) << min_print << " (idx" << std::setw(6) << min_index_print
+           << ")  " << std::setw(8) << geometric_mean_print << "  " << std::setw(8) << mean_print
+           << "  (idx" << std::setw(6) << max_index_print << ") " << std::setw(8) << max_print
+           << std::endl;
   }
 
+private:
   std::size_t n_samples;
   double      min_value;
   std::size_t min_index;

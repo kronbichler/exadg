@@ -951,30 +951,36 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
 
   print_list_of_iterations(this->pcout, names, iterations_avg);
 
-  if(dealii::Utilities::MPI::this_mpi_process(velocity[0].get_mpi_communicator()) == 0)
-  {
-    std::cout << std::endl
+  this->pcout << std::endl
               << "Detailed statistics of consistent splitting solver" << std::endl
               << "  Category                     min          geometric mean  "
               << "arithmetic mean       max" << std::scientific << std::endl;
-    stat_pressure_iterations.print_statistics(std::cout, "Pressure iterations", 25);
-    stat_pressure_rhs_norm.print_statistics(std::cout, "P rhs norm", 25);
-    stat_pressure_residual_start.print_statistics(std::cout, "P residual start solve", 25);
-    stat_pressure_residual_stop.print_statistics(std::cout, "P residual end solve", 25);
-    stat_pressure_time_rhs.print_statistics(std::cout, "P time rhs [s]", 25);
-    stat_pressure_time_projection.print_statistics(std::cout, "P time projection [s]", 25);
-    stat_pressure_time_solve.print_statistics(std::cout, "P time solve [s]", 25);
-    std::cout << std::endl;
-    stat_momentum_iterations.print_statistics(std::cout, "Momentum iterations", 25);
-    stat_momentum_rhs_norm.print_statistics(std::cout, "U rhs norm", 25);
-    stat_momentum_residual_start.print_statistics(std::cout, "U residual start solve", 25);
-    stat_momentum_residual_stop.print_statistics(std::cout, "U residual end solve", 25);
-    stat_momentum_time_rhs.print_statistics(std::cout, "U time rhs [s]", 25);
-    stat_momentum_time_projection.print_statistics(std::cout, "U time projection [s]", 25);
-    stat_momentum_time_dp_residual.print_statistics(std::cout, "U time residual FP64 [s]", 25);
-    stat_momentum_time_solve.print_statistics(std::cout, "U time solve [s]", 25);
-    std::cout << std::endl;
-  }
+  stat_pressure_iterations.print_statistics(this->pcout, "Pressure iterations", 25);
+  stat_pressure_rhs_norm.print_statistics(this->pcout, "P rhs norm", 25);
+  stat_pressure_residual_start.print_statistics(this->pcout, "P residual start solve", 25);
+  stat_pressure_residual_stop.print_statistics(this->pcout, "P residual end solve", 25);
+  stat_pressure_time_rhs.print_statistics(this->pcout, "P time rhs [s]", 25, &this->mpi_comm);
+  stat_pressure_time_projection.print_statistics(this->pcout,
+                                                 "P time projection [s]",
+                                                 25,
+                                                 &this->mpi_comm);
+  stat_pressure_time_solve.print_statistics(this->pcout, "P time solve [s]", 25, &this->mpi_comm);
+  this->pcout << std::endl;
+  stat_momentum_iterations.print_statistics(this->pcout, "Momentum iterations", 25);
+  stat_momentum_rhs_norm.print_statistics(this->pcout, "U rhs norm", 25);
+  stat_momentum_residual_start.print_statistics(this->pcout, "U residual start solve", 25);
+  stat_momentum_residual_stop.print_statistics(this->pcout, "U residual end solve", 25);
+  stat_momentum_time_rhs.print_statistics(this->pcout, "U time rhs [s]", 25, &this->mpi_comm);
+  stat_momentum_time_projection.print_statistics(this->pcout,
+                                                 "U time projection [s]",
+                                                 25,
+                                                 &this->mpi_comm);
+  stat_momentum_time_dp_residual.print_statistics(this->pcout,
+                                                  "U time residual FP64 [s]",
+                                                  25,
+                                                  &this->mpi_comm);
+  stat_momentum_time_solve.print_statistics(this->pcout, "U time solve [s]", 25, &this->mpi_comm);
+  this->pcout << std::endl;
 }
 
 template<int dim, typename Number>
