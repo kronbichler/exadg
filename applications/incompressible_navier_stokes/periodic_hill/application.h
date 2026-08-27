@@ -639,9 +639,9 @@ private:
 
     // Linear solver tolerances are stricter for convergence study runs to achieve lower errors.
     double const abs_tol_lin            = convergence_study ? 1.0e-18 : 1.0e-12;
-    double const rel_tol_lin_ppe        = convergence_study ? 1.0e-09 : 1.0e-05;
+    double const rel_tol_lin_ppe        = convergence_study ? 1.0e-09 : 5.0e-06;
     double const rel_tol_lin_projection = convergence_study ? 1.0e-09 : 1.0e-06;
-    double const rel_tol_lin_momentum   = convergence_study ? 1.0e-09 : 1.0e-08;
+    double const rel_tol_lin_momentum   = convergence_study ? 1.0e-09 : 5.0e-10;
     double const rel_tol_lin_mass       = convergence_study ? 1.0e-09 : 1.0e-04;
 
     // pressure Poisson equation
