@@ -155,7 +155,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::intersect_lines_with_cell(
                 p, dealii::GeometryInfo<dim>::project_to_unit_cell(p_unit));
             }
           }
-          catch(dealii::Mapping<dim>::ExcTransformationFailed &)
+          catch(typename dealii::Mapping<dim>::ExcTransformationFailed &)
           {
           }
       }
@@ -317,7 +317,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
                                 dealii::Point<dim>>(cell, p_unit));
                   }
                 }
-                catch(dealii::Mapping<dim>::ExcTransformationFailed &)
+                catch(typename dealii::Mapping<dim>::ExcTransformationFailed &)
                 {
                 }
             }
@@ -621,7 +621,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
                                 dealii::Point<dim>>(cell, p_unit));
                   }
                 }
-                catch(dealii::Mapping<dim>::ExcTransformationFailed &)
+                catch(typename dealii::Mapping<dim>::ExcTransformationFailed &)
                 {
                 }
             }
