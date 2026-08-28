@@ -172,7 +172,7 @@ MeanVelocityCalculator<dim, Number>::write_output(Number const &      value,
       if(clear_files == true)
       {
         f.open(filename.c_str(), std::ios::trunc);
-        f << std::endl << "  Time                " + name << std::endl;
+        f << std::endl << "# Time                " + name << std::endl;
 
         clear_files = false;
       }

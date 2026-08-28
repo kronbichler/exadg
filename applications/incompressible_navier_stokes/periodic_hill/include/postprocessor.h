@@ -240,7 +240,7 @@ private:
         if(clear_files == true)
         {
           f.open(filename.c_str(), std::ios::trunc);
-          f << std::endl << "  Time                Mean velocity [m/s]" << std::endl;
+          f << std::endl << "# Time                Mean velocity [m/s]" << std::endl;
 
           clear_files = false;
         }
