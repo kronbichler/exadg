@@ -133,9 +133,8 @@ struct StatisticalQuantity
       mean_print           = dealii::Utilities::MPI::max(mean_print, *mpi_comm);
       geometric_mean_print = dealii::Utilities::MPI::max(geometric_mean_print, *mpi_comm);
 
-      // The index information is not communicated.
-      max_index_print = dealii::numbers::invalid_size_type;
-      min_index_print = dealii::numbers::invalid_size_type;
+      // The index information is not communicated, so we might be somewhat off
+      // here. Nonetheless, it can be expected that some hint is still possible.
     }
 
     stream << "  " << std::left << std::setw(width) << name << " " << std::right << std::setw(8)
