@@ -58,8 +58,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
     pressure_nbc_rhs(this->param.order_extrapolation_pressure_nbc),
     factors_time_step_mass{},
     factor_cfl(-1.0),
-    iterations_pressure({0, 0}),
-    iterations_viscous({0, {0, 0}}),
     extra_pressure_nbc(this->param.order_extrapolation_pressure_nbc,
                        this->param.start_with_low_order),
     extra_pressure_rhs(this->param.order_extrapolation_pressure_rhs,
@@ -449,6 +447,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
   rhs_pressure(pressure_rhs);
 
   const double t_rhs = timer.wall_time();
+  stat_pressure_time_rhs.add_sample(t_rhs);
 
   // projection solution from previous time steps to get a good initial
   // estimate for the solver, following the algorithm by Loehner, 'Projective
@@ -469,6 +468,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
     pressure_matvec.back().copy_locally_owned_data_from(pressure_rhs);
   }
   const double t_extrapol = timer2.wall_time();
+  stat_pressure_time_projection.add_sample(t_extrapol);
   timer2.restart();
 
   // Solve linear system of equations: Try if we can converge in single
@@ -493,9 +493,13 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
     n_iter.second = control.last_value();
   }
 
-  iterations_pressure.first += 1;
-  iterations_pressure.second += n_iter.first;
   const double t_sol = timer2.wall_time();
+
+  stat_pressure_iterations.add_sample(n_iter.first);
+  stat_pressure_rhs_norm.add_sample(extrapolate_accuracy.first);
+  stat_pressure_residual_start.add_sample(extrapolate_accuracy.second);
+  stat_pressure_residual_stop.add_sample(n_iter.second);
+  stat_pressure_time_solve.add_sample(t_sol);
 
   // special case: pressure level is undefined
   // Adjust the pressure level in order to allow a calculation of the pressure error.
@@ -635,6 +639,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       right_hand_side);
 
     const double t_rhs = timer.wall_time();
+    stat_momentum_time_rhs.add_sample(t_rhs);
 
     dealii::Timer timer2;
 
@@ -683,6 +688,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                                                         local_sums,
                                                         projection_vector);
     const double t_proj  = timer2.wall_time();
+    stat_momentum_time_projection.add_sample(t_proj);
     timer2.restart();
 
     if(preconditioner_viscous.get_vector().get_partitioner().get() !=
@@ -727,6 +733,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     velocity_red.back() = 0.f;
 
     const double t_residual = timer2.wall_time();
+    stat_momentum_time_dp_residual.add_sample(t_residual);
     timer2.restart();
 
     dealii::SolverControl control(this->param.solver_data_momentum.max_iter,
@@ -757,8 +764,11 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                   << "/" << t_residual << " s, solve " << timer2.wall_time() << " s";
     }
 
-    iterations_viscous.first += 1;
-    std::get<1>(iterations_viscous.second) += n_iter;
+    stat_momentum_iterations.add_sample(n_iter);
+    stat_momentum_rhs_norm.add_sample(extrapolate_accuracy.first);
+    stat_momentum_residual_start.add_sample(extrapolate_accuracy.second);
+    stat_momentum_residual_stop.add_sample(control.last_value());
+    stat_momentum_time_solve.add_sample(timer2.wall_time());
 
     if(this->print_solver_info() and not(this->is_test))
     {
@@ -932,16 +942,45 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
   }
   else
   {
-    names = {"Pressure step", "Viscous step"};
+    names = {"Pressure step", "Momentum step"};
 
     iterations_avg.resize(2);
-    iterations_avg[0] =
-      (double)iterations_pressure.second / std::max(1., (double)iterations_pressure.first);
-    iterations_avg[1] = (double)std::get<1>(iterations_viscous.second) /
-                        std::max(1., (double)iterations_viscous.first);
+    iterations_avg[0] = stat_pressure_iterations.get_mean();
+    iterations_avg[1] = stat_momentum_iterations.get_mean();
   }
 
   print_list_of_iterations(this->pcout, names, iterations_avg);
+
+  this->pcout << std::endl
+              << "Detailed statistics of consistent splitting solver" << std::endl
+              << "  Category                     min          geometric mean  "
+              << "arithmetic mean       max" << std::scientific << std::endl;
+  stat_pressure_iterations.print_statistics(this->pcout, "Pressure iterations", 25);
+  stat_pressure_rhs_norm.print_statistics(this->pcout, "P rhs norm", 25);
+  stat_pressure_residual_start.print_statistics(this->pcout, "P residual start solve", 25);
+  stat_pressure_residual_stop.print_statistics(this->pcout, "P residual end solve", 25);
+  stat_pressure_time_rhs.print_statistics(this->pcout, "P time rhs [s]", 25, &this->mpi_comm);
+  stat_pressure_time_projection.print_statistics(this->pcout,
+                                                 "P time projection [s]",
+                                                 25,
+                                                 &this->mpi_comm);
+  stat_pressure_time_solve.print_statistics(this->pcout, "P time solve [s]", 25, &this->mpi_comm);
+  this->pcout << std::endl;
+  stat_momentum_iterations.print_statistics(this->pcout, "Momentum iterations", 25);
+  stat_momentum_rhs_norm.print_statistics(this->pcout, "U rhs norm", 25);
+  stat_momentum_residual_start.print_statistics(this->pcout, "U residual start solve", 25);
+  stat_momentum_residual_stop.print_statistics(this->pcout, "U residual end solve", 25);
+  stat_momentum_time_rhs.print_statistics(this->pcout, "U time rhs [s]", 25, &this->mpi_comm);
+  stat_momentum_time_projection.print_statistics(this->pcout,
+                                                 "U time projection [s]",
+                                                 25,
+                                                 &this->mpi_comm);
+  stat_momentum_time_dp_residual.print_statistics(this->pcout,
+                                                  "U time residual FP64 [s]",
+                                                  25,
+                                                  &this->mpi_comm);
+  stat_momentum_time_solve.print_statistics(this->pcout, "U time solve [s]", 25, &this->mpi_comm);
+  this->pcout << std::endl;
 }
 
 template<int dim, typename Number>
