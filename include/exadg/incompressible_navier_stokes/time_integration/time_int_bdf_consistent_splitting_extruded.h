@@ -198,6 +198,15 @@ private:
   VectorType                                                            rhs_rt;
   std::array<double, 6>                                                 factors_time_step_mass;
 
+  using ChebyshevSolver =
+    dealii::PreconditionChebyshev<RTOperator::RaviartThomasOperatorBase<dim, float>,
+                                  VectorTypeFloat,
+                                  dealii::DiagonalMatrix<VectorTypeFloat>>;
+  std::shared_ptr<ChebyshevSolver> momentum_solver_chebyshev;
+  double                           momentum_sliding_condition_number_estimate;
+  double                           momentum_sliding_iteration_count;
+  double                           momentum_sliding_smoothing_range;
+
   double factor_cfl;
 
   // iteration counts and solver info
@@ -216,7 +225,8 @@ private:
   Utilities::StatisticalQuantity stat_momentum_time_rhs;
   Utilities::StatisticalQuantity stat_momentum_time_projection;
   Utilities::StatisticalQuantity stat_momentum_time_dp_residual;
-  Utilities::StatisticalQuantity stat_momentum_time_solve;
+  Utilities::StatisticalQuantity stat_momentum_time_solve_chebyshev;
+  Utilities::StatisticalQuantity stat_momentum_time_solve_cg;
 
   // time integrator constants: extrapolation scheme
   ExtrapolationConstants extra_pressure_nbc;
