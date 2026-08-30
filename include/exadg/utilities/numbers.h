@@ -129,6 +129,12 @@ struct StatisticalQuantity
       return std::numeric_limits<double>::quiet_NaN();
   }
 
+  std::size_t
+  get_n_samples() const
+  {
+    return n_samples;
+  }
+
   template<typename StreamType>
   void
   print_statistics(StreamType &        stream,
