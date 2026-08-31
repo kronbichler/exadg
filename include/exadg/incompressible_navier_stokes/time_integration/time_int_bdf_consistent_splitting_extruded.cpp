@@ -34,6 +34,8 @@
 #include <exadg/time_integration/vector_handling.h>
 #include <exadg/utilities/print_solver_results.h>
 
+#include <algorithm>
+
 namespace ExaDG
 {
 namespace IncNS
@@ -647,7 +649,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
     // solve linear system of equations
     std::pair<double, double> extrapolate_accuracy(0., 0.);
-    unsigned int              n_iter = 0;
+    unsigned int              n_iterations = 0;
 
     const Number factor_mass = this->get_scaling_factor_time_derivative_term();
     const Number factor_lapl = this->pde_operator->get_viscous_kernel_data().viscosity;
@@ -739,14 +741,22 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
     op_rt_float->set_parameters(factor_mass, factor_lapl);
 
-    double reached_residual = std::numeric_limits<double>::signaling_NaN();
+    double reached_residual = std::numeric_limits<double>::quiet_NaN();
 
     // In the startup phase or at certain times, run the CG solver (that gets
     // us a new eigenvalue estimate)
 
+    const double absolute_residual_target =
+      extrapolate_accuracy.first * this->param.solver_data_momentum.rel_tol;
+    const double initial_residual = extrapolate_accuracy.second;
+    AssertThrow(initial_residual > 0.0,
+                dealii::ExcMessage("Got invalid residual norm " +
+                                   std::to_string(initial_residual)));
+    const double max_reduction_float = 1e-7;
+
     const bool try_chebyshev_solver = this->get_time_step_number() > 20 &&
                                       this->get_time_step_number() % 32 != 0 &&
-                                      momentum_solver_chebyshev.get() != nullptr;
+                                      momentum_solver_chebyshev != nullptr;
     bool   used_cg    = false;
     double solve_time = 0;
     if(try_chebyshev_solver)
@@ -759,12 +769,14 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       // because we want to avoid the noise in the norm of the residual upon
       // entry. (We will also use a sliding average for the actual estimate of
       // the condition number further down.)
-      const double required_reduction = extrapolate_accuracy.first *
-                                        this->param.solver_data_momentum.rel_tol /
-                                        extrapolate_accuracy.second;
-      const unsigned int iteration_count_guess =
-        1 + static_cast<unsigned int>(std::log(2. / required_reduction) * 0.5 *
-                                      std::sqrt(momentum_sliding_condition_number_estimate));
+      const double target_reduction    = absolute_residual_target / initial_residual;
+      const double requested_reduction = std::clamp(target_reduction, max_reduction_float, 1.9999);
+
+      // This is a convergence formula for the Chebyshev solver
+      const double iteration_count_guess =
+        std::log(2. / requested_reduction) * 0.5 *
+        std::sqrt(std::max(momentum_sliding_condition_number_estimate, 1.0));
+
       if(momentum_sliding_iteration_count == 0)
         momentum_sliding_iteration_count = iteration_count_guess;
       else
@@ -776,24 +788,37 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
           momentum_sliding_iteration_count =
             0.8 * momentum_sliding_iteration_count + 0.2 * iteration_count_guess;
       }
-      momentum_solver_chebyshev->set_degree(
-        static_cast<unsigned int>(momentum_sliding_iteration_count));
+      n_iterations =
+        std::clamp(static_cast<unsigned int>(std::ceil(momentum_sliding_iteration_count)),
+                   1u,
+                   this->param.solver_data_momentum.max_iter);
+      momentum_solver_chebyshev->set_degree(n_iterations);
 
       reached_residual =
         momentum_solver_chebyshev->vmult_with_last_residual_norm(velocity_red.back(),
                                                                  velocity_matvec.back());
 
       // From the actual residual reduction, we compute an estimate of the
-      // apparent condition number, that is then fed into the sliding average
-      // for determining the iteration in the next step. Note that we subtract
-      // 1 from the iteration count because the guess returned by the
-      // Chebyshev solver indicates the residual one iteration before the end.
-      n_iter = static_cast<unsigned int>(momentum_sliding_iteration_count);
-      momentum_sliding_condition_number_estimate =
-        0.8 * momentum_sliding_condition_number_estimate +
-        0.2 * std::pow((n_iter - 1) /
-                         (0.5 * std::log(2 / (reached_residual / extrapolate_accuracy.second))),
-                       2);
+      // apparent condition number when solving the iteration count formula
+      // for Chebyshev used above for the condition number. The result is then
+      // fed into the sliding average for determining the iteration in the
+      // next step. Note that we subtract 1 from the iteration count because
+      // the guess returned by the Chebyshev solver indicates the residual one
+      // iteration before the end.
+      const double achieved_reduction = reached_residual / initial_residual;
+      if(n_iterations > 1 && achieved_reduction > 0 && achieved_reduction < 2.)
+      {
+        const double denominator = 0.5 * std::log(2.0 / achieved_reduction);
+        if(std::abs(denominator) > max_reduction_float)
+        {
+          const double apparent_condition_number =
+            std::pow(static_cast<double>(n_iterations - 1) / denominator, 2);
+
+          if(std::isfinite(apparent_condition_number) && apparent_condition_number >= 1.0)
+            momentum_sliding_condition_number_estimate =
+              0.8 * momentum_sliding_condition_number_estimate + 0.2 * apparent_condition_number;
+        }
+      }
 
       this->pcout << "Estimate of it count: " << iteration_count_guess << " "
                   << static_cast<unsigned int>(momentum_sliding_iteration_count) << " "
@@ -805,22 +830,36 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                         " f" :
                         "")
                   << " est "
-                  << std::pow((n_iter - 1) / (0.5 * std::log(2 / (reached_residual /
-                                                                  extrapolate_accuracy.second))),
+                  << std::pow((n_iterations - 1) /
+                                (0.5 *
+                                 std::log(2 / (reached_residual / extrapolate_accuracy.second))),
                               2)
                   << " cond " << momentum_sliding_condition_number_estimate << "  time "
                   << timer2.wall_time() << std::endl;
-      solve_time += timer2.wall_time();
-      stat_momentum_time_solve_chebyshev.add_sample(timer2.wall_time());
+      const double elapsed_time = timer2.wall_time();
+      solve_time += elapsed_time;
+      stat_momentum_time_solve_chebyshev.add_sample(elapsed_time);
       timer2.restart();
     }
     else
       velocity_red.back() = 0.f;
 
-    if(not try_chebyshev_solver || reached_residual > 4. * extrapolate_accuracy.first *
-                                                        this->param.solver_data_momentum.rel_tol)
+    // As a fall-back in case the Chebyshev residual does not meet the
+    // tolerance or in case we could not use Chebyshev, we need to use CG. As
+    // to the tolerance, we intentionally choose a rather big failure factor
+    // of 3.0 because the Chebyshev solver actually does one more iteration
+    // after the one where the residual is gathered.
+    const double chebyshev_failure_factor        = 3.0;
+    const double chebyshev_severe_failure_factor = 6.0;
+    const bool   need_cg_solver =
+      !try_chebyshev_solver ||
+      reached_residual > chebyshev_failure_factor * absolute_residual_target;
+    const bool had_severe_chebyshev_failure =
+      try_chebyshev_solver &&
+      reached_residual > chebyshev_severe_failure_factor * absolute_residual_target;
+
+    if(need_cg_solver)
     {
-      used_cg = true;
       dealii::SolverControl control(this->param.solver_data_momentum.max_iter,
                                     extrapolate_accuracy.first *
                                       this->param.solver_data_momentum.rel_tol);
@@ -838,22 +877,23 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                       velocity_red.back(),
                       velocity_matvec.back(),
                       preconditioner_viscous);
-      n_iter           = n_iter + control.last_step();
+      n_iterations += control.last_step();
       reached_residual = control.last_value();
       this->pcout << "Conjugate gradient solver: " << control.last_step() << " "
                   << control.last_value() / extrapolate_accuracy.second << " "
                   << control.last_value() << "  time " << timer2.wall_time() << std::endl;
 
       // Prepare the Chebyshev solver for the other cases in case this is not
-      // the cleanup part (which typically takes a small number of iterations
-      // and thus is unsafe for the eigenvalue estimate)
-      if(not try_chebyshev_solver)
+      // the cleanup part
+      constexpr unsigned int min_eigenvalue_iterations = 5;
+      if(control.last_step() >= min_eigenvalue_iterations && min_eig > 0.0 && max_eig >= min_eig)
       {
-        if(momentum_sliding_condition_number_estimate == 0)
+        if(momentum_sliding_condition_number_estimate <= 0 ||
+           !std::isfinite(momentum_sliding_condition_number_estimate))
           momentum_sliding_condition_number_estimate = max_eig / min_eig;
         else
           momentum_sliding_condition_number_estimate =
-            0.8 * momentum_sliding_condition_number_estimate + 0.2 * max_eig / min_eig;
+            0.9 * momentum_sliding_condition_number_estimate + 0.1 * max_eig / min_eig;
 
         typename ChebyshevSolver::AdditionalData chebyshev_data;
         chebyshev_data.preconditioner.reset(&preconditioner_viscous, [](auto *) {
@@ -871,15 +911,20 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         momentum_solver_chebyshev = std::make_shared<ChebyshevSolver>();
         momentum_solver_chebyshev->initialize(*op_rt_float, chebyshev_data);
       }
-      else
-        // If we got here after failing to meet the tolerance, we should use
-        // the CG solver in the next iteration to refresh the
-        // eigenvalue/smoothing range parameter and get a better estimate of
-        // the sliding averages
-        momentum_solver_chebyshev.reset();
 
-      solve_time += timer2.wall_time();
-      stat_momentum_time_solve_cg.add_sample(timer2.wall_time());
+      // If we got here after failing to meet the tolerance of Chebyshev, our
+      // condition number guess was probably not good enough. We should use
+      // the CG solver in the next iteration to refresh the
+      // eigenvalue/smoothing range parameter and get a better estimate of the
+      // sliding averages.
+      if(had_severe_chebyshev_failure)
+        momentum_solver_chebyshev.reset();
+      else if(try_chebyshev_solver)
+        momentum_sliding_condition_number_estimate *= 1.1;
+
+      const double elapsed_time = timer2.wall_time();
+      solve_time += elapsed_time;
+      stat_momentum_time_solve_cg.add_sample(elapsed_time);
       timer2.restart();
     }
 
@@ -899,7 +944,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                   << "/" << t_residual << " s, solve " << solve_time + timer2.wall_time() << " s";
     }
 
-    stat_momentum_iterations.add_sample(n_iter);
+    stat_momentum_iterations.add_sample(n_iterations);
     stat_momentum_rhs_norm.add_sample(extrapolate_accuracy.first);
     stat_momentum_residual_start.add_sample(extrapolate_accuracy.second);
     stat_momentum_residual_stop.add_sample(reached_residual);
@@ -910,7 +955,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                   << "Solve viscous step (projection reduced residual from "
                   << extrapolate_accuracy.first << " to " << extrapolate_accuracy.second
                   << " solve " << (used_cg ? "CG" : "Ch") << " to " << reached_residual << "):";
-      print_solver_info_linear(this->pcout, n_iter, timer.wall_time());
+      print_solver_info_linear(this->pcout, n_iterations, timer.wall_time());
     }
   }
   else // no viscous term and no (linearly) implicit convective term, i.e. there is nothing to do in
