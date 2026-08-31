@@ -798,28 +798,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         momentum_solver_chebyshev->vmult_with_last_residual_norm(velocity_red.back(),
                                                                  velocity_matvec.back());
 
-      // From the actual residual reduction, we compute an estimate of the
-      // apparent condition number when solving the iteration count formula
-      // for Chebyshev used above for the condition number. The result is then
-      // fed into the sliding average for determining the iteration in the
-      // next step. Note that we subtract 1 from the iteration count because
-      // the guess returned by the Chebyshev solver indicates the residual one
-      // iteration before the end.
-      const double achieved_reduction = reached_residual / initial_residual;
-      if(n_iterations > 1 && achieved_reduction > 0 && achieved_reduction < 2.)
-      {
-        const double denominator = 0.5 * std::log(2.0 / achieved_reduction);
-        if(std::abs(denominator) > max_reduction_float)
-        {
-          const double apparent_condition_number =
-            std::pow(static_cast<double>(n_iterations - 1) / denominator, 2);
-
-          if(std::isfinite(apparent_condition_number) && apparent_condition_number >= 1.0)
-            momentum_sliding_condition_number_estimate =
-              0.8 * momentum_sliding_condition_number_estimate + 0.2 * apparent_condition_number;
-        }
-      }
-
       this->pcout << "Estimate of it count: " << iteration_count_guess << " "
                   << static_cast<unsigned int>(momentum_sliding_iteration_count) << " "
                   << reached_residual << " "
@@ -880,8 +858,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       n_iterations += control.last_step();
       reached_residual = control.last_value();
       this->pcout << "Conjugate gradient solver: " << control.last_step() << " "
-                  << control.last_value() / extrapolate_accuracy.second << " "
-                  << control.last_value() << "  time " << timer2.wall_time() << std::endl;
+                  << control.last_value() / extrapolate_accuracy.second << " absolute "
+                  << control.last_value() << " from " << control.initial_value() << "  time "
+                  << timer2.wall_time() << std::endl;
 
       // Prepare the Chebyshev solver for the other cases in case this is not
       // the cleanup part
@@ -916,16 +895,41 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       // condition number guess was probably not good enough. We should use
       // the CG solver in the next iteration to refresh the
       // eigenvalue/smoothing range parameter and get a better estimate of the
-      // sliding averages.
+      // sliding averages or, if the failure was not severe, try with more
+      // iterations.
       if(had_severe_chebyshev_failure)
         momentum_solver_chebyshev.reset();
       else if(try_chebyshev_solver)
-        momentum_sliding_condition_number_estimate *= 1.1;
+        momentum_sliding_iteration_count += 1;
 
       const double elapsed_time = timer2.wall_time();
       solve_time += elapsed_time;
       stat_momentum_time_solve_cg.add_sample(elapsed_time);
       timer2.restart();
+    }
+    else
+    {
+      // If Chebyshev succeeded, we compute an estimate of the apparent
+      // condition number from the achieved residual reduction. It is done by
+      // rearranging the above Chebyshev iteration count formula for the
+      // condition number. The result is then fed into the sliding average for
+      // determining the iteration in the next step. Note that we subtract 1
+      // from the iteration count because the guess returned by the Chebyshev
+      // solver indicates the residual one iteration before the end.
+      const double achieved_reduction = reached_residual / initial_residual;
+      if(n_iterations > 1 && achieved_reduction > 0 && achieved_reduction < 2.)
+      {
+        const double denominator = 0.5 * std::log(2.0 / achieved_reduction);
+        if(std::abs(denominator) > max_reduction_float)
+        {
+          const double apparent_condition_number =
+            std::pow(static_cast<double>(n_iterations - 1) / denominator, 2);
+
+          if(std::isfinite(apparent_condition_number) && apparent_condition_number >= 1.0)
+            momentum_sliding_condition_number_estimate =
+              0.8 * momentum_sliding_condition_number_estimate + 0.2 * apparent_condition_number;
+        }
+      }
     }
 
     DEAL_II_OPENMP_SIMD_PRAGMA
