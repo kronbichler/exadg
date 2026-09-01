@@ -38,6 +38,7 @@ enum class LinearSolver
   FGMRES,
   BiCGStab,
   MinRes,
+  Chebyshev,
   Richardson
 };
 
@@ -78,6 +79,10 @@ linear_solver_to_string(LinearSolver const linear_solver)
   else if(linear_solver == LinearSolver::Richardson)
   {
     solver_name = "richardson";
+  }
+  else if(linear_solver == LinearSolver::Chebyshev)
+  {
+    solver_name = "chebyshev";
   }
   else
   {

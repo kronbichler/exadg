@@ -514,8 +514,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
   if(this->print_solver_info() and not(this->is_test))
   {
     this->pcout << std::endl
-                << "Pressure step prepare: " << t_rhs << "/" << t_extrapol << " s, solve " << t_sol
-                << std::endl
+                << std::setprecision(4) << "Pressure step prepare: " << t_rhs << "/" << t_extrapol
+                << " s, solve " << t_sol << std::endl
                 << "Solve pressure step (projection reduced residual from "
                 << extrapolate_accuracy.first << " to " << extrapolate_accuracy.second
                 << " solve to " << n_iter.second << "):";
@@ -743,9 +743,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
     double reached_residual = std::numeric_limits<double>::quiet_NaN();
 
-    // In the startup phase or at certain times, run the CG solver (that gets
-    // us a new eigenvalue estimate)
-
     const double absolute_residual_target =
       extrapolate_accuracy.first * this->param.solver_data_momentum.rel_tol;
     const double initial_residual = extrapolate_accuracy.second;
@@ -754,10 +751,20 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                                    std::to_string(initial_residual)));
     const double max_reduction_float = 1e-7;
 
-    const bool try_chebyshev_solver = this->get_time_step_number() > 20 &&
-                                      this->get_time_step_number() % 32 != 0 &&
-                                      momentum_solver_chebyshev != nullptr;
-    bool   used_cg    = false;
+    AssertThrow(this->param.solver_data_momentum.linear_solver == LinearSolver::CG ||
+                  this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev,
+                dealii::ExcMessage("For the viscous solver with the extruded specialization "
+                                   "of the consistent splitting scheme, only the conjugate "
+                                   "gradient (cg) and the Chebyshev solver are implemented."));
+
+    // In the startup phase or at certain times, run the CG solver even if
+    // Chebyshev was set as the solver, because we want to compute a fresh
+    // eigenvalue estimate regularly.
+    const bool try_chebyshev_solver =
+      this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev &&
+      this->get_time_step_number() > 10 && this->get_time_step_number() % 32 != 0 &&
+      momentum_solver_chebyshev != nullptr;
+
     double solve_time = 0;
     if(try_chebyshev_solver)
     {
@@ -797,23 +804,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       reached_residual =
         momentum_solver_chebyshev->vmult_with_last_residual_norm(velocity_red.back(),
                                                                  velocity_matvec.back());
-
-      this->pcout << "Estimate of it count: " << iteration_count_guess << " "
-                  << static_cast<unsigned int>(momentum_sliding_iteration_count) << " "
-                  << reached_residual << " "
-                  << extrapolate_accuracy.first * this->param.solver_data_momentum.rel_tol << " "
-                  << extrapolate_accuracy.second << " "
-                  << (reached_residual > 4. * extrapolate_accuracy.first *
-                                           this->param.solver_data_momentum.rel_tol ?
-                        " f" :
-                        "")
-                  << " est "
-                  << std::pow((n_iterations - 1) /
-                                (0.5 *
-                                 std::log(2 / (reached_residual / extrapolate_accuracy.second))),
-                              2)
-                  << " cond " << momentum_sliding_condition_number_estimate << "  time "
-                  << timer2.wall_time() << std::endl;
       const double elapsed_time = timer2.wall_time();
       solve_time += elapsed_time;
       stat_momentum_time_solve_chebyshev.add_sample(elapsed_time);
@@ -823,10 +813,11 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       velocity_red.back() = 0.f;
 
     // As a fall-back in case the Chebyshev residual does not meet the
-    // tolerance or in case we could not use Chebyshev, we need to use CG. As
-    // to the tolerance, we intentionally choose a rather big failure factor
-    // of 3.0 because the Chebyshev solver actually does one more iteration
-    // after the one where the residual is gathered.
+    // tolerance or in case Chebyshev was not selected, we use the CG
+    // solver. As to the tolerance to determine whether Chebyshev was good
+    // enough, we intentionally choose a rather big failure factor of 3.0
+    // because the Chebyshev solver actually does one more iteration after the
+    // one where the residual is gathered.
     const double chebyshev_failure_factor        = 3.0;
     const double chebyshev_severe_failure_factor = 6.0;
     const bool   need_cg_solver =
@@ -842,25 +833,24 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                                     extrapolate_accuracy.first *
                                       this->param.solver_data_momentum.rel_tol);
 
-      double                            min_eig = 1, max_eig = 1;
+      double                            min_eig = 0.0, max_eig = 0.0;
       dealii::SolverCG<VectorTypeFloat> solver_cg(control);
-      solver_cg.connect_eigenvalues_slot([&min_eig, &max_eig](const std::vector<double> & eigval) {
-        if(!eigval.empty())
-        {
-          min_eig = eigval.front();
-          max_eig = eigval.back();
-        }
-      });
+      if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
+        solver_cg.connect_eigenvalues_slot(
+          [&min_eig, &max_eig](const std::vector<double> & eigval) {
+            if(!eigval.empty())
+            {
+              min_eig = eigval.front();
+              max_eig = eigval.back();
+            }
+          });
+
       solver_cg.solve(*op_rt_float,
                       velocity_red.back(),
                       velocity_matvec.back(),
                       preconditioner_viscous);
       n_iterations += control.last_step();
       reached_residual = control.last_value();
-      this->pcout << "Conjugate gradient solver: " << control.last_step() << " "
-                  << control.last_value() / extrapolate_accuracy.second << " absolute "
-                  << control.last_value() << " from " << control.initial_value() << "  time "
-                  << timer2.wall_time() << std::endl;
 
       // Prepare the Chebyshev solver for the other cases in case this is not
       // the cleanup part
@@ -944,21 +934,21 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     if(this->print_solver_info() and not(this->is_test))
     {
       this->pcout << std::endl
-                  << std::setprecision(5) << "Viscous step prepare: " << t_rhs << "/" << t_proj
+                  << std::setprecision(4) << "Viscous step prepare: " << t_rhs << "/" << t_proj
                   << "/" << t_residual << " s, solve " << solve_time + timer2.wall_time() << " s";
     }
 
     stat_momentum_iterations.add_sample(n_iterations);
     stat_momentum_rhs_norm.add_sample(extrapolate_accuracy.first);
-    stat_momentum_residual_start.add_sample(extrapolate_accuracy.second);
+    stat_momentum_residual_start.add_sample(initial_residual);
     stat_momentum_residual_stop.add_sample(reached_residual);
 
     if(this->print_solver_info() and not(this->is_test))
     {
       this->pcout << std::endl
                   << "Solve viscous step (projection reduced residual from "
-                  << extrapolate_accuracy.first << " to " << extrapolate_accuracy.second
-                  << " solve " << (used_cg ? "CG" : "Ch") << " to " << reached_residual << "):";
+                  << extrapolate_accuracy.first << " to " << initial_residual << " solve "
+                  << (need_cg_solver ? "CG" : "Ch") << " to " << reached_residual << "):";
       print_solver_info_linear(this->pcout, n_iterations, timer.wall_time());
     }
   }
