@@ -278,13 +278,13 @@ allocate_shared_recv_data(MemorySpace::MemorySpaceData<Number, MemorySpace::Host
 
 
 template<int dim, typename Number = double>
-class RaviartThomasOperatorBase : public EnableObserverPointer
+class RaviartThomasOperator : public EnableObserverPointer
 {
 public:
   static constexpr unsigned int n_lanes = VectorizedArray<Number>::size();
   using VectorType                      = LinearAlgebra::distributed::Vector<Number>;
 
-  RaviartThomasOperatorBase() = default;
+  RaviartThomasOperator() = default;
 
   template<typename OtherNumber>
   void
@@ -665,7 +665,7 @@ public:
       t = 0.0;
   }
 
-  ~RaviartThomasOperatorBase()
+  ~RaviartThomasOperator()
   {
     if(not this->is_test and timings[0] > 0)
     {

@@ -39,7 +39,7 @@
 namespace RTOperator
 {
 template<int, typename>
-class RaviartThomasOperatorBase;
+class RaviartThomasOperator;
 }
 
 namespace ExaDG
@@ -74,8 +74,8 @@ public:
   setup(LinePlotDataStatistics<dim> const & data_in);
 
   void
-  setup(LinePlotDataStatistics<dim> const &                        data_in,
-        RTOperator::RaviartThomasOperatorBase<dim, Number> const & rt_operator);
+  setup(LinePlotDataStatistics<dim> const &                    data_in,
+        RTOperator::RaviartThomasOperator<dim, Number> const & rt_operator);
 
   void
   evaluate(VectorType const & velocity, VectorType const & pressure, double const dt);
@@ -194,7 +194,7 @@ private:
   dealii::AlignedVector<dealii::VectorizedArray<Number>> shape_values_eo_t;
   dealii::AlignedVector<Number>                          shape_values_eo_dgq;
 
-  RTOperator::RaviartThomasOperatorBase<dim, Number> const * rt_operator;
+  RTOperator::RaviartThomasOperator<dim, Number> const * rt_operator;
   std::vector<std::array<unsigned int, dealii::VectorizedArray<Number>::size()>>
                                                    list_of_cells_to_evaluate;
   dealii::Table<2, dealii::Tensor<1, dim, Number>> evaluated_dg_values_on_cells;

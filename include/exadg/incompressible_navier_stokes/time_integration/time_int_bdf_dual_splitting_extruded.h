@@ -28,7 +28,7 @@
 namespace RTOperator
 {
 template<int dim, typename Number>
-class RaviartThomasOperatorBase;
+class RaviartThomasOperator;
 }
 
 namespace LaplaceOperator
@@ -177,8 +177,8 @@ private:
   VectorType velocity_projection_last_iter;
   VectorType velocity_viscous_last_iter;
 
-  std::shared_ptr<RTOperator::RaviartThomasOperatorBase<dim, Number>>   op_rt;
-  std::shared_ptr<RTOperator::RaviartThomasOperatorBase<dim, float>>    op_rt_float;
+  std::shared_ptr<RTOperator::RaviartThomasOperator<dim, Number>>       op_rt;
+  std::shared_ptr<RTOperator::RaviartThomasOperator<dim, float>>        op_rt_float;
   std::shared_ptr<LaplaceOperator::LaplaceOperatorDG<dim, Number>>      laplace_op;
   std::shared_ptr<LaplaceOperator::PoissonPreconditionerMG<dim, float>> poisson_preconditioner;
   VectorTypeFloat                                                       diagonal_mass;

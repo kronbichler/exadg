@@ -28,7 +28,7 @@
 namespace RTOperator
 {
 template<int dim, typename Number>
-class RaviartThomasOperatorBase;
+class RaviartThomasOperator;
 }
 
 namespace LaplaceOperator
@@ -185,8 +185,8 @@ private:
   std::vector<VectorType>      divergences;               // mf vector
   std::vector<VectorType>      pressure_nbc_rhs;          // vector only living on boundary
 
-  std::shared_ptr<RTOperator::RaviartThomasOperatorBase<dim, Number>>   op_rt;
-  std::shared_ptr<RTOperator::RaviartThomasOperatorBase<dim, float>>    op_rt_float;
+  std::shared_ptr<RTOperator::RaviartThomasOperator<dim, Number>>       op_rt;
+  std::shared_ptr<RTOperator::RaviartThomasOperator<dim, float>>        op_rt_float;
   std::shared_ptr<LaplaceOperator::LaplaceOperatorDG<dim, Number>>      laplace_op;
   std::shared_ptr<LaplaceOperator::PoissonPreconditionerMG<dim, float>> poisson_preconditioner;
   VectorTypeFloat                                                       diagonal_mass;
