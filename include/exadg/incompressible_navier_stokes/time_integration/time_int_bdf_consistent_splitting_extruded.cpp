@@ -870,8 +870,17 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
           // the preconditioner
         });
         chebyshev_data.eig_cg_n_iterations = 0;
-        chebyshev_data.max_eigenvalue      = 1.05 * max_eig;
-        chebyshev_data.smoothing_range     = momentum_sliding_condition_number_estimate;
+
+        // An experience from practice is that the maximum eigenvalue of a
+        // Jacobi-preconditioned matrix stemming from a reaction-diffusion
+        // PDE is around 2, so use at least that value even if CG did not
+        // find such a big value. This avoids some failures in Chebyshev
+        // when CG only does a small number of iterations.
+        if(this->param.preconditioner_momentum == MomentumPreconditioner::PointJacobi)
+          chebyshev_data.max_eigenvalue = std::max(2.0, 1.05 * max_eig);
+        else
+          chebyshev_data.max_eigenvalue = 1.05 * max_eig;
+        chebyshev_data.smoothing_range = momentum_sliding_condition_number_estimate;
 
         // the actual degree will be set when we know the tolerance for the
         // solver
