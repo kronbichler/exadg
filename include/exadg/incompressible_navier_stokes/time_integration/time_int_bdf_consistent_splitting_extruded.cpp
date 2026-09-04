@@ -758,8 +758,14 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                                    "gradient (cg) and the Chebyshev solver are implemented."));
 
     // In the startup phase or at certain times, run the CG solver even if
-    // Chebyshev was set as the solver, because we want to compute a fresh
-    // eigenvalue estimate regularly.
+    // Chebyshev was set as the solver. The reason to run it every 32 steps is
+    // to provide a new eigenvalue estimate but, more importantly, let the CG
+    // solver with its directional minimization clean up the situation from
+    // time to time: Using just Chebyshev might leave some low-amplitude error
+    // components below the threshold for the residual unnoticed for a longer
+    // time, until they reach the residual tolerance. Adding some nonlinearity
+    // like the minimization of CG can be more robust against those undesired
+    // artifacts. Note that this was not tested thoroughly yet.
     const bool try_chebyshev_solver =
       this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev &&
       this->get_time_step_number() > 10 && this->get_time_step_number() % 32 != 0 &&
@@ -779,7 +785,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       const double target_reduction    = absolute_residual_target / initial_residual;
       const double requested_reduction = std::clamp(target_reduction, max_reduction_float, 1.9999);
 
-      // This is a convergence formula for the Chebyshev solver
+      // This is a convergence formula for the Chebyshev solver, based on the
+      // book by Varga, Matrix Iterative Analysis. Their Chapter 5, page 156,
+      // formula (5.27) provides an error formula, which is then solved for
+      // the iteration number 'm'.
       const double iteration_count_guess =
         std::log(2. / requested_reduction) * 0.5 *
         std::sqrt(std::max(momentum_sliding_condition_number_estimate, 1.0));
@@ -857,6 +866,21 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       constexpr unsigned int min_eigenvalue_iterations = 5;
       if(control.last_step() >= min_eigenvalue_iterations && min_eig > 0.0 && max_eig >= min_eig)
       {
+        // Update the estimate for the condition number: We choose a low
+        // factor 0.1 for the exponential sliding average here, meaning that
+        // the other updates to the condition number estimate done by the
+        // observed convergence rates of Chebyshev are given more weight. This
+        // means that the actually measured past residual reduction is assumed
+        // to be more accurate to predict the necessary iteration count in the
+        // next step as governed by the Chebyshev iteration count formula. The
+        // reason is that the CG estimate can fluctuate more between a more
+        // pessimistic state when the observed eigenvalues by the CG/Lanczos
+        // iteration are more extreme than the ones mattering for the next
+        // solution of the linear system, or more optimistic state when too
+        // few iterations are made. The tests made show that this choice works
+        // well for smooth solutions, where the prediction from past solver
+        // phases are really good. In other cases, we might need to revisit
+        // this choice.
         if(momentum_sliding_condition_number_estimate <= 0 ||
            !std::isfinite(momentum_sliding_condition_number_estimate))
           momentum_sliding_condition_number_estimate = max_eig / min_eig;
