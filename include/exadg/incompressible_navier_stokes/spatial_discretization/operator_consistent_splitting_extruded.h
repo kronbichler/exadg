@@ -29,7 +29,7 @@
 namespace RTOperator
 {
 template<int, typename>
-class RaviartThomasOperatorBase;
+class RaviartThomasOperator;
 }
 
 namespace ExaDG
@@ -63,8 +63,8 @@ public:
   {
   }
 
-  std::shared_ptr<const RTOperator::RaviartThomasOperatorBase<dim, Number>> momentum_operator;
-  dealii::LinearAlgebra::distributed::Vector<Number> const *                velocity_vector;
+  std::shared_ptr<const RTOperator::RaviartThomasOperator<dim, Number>> momentum_operator;
+  dealii::LinearAlgebra::distributed::Vector<Number> const *            velocity_vector;
 };
 
 } // namespace IncNS

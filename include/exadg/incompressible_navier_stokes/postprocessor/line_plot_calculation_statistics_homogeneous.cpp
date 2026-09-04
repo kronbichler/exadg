@@ -447,8 +447,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
 template<int dim, typename Number>
 void
 LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
-  LinePlotDataStatistics<dim> const &                        data_in,
-  RTOperator::RaviartThomasOperatorBase<dim, Number> const & rt_operator)
+  LinePlotDataStatistics<dim> const &                    data_in,
+  RTOperator::RaviartThomasOperator<dim, Number> const & rt_operator)
 {
   time_all          = 0;
   data              = data_in;

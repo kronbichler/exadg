@@ -129,7 +129,7 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::allocate_vectors()
   // do test for matrix-free operator of optimized kind
   const std::vector<unsigned int> cell_vectorization_category =
     Helper::compute_vectorization_category(pde_operator->get_dof_handler_u().get_triangulation());
-  op_rt = std::make_shared<RTOperator::RaviartThomasOperatorBase<dim, Number>>();
+  op_rt = std::make_shared<RTOperator::RaviartThomasOperator<dim, Number>>();
   op_rt->reinit(*pde_operator->get_mapping(),
                 pde_operator->get_dof_handler_u(),
                 pde_operator->get_constraint_u(),
@@ -141,7 +141,7 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::allocate_vectors()
   op_rt->initialize_dof_vector(solution_rt);
   op_rt->initialize_dof_vector(rhs_rt);
 
-  op_rt_float = std::make_shared<RTOperator::RaviartThomasOperatorBase<dim, float>>();
+  op_rt_float = std::make_shared<RTOperator::RaviartThomasOperator<dim, float>>();
   op_rt_float->reinit(*pde_operator->get_mapping(),
                       pde_operator->get_dof_handler_u(),
                       pde_operator->get_constraint_u(),

@@ -63,7 +63,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
     extra_pressure_rhs(this->param.order_extrapolation_pressure_rhs,
                        this->param.start_with_low_order)
 {
-  op_rt = std::make_shared<RTOperator::RaviartThomasOperatorBase<dim, Number>>();
+  op_rt = std::make_shared<RTOperator::RaviartThomasOperator<dim, Number>>();
 
   pde_operator->momentum_operator = op_rt;
   pde_operator->velocity_vector   = &velocity[0];
@@ -179,7 +179,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   op_rt->initialize_dof_vector(solution_rt);
   op_rt->initialize_dof_vector(rhs_rt);
 
-  op_rt_float = std::make_shared<RTOperator::RaviartThomasOperatorBase<dim, float>>();
+  op_rt_float = std::make_shared<RTOperator::RaviartThomasOperator<dim, float>>();
   op_rt_float->reinit(*pde_operator->get_mapping(),
                       pde_operator->get_dof_handler_u(),
                       pde_operator->get_constraint_u(),
@@ -989,7 +989,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::write_restart_vectors() cons
 {
   // Restart vectors need to be stored in a format compatible with the
   // DoFHandler, so the vectors written for
-  // `RTOperator::RaviartThomasOperatorBase` need to be converted
+  // `RTOperator::RaviartThomasOperator` need to be converted
   // appropriately.
   std::vector<VectorType>         velocity_copied(this->get_size_velocity());
   std::vector<VectorType const *> vectors_velocity;
@@ -1013,7 +1013,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
 {
   // Restart vectors need to be stored in a format compatible with the
   // DoFHandler, so the vectors written for
-  // `RTOperator::RaviartThomasOperatorBase` need to be converted
+  // `RTOperator::RaviartThomasOperator` need to be converted
   // appropriately.
   std::vector<VectorType> vectors_velocity(this->get_size_velocity());
   for(unsigned int i = 0; i < this->get_size_velocity(); i++)
