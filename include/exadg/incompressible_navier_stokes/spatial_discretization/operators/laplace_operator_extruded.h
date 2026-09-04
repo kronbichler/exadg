@@ -1563,6 +1563,7 @@ public:
       import_values.resize_fast(send_data_cell_index.size() * data_per_face);
       export_values.clear();
       export_values.resize_fast(send_data_cell_index.size() * data_per_face);
+      mpi_requests.resize(2 * send_data_process.size());
     }
 
     cell_level_index.resize(matrix_free.n_cell_batches());
@@ -1790,8 +1791,8 @@ public:
       // data: everything projected to face, 2 because of values and derivatives
       const int data_per_face = 2 * Utilities::pow(nn, dim - 1);
 
-      std::vector<MPI_Request> requests(2 * send_data_process.size());
-      unsigned int             offset = 0;
+      AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
+      unsigned int offset = 0;
       for(unsigned int p = 0; p < send_data_process.size(); ++p)
       {
         MPI_Irecv(&import_values[offset * data_per_face],
@@ -1800,28 +1801,28 @@ public:
                   send_data_process[p].first,
                   send_data_process[p].first + 47,
                   src.get_mpi_communicator(),
-                  &requests[p]);
+                  &mpi_requests[p]);
         offset += send_data_process[p].second;
       }
       AssertDimension(offset * data_per_face, import_values.size());
 
       if(nn == 2)
-        vmult_pack_and_send_data<2>(src, requests);
+        vmult_pack_and_send_data<2>(src);
       else if(nn == 3)
-        vmult_pack_and_send_data<3>(src, requests);
+        vmult_pack_and_send_data<3>(src);
       else if(nn == 4)
-        vmult_pack_and_send_data<4>(src, requests);
+        vmult_pack_and_send_data<4>(src);
 #ifndef DEBUG
       else if(nn == 5)
-        vmult_pack_and_send_data<5>(src, requests);
+        vmult_pack_and_send_data<5>(src);
       else if(nn == 6)
-        vmult_pack_and_send_data<6>(src, requests);
+        vmult_pack_and_send_data<6>(src);
       else if(nn == 7)
-        vmult_pack_and_send_data<7>(src, requests);
+        vmult_pack_and_send_data<7>(src);
       else if(nn == 8)
-        vmult_pack_and_send_data<8>(src, requests);
+        vmult_pack_and_send_data<8>(src);
       else if(nn == 9)
-        vmult_pack_and_send_data<9>(src, requests);
+        vmult_pack_and_send_data<9>(src);
 #endif
       else
         AssertThrow(false, ExcNotImplemented());
@@ -1829,8 +1830,8 @@ public:
       timings[3] += time.wall_time();
 
       time.restart();
-      if(!requests.empty())
-        MPI_Waitall(requests.size(), &requests[0], MPI_STATUSES_IGNORE);
+      if(!mpi_requests.empty())
+        MPI_Waitall(mpi_requests.size(), &mpi_requests[0], MPI_STATUSES_IGNORE);
       timings[5] += time.wall_time();
     }
 
@@ -1918,9 +1919,9 @@ public:
 
       // data: everything projected to face, 2 because of values and derivatives
       const int data_per_face = 2 * Utilities::pow(nn, dim - 1);
+      AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
 
-      std::vector<MPI_Request> requests(2 * send_data_process.size());
-      unsigned int             offset = 0;
+      unsigned int offset = 0;
       for(unsigned int p = 0; p < send_data_process.size(); ++p)
       {
         MPI_Irecv(&import_values[offset * data_per_face],
@@ -1929,28 +1930,28 @@ public:
                   send_data_process[p].first,
                   send_data_process[p].first + 47,
                   solution.get_mpi_communicator(),
-                  &requests[p]);
+                  &mpi_requests[p]);
         offset += send_data_process[p].second;
       }
       AssertDimension(offset * data_per_face, import_values.size());
 
       if(nn == 2)
-        vmult_pack_and_send_data<2>(solution, requests);
+        vmult_pack_and_send_data<2>(solution);
       else if(nn == 3)
-        vmult_pack_and_send_data<3>(solution, requests);
+        vmult_pack_and_send_data<3>(solution);
       else if(nn == 4)
-        vmult_pack_and_send_data<4>(solution, requests);
+        vmult_pack_and_send_data<4>(solution);
 #ifndef DEBUG
       else if(nn == 5)
-        vmult_pack_and_send_data<5>(solution, requests);
+        vmult_pack_and_send_data<5>(solution);
       else if(nn == 6)
-        vmult_pack_and_send_data<6>(solution, requests);
+        vmult_pack_and_send_data<6>(solution);
       else if(nn == 7)
-        vmult_pack_and_send_data<7>(solution, requests);
+        vmult_pack_and_send_data<7>(solution);
       else if(nn == 8)
-        vmult_pack_and_send_data<8>(solution, requests);
+        vmult_pack_and_send_data<8>(solution);
       else if(nn == 9)
-        vmult_pack_and_send_data<9>(solution, requests);
+        vmult_pack_and_send_data<9>(solution);
 #endif
       else
         AssertThrow(false, ExcNotImplemented());
@@ -1958,8 +1959,8 @@ public:
       timings[3] += time.wall_time();
 
       time.restart();
-      if(!requests.empty())
-        MPI_Waitall(requests.size(), &requests[0], MPI_STATUSES_IGNORE);
+      if(!mpi_requests.empty())
+        MPI_Waitall(mpi_requests.size(), &mpi_requests[0], MPI_STATUSES_IGNORE);
       timings[5] += time.wall_time();
     }
 
@@ -2139,6 +2140,7 @@ private:
   std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>> mpi_exchange_data_on_faces;
   mutable AlignedVector<Number>                                import_values;
   mutable AlignedVector<Number>                                export_values;
+  mutable std::vector<MPI_Request>                             mpi_requests;
   Table<2, unsigned char>                                      all_owned_faces;
   std::vector<std::pair<unsigned int, unsigned int>>           send_data_process;
   std::vector<unsigned int>                                    send_data_cell_index;
@@ -2580,11 +2582,13 @@ private:
 
   template<int nn>
   void
-  vmult_pack_and_send_data(const VectorType & src, std::vector<MPI_Request> & requests) const
+  vmult_pack_and_send_data(const VectorType & src) const
   {
     constexpr int data_per_face = 2 * Utilities::pow(nn, dim - 1);
 
     std::array<VectorizedArray<Number>, 2 * nn * nn> tmp_vec;
+
+    AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
 
     unsigned int offset = 0;
     for(unsigned int p = 0; p < send_data_process.size(); ++p)
@@ -2639,7 +2643,7 @@ private:
                 send_data_process[p].first,
                 src.get_partitioner()->this_mpi_process() + 47,
                 src.get_mpi_communicator(),
-                &requests[send_data_process.size() + p]);
+                &mpi_requests[send_data_process.size() + p]);
       offset += my_faces;
     }
     AssertDimension(offset * data_per_face, export_values.size());

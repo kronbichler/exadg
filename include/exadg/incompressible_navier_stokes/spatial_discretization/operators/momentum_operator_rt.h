@@ -588,6 +588,7 @@ public:
           offset += data_per_face;
         }
       }
+      mpi_requests.resize(send_data_process.size() * 2);
       import_values.clear();
       import_values.resize_fast(send_data_cell_index.size() * data_per_face);
       export_values.clear();
@@ -1539,6 +1540,7 @@ private:
   std::vector<dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes>> dof_indices;
   std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>>     neighbor_cells;
   std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>>     mpi_exchange_data_on_faces;
+  mutable std::vector<MPI_Request>                                 mpi_requests;
   mutable AlignedVector<Number>                                    import_values;
   mutable AlignedVector<Number>                                    export_values;
   Table<2, unsigned char>                                          all_owned_faces;
@@ -3110,8 +3112,8 @@ private:
         (Utilities::pow(n_t, dim - 1) + n_n * Utilities::pow(n_t, dim - 2) * (dim - 1)) *
         (exchange_derivatives ? 2 : 1);
 
-      std::vector<MPI_Request> requests(2 * send_data_process.size());
-      unsigned int             offset = 0;
+      AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
+      unsigned int offset = 0;
       for(unsigned int p = 0; p < send_data_process.size(); ++p)
       {
         MPI_Irecv(&import_values[offset * data_per_face],
@@ -3120,41 +3122,41 @@ private:
                   send_data_process[p].first,
                   send_data_process[p].first + 47,
                   src.get_mpi_communicator(),
-                  &requests[p]);
+                  &mpi_requests[p]);
         offset += send_data_process[p].second;
       }
       AssertDimension(offset * data_per_face * (exchange_derivatives ? 1 : 2),
                       import_values.size());
 
       if(n_t == 2)
-        vmult_pack_and_send_data<2, exchange_derivatives>(src, requests);
+        vmult_pack_and_send_data<2, exchange_derivatives>(src);
       else if(n_t == 3)
-        vmult_pack_and_send_data<3, exchange_derivatives>(src, requests);
+        vmult_pack_and_send_data<3, exchange_derivatives>(src);
       else if(n_t == 4)
-        vmult_pack_and_send_data<4, exchange_derivatives>(src, requests);
+        vmult_pack_and_send_data<4, exchange_derivatives>(src);
 #ifndef DEBUG
       else if(n_t == 5)
-        vmult_pack_and_send_data<5, exchange_derivatives>(src, requests);
+        vmult_pack_and_send_data<5, exchange_derivatives>(src);
       else if(n_t == 6)
-        vmult_pack_and_send_data<6, exchange_derivatives>(src, requests);
+        vmult_pack_and_send_data<6, exchange_derivatives>(src);
       else if(n_t == 7)
-        vmult_pack_and_send_data<7, exchange_derivatives>(src, requests);
+        vmult_pack_and_send_data<7, exchange_derivatives>(src);
       else if(n_t == 8)
-        vmult_pack_and_send_data<8, exchange_derivatives>(src, requests);
+        vmult_pack_and_send_data<8, exchange_derivatives>(src);
       else if(n_t == 9)
-        vmult_pack_and_send_data<9, exchange_derivatives>(src, requests);
+        vmult_pack_and_send_data<9, exchange_derivatives>(src);
 #endif
       else
         AssertThrow(false, ExcNotImplemented());
 
-      if(!requests.empty())
-        MPI_Waitall(requests.size(), &requests[0], MPI_STATUSES_IGNORE);
+      if(!mpi_requests.empty())
+        MPI_Waitall(mpi_requests.size(), &mpi_requests[0], MPI_STATUSES_IGNORE);
     }
   }
 
   template<int n_t, bool include_face_derivative = true>
   void
-  vmult_pack_and_send_data(const VectorType & src, std::vector<MPI_Request> & requests) const
+  vmult_pack_and_send_data(const VectorType & src) const
   {
     constexpr int n_n = n_t + 1;
     constexpr int data_per_face =
@@ -3163,6 +3165,7 @@ private:
 
     std::array<VectorizedArray<Number>, dim * 3 * n_n * n_t> tmp_vec;
 
+    AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
     unsigned int offset = 0;
     for(unsigned int p = 0; p < send_data_process.size(); ++p)
     {
@@ -3228,7 +3231,7 @@ private:
                 send_data_process[p].first,
                 src.get_partitioner()->this_mpi_process() + 47,
                 src.get_mpi_communicator(),
-                &requests[send_data_process.size() + p]);
+                &mpi_requests[send_data_process.size() + p]);
       offset += my_faces;
     }
     if(include_face_derivative)
