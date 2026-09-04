@@ -3112,6 +3112,7 @@ private:
         (Utilities::pow(n_t, dim - 1) + n_n * Utilities::pow(n_t, dim - 2) * (dim - 1)) *
         (exchange_derivatives ? 2 : 1);
 
+      AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
       unsigned int offset = 0;
       for(unsigned int p = 0; p < send_data_process.size(); ++p)
       {
@@ -3164,6 +3165,7 @@ private:
 
     std::array<VectorizedArray<Number>, dim * 3 * n_n * n_t> tmp_vec;
 
+    AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
     unsigned int offset = 0;
     for(unsigned int p = 0; p < send_data_process.size(); ++p)
     {
