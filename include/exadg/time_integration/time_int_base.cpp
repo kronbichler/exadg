@@ -132,8 +132,9 @@ TimeIntBase::advance_one_timestep_post_solve()
   {
     // Query the current time of the simulation and synchronize it across the
     // MPI processes to make sure that actions based on this switch are done
-    // in sync on all MPI processes
-    if(wall_time_limit < std::numeric_limits<double>::max())
+    // in sync on all MPI processes whenever wall-time-based triggers are active.
+    if(wall_time_limit < std::numeric_limits<double>::max() or
+       restart_data.interval_wall_time < std::numeric_limits<double>::max())
       synchronized_wall_time =
         dealii::Utilities::MPI::broadcast(mpi_comm, global_timer.wall_time() * (1 + 1e-6));
 
