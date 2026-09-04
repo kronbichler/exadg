@@ -66,7 +66,7 @@ struct SolverInfoData
     // variables are reinitialized after a restart anyway.
     if(time_step_number == 1)
     {
-      counter += int((time + 1.e-10) / interval_time);
+      counter += static_cast<unsigned int>(time * (1.0 + 1.e-12) / interval_time);
     }
 
     do_output_in_this_time_step = wall_time > interval_wall_time * counter or

@@ -50,6 +50,7 @@ Parameters::Parameters()
     // PHYSICAL QUANTITIES
     start_time(0.),
     end_time(-1.),
+    wall_time_limit(std::numeric_limits<double>::max()),
     viscosity(-1.),
     density(1.),
     thermal_expansion_coefficient(1.0),
@@ -850,6 +851,8 @@ Parameters::print_parameters_physical_quantities(dealii::ConditionalOStream cons
   {
     print_parameter(pcout, "Start time", start_time);
     print_parameter(pcout, "End time", end_time);
+    if(wall_time_limit < std::numeric_limits<double>::max())
+      print_parameter(pcout, "Wall time limit", Utilities::get_time_string(wall_time_limit));
   }
 
   // nothing to print if we bypass the PDE solver by

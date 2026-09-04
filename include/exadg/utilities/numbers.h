@@ -57,6 +57,23 @@ is_valid_timestep(types::time_step const timestep)
   return (timestep != numbers::invalid_timestep);
 }
 
+inline std::string
+get_time_string(double const time_in_seconds)
+{
+  unsigned int const hours   = static_cast<unsigned int>(time_in_seconds / 3600.0);
+  unsigned int const minutes = static_cast<unsigned int>((time_in_seconds - hours * 3600.0) / 60.0);
+  unsigned int const seconds =
+    static_cast<unsigned int>((time_in_seconds - hours * 3600.0 - minutes * 60.0));
+
+  std::string time_string;
+  if(hours > 0)
+    time_string += std::to_string(hours) + " h ";
+  if(hours > 0 || minutes > 0)
+    time_string += std::to_string(minutes) + " min ";
+  time_string += std::to_string(seconds) + " s";
+  return time_string;
+}
+
 struct StatisticalQuantity
 {
   StatisticalQuantity()

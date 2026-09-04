@@ -198,6 +198,9 @@ public:
   // end time of simulation
   double end_time;
 
+  // possible limit on the wall time of the simulation
+  double wall_time_limit;
+
   // kinematic viscosity
   double viscosity;
 

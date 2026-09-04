@@ -51,11 +51,11 @@ public:
   typedef boost::archive::text_iarchive BoostInputArchiveType;
   typedef boost::archive::text_oarchive BoostOutputArchiveType;
 
-  TimeIntBase(double const &      start_time_,
-              double const &      end_time_,
+  TimeIntBase(double const        start_time_,
+              double const        end_time_,
               unsigned int const  max_number_of_time_steps_,
               RestartData const & restart_data_,
-              MPI_Comm const &    mpi_comm_,
+              MPI_Comm const      mpi_comm_,
               bool const          is_test_);
 
   virtual ~TimeIntBase()
@@ -156,6 +156,13 @@ public:
 
 protected:
   /*
+   * Set a limit on the wall time, typically done in the constructor when
+   * certain parameters are set.
+   */
+  void
+  set_wall_time_limit(double const wall_time_limit);
+
+  /*
    * Do one time step including pre and post routines done before and after the actual solution of
    * the current time step. Compared to the function advance_one_timestep(), do_timestep() is a raw
    * version that does not call postprocessing routines, does not write output to pcout, and does
@@ -225,14 +232,24 @@ protected:
   output_remaining_time() const;
 
   /*
-   * Start and end times.
+   * Start time of simulation.
    */
-  double start_time, end_time;
+  double start_time;
+
+  /*
+   * End time of simulation.
+   */
+  double const end_time;
 
   /*
    * Physical time.
    */
   double time;
+
+  /*
+   * Limit on the wall clock time.
+   */
+  double const wall_time_limit;
 
   /*
    * A small number which is much smaller than the time step size.
@@ -268,6 +285,7 @@ protected:
    * Computation time (wall clock time).
    */
   dealii::Timer              global_timer;
+  double                     synchronized_wall_time;
   std::shared_ptr<TimerTree> timer_tree;
   bool                       is_test;
 

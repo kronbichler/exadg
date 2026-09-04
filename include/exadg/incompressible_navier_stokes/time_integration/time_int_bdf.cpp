@@ -62,6 +62,7 @@ TimeIntBDF<dim, Number>::TimeIntBDF(
     postprocessor(postprocessor_in),
     vec_grid_coordinates(param_in.order_time_integrator)
 {
+  this->set_wall_time_limit(param_in.wall_time_limit);
   needs_vector_convective_term =
     this->param.convective_problem() and
     (this->param.treatment_of_convective_term == TreatmentOfConvectiveTerm::Explicit or

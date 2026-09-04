@@ -24,21 +24,23 @@
 
 namespace ExaDG
 {
-TimeIntBase::TimeIntBase(double const &      start_time_,
-                         double const &      end_time_,
+TimeIntBase::TimeIntBase(double const        start_time_,
+                         double const        end_time_,
                          unsigned int const  max_number_of_time_steps_,
                          RestartData const & restart_data_,
-                         MPI_Comm const &    mpi_comm_,
+                         MPI_Comm const      mpi_comm_,
                          bool const          is_test_)
   : start_time(start_time_),
     end_time(end_time_),
     time(start_time_),
+    wall_time_limit(std::numeric_limits<double>::max()),
     eps(1.e-10),
     pcout(std::cout, dealii::Utilities::MPI::this_mpi_process(mpi_comm_) == 0),
     time_step_number(1),
     max_number_of_time_steps(max_number_of_time_steps_),
     restart_data(restart_data_),
     mpi_comm(mpi_comm_),
+    synchronized_wall_time(0.),
     timer_tree(new TimerTree()),
     is_test(is_test_)
 {
@@ -53,7 +55,8 @@ TimeIntBase::started() const
 bool
 TimeIntBase::finished() const
 {
-  return not(time < (end_time - eps) and time_step_number <= max_number_of_time_steps);
+  return not(synchronized_wall_time < wall_time_limit and time < (end_time - eps) and
+             time_step_number <= max_number_of_time_steps);
 }
 
 void
@@ -63,6 +66,13 @@ TimeIntBase::timeloop()
   {
     advance_one_timestep();
   }
+
+  if(synchronized_wall_time > wall_time_limit)
+    pcout << std::endl
+          << "Time stepping reached the wall time limit set to "
+          << Utilities::get_time_string(wall_time_limit) << " before reaching the end time."
+          << std::endl
+          << std::endl;
 }
 
 void
@@ -120,6 +130,14 @@ TimeIntBase::advance_one_timestep_post_solve()
 
   if(started() and not finished())
   {
+    // Query the current time of the simulation and synchronize it across the
+    // MPI processes to make sure that actions based on this switch are done
+    // in sync on all MPI processes whenever wall-time-based triggers are active.
+    if(wall_time_limit < std::numeric_limits<double>::max() or
+       restart_data.interval_wall_time < std::numeric_limits<double>::max())
+      synchronized_wall_time =
+        dealii::Utilities::MPI::broadcast(mpi_comm, global_timer.wall_time() * (1 + 1e-6));
+
     do_timestep_post_solve();
 
     postprocessing();
@@ -143,6 +161,12 @@ TimeIntBase::reset_time(double const & current_time)
   else
     AssertThrow(false,
                 dealii::ExcMessage("The variable time may not be overwritten via public access."));
+}
+
+void
+TimeIntBase::set_wall_time_limit(double const wall_time_limit)
+{
+  const_cast<double &>(this->wall_time_limit) = wall_time_limit;
 }
 
 void
@@ -200,9 +224,8 @@ TimeIntBase::get_time_step_number() const
 void
 TimeIntBase::write_restart() const
 {
-  double const wall_time = global_timer.wall_time();
-
-  if(restart_data.do_restart(wall_time, time - start_time, time_step_number, time_step_number == 2))
+  if(restart_data.do_restart(
+       synchronized_wall_time, time - start_time, time_step_number, time_step_number == 2))
   {
     pcout << std::endl
           << print_horizontal_line() << std::endl
@@ -270,21 +293,10 @@ TimeIntBase::output_remaining_time() const
       double const time_spent     = global_timer.wall_time();
       double const remaining_time = time_spent * (end_time - time) / (time - start_time);
 
-      int const hours_spent   = int(time_spent / 3600.0);
-      int const minutes_spent = int((time_spent - hours_spent * 3600.0) / 60.0);
-      int const seconds_spent = int((time_spent - hours_spent * 3600.0 - minutes_spent * 60.0));
-
-      int const hours   = int(remaining_time / 3600.0);
-      int const minutes = int((remaining_time - hours * 3600.0) / 60.0);
-      int const seconds = int((remaining_time - hours * 3600.0 - minutes * 60.0));
-
-      pcout << std::endl << "Spent ";
-      if(hours_spent > 0)
-        pcout << hours_spent << " h ";
-      pcout << minutes_spent << " min " << seconds_spent << " s, estimated time until completion: ";
-      if(hours > 0)
-        pcout << hours << " h ";
-      pcout << minutes << " min " << seconds << " s." << std::endl;
+      pcout << std::endl
+            << "Spent " << Utilities::get_time_string(time_spent)
+            << ", estimated time until completion: " << Utilities::get_time_string(remaining_time)
+            << "." << std::endl;
     }
   }
 }
