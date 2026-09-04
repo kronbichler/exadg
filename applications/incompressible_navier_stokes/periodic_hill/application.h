@@ -441,6 +441,11 @@ public:
                         restart_interval_time,
                         "Time between writes of restart data in multiples of flow-through time.",
                         dealii::Patterns::Double());
+      prm.add_parameter("RestartIntervalWallTime",
+                        restart_interval_wall_time,
+                        "Time between writes of restart in terms of the elapsed "
+                        "wall clock time of the time stepping in the simulation.",
+                        dealii::Patterns::Double());
       prm.add_parameter("TriangulationType", triangulation_type, "Type of triangulation");
       prm.add_parameter("TemporalDiscretization",
                         temporal_discretization,
@@ -458,6 +463,12 @@ public:
                         end_time_multiples,
                         "End time in multiples of flow-through time.",
                         dealii::Patterns::Double(0.0, 1000.0));
+      prm.add_parameter("WallTimeLimit",
+                        wall_time_limit,
+                        "Set a limit to the total run time of the time loop in the solver. "
+                        "Setting this limit can terminate a simulation also when the given "
+                        "end time was not yet reached.",
+                        dealii::Patterns::Double(0.0));
       prm.add_parameter("GridStretchFactor",
                         grid_stretch_factor,
                         "Factor describing grid stretching in vertical direction.",
@@ -549,9 +560,10 @@ private:
 
 
     // PHYSICAL QUANTITIES
-    this->param.start_time = start_time;
-    this->param.end_time   = end_time;
-    this->param.viscosity  = viscosity;
+    this->param.wall_time_limit = wall_time_limit;
+    this->param.start_time      = start_time;
+    this->param.end_time        = end_time;
+    this->param.viscosity       = viscosity;
 
 
     // TEMPORAL DISCRETIZATION
@@ -617,7 +629,7 @@ private:
     this->param.restart_data.directory_read                 = restart_directory;
     this->param.restart_data.directory_write                = this->output_parameters.directory;
     this->param.restart_data.filename            = this->output_parameters.filename + "_restart";
-    this->param.restart_data.interval_wall_time  = 1.e6;
+    this->param.restart_data.interval_wall_time  = restart_interval_wall_time;
     this->param.restart_data.interval_time_steps = 1e8;
 
     // Same `mapping_degree` and spatial resolution are the most stable options for restart,
@@ -1416,6 +1428,8 @@ private:
   double       end_time_multiples = 10.0;
   double       end_time = temporal_convergence_study ? 0.1 : end_time_multiples * flow_through_time;
 
+  double wall_time_limit = std::numeric_limits<double>::max();
+
   // grid
   bool   consider_box_distort = false; // distort the box grid before mapping
   bool   consider_mapping     = true;  // map the box to give the classic periodic hill geometry
@@ -1429,10 +1443,11 @@ private:
   // postprocessing
 
   // restart
-  bool        write_restart         = false;
-  bool        read_restart          = false;
-  double      restart_interval_time = 8.0 * flow_through_time;
-  std::string restart_directory     = "./output/";
+  bool        write_restart              = false;
+  bool        read_restart               = false;
+  double      restart_interval_time      = 8.0 * flow_through_time;
+  double      restart_interval_wall_time = std::numeric_limits<double>::max();
+  std::string restart_directory          = "./output/";
 
   // sampling
   bool         calculate_statistics        = true;

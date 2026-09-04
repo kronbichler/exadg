@@ -132,7 +132,8 @@ struct RestartData
       directory_read("./output/"),
       directory_write("./output/"),
       filename("restart"),
-      counter(1),
+      interval_counter(1),
+      interval_counter_wall_time(1),
       discretization_identical(false),
       consider_mapping_write(false),
       consider_mapping_read_source(false),
@@ -177,18 +178,23 @@ struct RestartData
     // if the restart is controlled by the wall time or the time_step_number because these
     // variables are reinitialized after a restart anyway.
     if(reset_counter)
-      counter += int((time + 1.e-10) / interval_time);
+      interval_counter += static_cast<unsigned int>(time * (1.0 + 1.e-12) / interval_time);
 
-    bool const trigger_restart_base = wall_time > interval_wall_time * counter or
-                                      time > interval_time * counter or
-                                      time_step_number > interval_time_steps * counter;
+    bool const trigger_restart_by_wall_time =
+      wall_time > interval_wall_time * interval_counter_wall_time;
+    if(trigger_restart_by_wall_time)
+      ++interval_counter_wall_time;
+
+    bool const trigger_restart_base = trigger_restart_by_wall_time or
+                                      time > interval_time * interval_counter or
+                                      time_step_number > interval_time_steps * interval_counter;
 
     // Additionally use the physical time window.
     bool const trigger_restart =
       trigger_restart_base and time >= interval_time_start and time <= interval_time_end;
 
     if(trigger_restart)
-      ++counter;
+      ++interval_counter;
 
     return trigger_restart;
   }
@@ -246,8 +252,11 @@ struct RestartData
   // filename for restart files
   std::string filename;
 
-  // counter needed do decide when to write restart
-  mutable unsigned int counter;
+  // counter needed do decide when to write restart regarding physical time
+  mutable unsigned int interval_counter;
+
+  // counter needed do decide when to write restart regarding elapsed wall time
+  mutable unsigned int interval_counter_wall_time;
 
   // The discretization used when writing the restart data was identical to the current one.
   // Note that this includes the finite element, uniform and adaptive refinement, and the
