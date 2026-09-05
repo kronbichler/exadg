@@ -783,11 +783,13 @@ Parameters::print(dealii::ConditionalOStream const & pcout, std::string const & 
   print_parameters_numerical_parameters(pcout);
 
   // HIGH-ORDER DUAL SPLITTING SCHEME
-  if(temporal_discretization == TemporalDiscretization::BDFDualSplitting)
+  if(temporal_discretization == TemporalDiscretization::BDFDualSplitting or
+     temporal_discretization == TemporalDiscretization::BDFDualSplittingExtruded)
     print_parameters_dual_splitting(pcout);
 
   // CONSISTENT SPLITTING SCHEME
-  if(temporal_discretization == TemporalDiscretization::BDFConsistentSplitting)
+  if(temporal_discretization == TemporalDiscretization::BDFConsistentSplitting or
+     temporal_discretization == TemporalDiscretization::BDFConsistentSplittingExtruded)
     print_parameters_consistent_splitting(pcout);
 
   // PRESSURE-CORRECTION  SCHEME

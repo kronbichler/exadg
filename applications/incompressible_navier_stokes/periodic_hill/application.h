@@ -451,6 +451,9 @@ public:
                         temporal_discretization,
                         "Temporal discretization");
       prm.add_parameter("SpatialDiscretization", spatial_discretization, "Spatial discretization");
+      prm.add_parameter("MomentumLinearSolver",
+                        momentum_solver_type,
+                        "Iterative solver chosen for the momentum (viscous) solver");
       prm.add_parameter("Inviscid",
                         inviscid,
                         "Consider inviscid flow, i.e., zero viscosity.",
@@ -680,7 +683,7 @@ private:
       this->param.order_time_integrator <= 2 ? this->param.order_time_integrator : 2;
 
     this->param.solver_data_momentum =
-      SolverData(1000, abs_tol_lin, rel_tol_lin_momentum, LinearSolver::CG);
+      SolverData(1000, abs_tol_lin, rel_tol_lin_momentum, momentum_solver_type);
     this->param.preconditioner_momentum = spatial_discretization == SpatialDiscretization::L2 ?
                                             MomentumPreconditioner::InverseMassMatrix :
                                             MomentumPreconditioner::PointJacobi;
@@ -1439,6 +1442,7 @@ private:
   TemporalDiscretization temporal_discretization = TemporalDiscretization::Undefined;
   TriangulationType      triangulation_type      = TriangulationType::Distributed;
   SpatialDiscretization  spatial_discretization  = SpatialDiscretization::L2;
+  LinearSolver           momentum_solver_type    = LinearSolver::CG;
 
   // postprocessing
 
