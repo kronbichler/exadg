@@ -248,6 +248,18 @@ struct LinePlotDataStatistics : public LinePlotDataBase<dim>
 {
   TimeControlDataStatistics time_control_data_statistics;
 
+  /*
+   * If true, the accumulated time-integral quantities used to compute the
+   * time-averaged mean are reset every time `write_output()` is called, such
+   * that each output file reflects the time window since the previous write.
+   */
+  bool reset_integral_on_write = false;
+
+  /*
+   * Flag for ALE formulation; mesh is non-static in this case.
+   */
+  bool ale_formulation = true;
+
   void
   print(dealii::ConditionalOStream & pcout)
   {

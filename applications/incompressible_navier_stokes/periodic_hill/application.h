@@ -22,6 +22,9 @@
 #ifndef APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_TEST_CASES_PERIODIC_HILL_H_
 #define APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_TEST_CASES_PERIODIC_HILL_H_
 
+// ExaDG
+#include <exadg/utilities/create_directories.h>
+
 // periodic hill application
 #include "include/flow_rate_controller.h"
 #include "include/manifold.h"
@@ -507,6 +510,35 @@ private:
   parse_parameters() final
   {
     ApplicationBase<dim, Number>::parse_parameters();
+
+    // Automatic "span" folder handling to chain restarts without manually editing the
+    // input file between runs: each run's output (and, if `WriteRestart == true`, its
+    // restart data) is written into a numbered subfolder "periodic_hill_span_<N>" of
+    // `OutputDirectory`. A fresh run (`ReadRestart == false`) simply uses
+    // `OutputDirectory` as-is. A restarted run (`ReadRestart == true`) scans
+    // `OutputDirectory` for existing "periodic_hill_span_<N>" folders, reads from the one
+    // with the largest N found (asserting that at least "periodic_hill_span_0",
+    // containing the initial snapshot, exists), and writes into "periodic_hill_span_<N+1>".
+    if(read_restart)
+    {
+      std::string const span_prefix = "periodic_hill_span_";
+
+      std::optional<unsigned int> const last_span =
+        find_last_indexed_subdirectory(this->output_parameters.directory,
+                                       span_prefix,
+                                       this->mpi_comm);
+
+      AssertThrow(last_span.has_value(),
+                  dealii::ExcMessage("ReadRestart = true, but no folder \"" + span_prefix +
+                                     "<N>\" was found in \"" + this->output_parameters.directory +
+                                     "\". Expected at least \"" + span_prefix +
+                                     "0\" containing the initial snapshot to restart from."));
+
+      restart_directory =
+        this->output_parameters.directory + span_prefix + std::to_string(*last_span) + "/";
+      this->output_parameters.directory =
+        this->output_parameters.directory + span_prefix + std::to_string(*last_span + 1) + "/";
+    }
 
     // viscosity needs to be recomputed since the parameters inviscid, Re are
     // read from the input file
@@ -1366,7 +1398,17 @@ private:
     my_pp_data.line_plot_data.time_control_data_statistics.time_control_data
       .trigger_every_time_steps = sample_every_timesteps;
     my_pp_data.line_plot_data.time_control_data_statistics
-      .write_preliminary_results_every_nth_time_step = sample_every_timesteps * 2000;
+      .write_preliminary_results_every_nth_time_step = sample_every_timesteps * 1000;
+
+    // Reset the accumulated time-integral (mean) quantities every time line
+    // output is written, so that each set of line-plot files reflects only the
+    // time window since the previous write (rather than the running mean since
+    // sample_start_time).
+    my_pp_data.line_plot_data.reset_integral_on_write = true;
+
+    // Grid-size-dependent quantities do not need to be recomputed/time-averaged
+    // every sample when the mesh is static.
+    my_pp_data.line_plot_data.ale_formulation = this->param.ale_formulation;
 
     // calculation of flow rate (use volume-based computation)
     my_pp_data.mean_velocity_data.calculate = true;

@@ -142,11 +142,11 @@ private:
 
   // Velocity quantities
   // For all lines: for all points along the line
-  std::vector<std::vector<dealii::Tensor<1, dim, Number>>> velocity_global;
+  std::vector<std::vector<dealii::Tensor<1, dim, Number>>> velocity_time_integral_global;
 
   // Pressure quantities
   // For all lines: for all points along the line
-  std::vector<std::vector<Number>> pressure_global;
+  std::vector<std::vector<Number>> pressure_time_integral_global;
 
   bool write_final_output;
 };

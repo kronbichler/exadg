@@ -51,8 +51,8 @@ namespace IncNS
  * and one spatial, homogeneous direction (averaging_direction = {0,1,2}), e.g.,
  * in the x-direction with a line in the y-z plane.
  *
- * NOTE: This functionality can only be used for hypercube meshes and for geometries/meshes for
- * which the cells are aligned with the coordinate axis.
+ * NOTE: This functionality can only be used for hypercube meshes and for
+ * geometries/meshes for which the cells are aligned with the coordinate axis.
  */
 
 template<int dim, typename Number>
@@ -78,10 +78,13 @@ public:
         RTOperator::RaviartThomasOperator<dim, Number> const & rt_operator);
 
   void
-  evaluate(VectorType const & velocity, VectorType const & pressure, double const dt);
+  evaluate(VectorType const & velocity,
+           VectorType const & pressure,
+           double const       time,
+           double const       dt);
 
   void
-  write_output() const;
+  write_output(double const time);
 
   TimeControlStatistics time_control_statistics;
 
@@ -105,7 +108,10 @@ private:
   print_headline(std::ofstream & f, unsigned int const number_of_samples) const;
 
   void
-  do_evaluate(VectorType const & velocity, VectorType const & pressure, double const dt);
+  do_evaluate(VectorType const & velocity,
+              VectorType const & pressure,
+              double const       time,
+              double const       dt);
 
   void
   average_pressure_for_given_point(VectorType const & pressure,
@@ -114,7 +120,16 @@ private:
                                    double &           pressure_local);
 
   void
-  do_write_output() const;
+  do_write_output(double const time) const;
+
+  /**
+   * Resets the state of the internal data used for the time-integral (mean)
+   * computation, i.e., the sample/time bookkeeping and the accumulated
+   * time-integral quantities for all lines. Called from `write_output()` if
+   * `data.reset_integral_on_write == true`.
+   */
+  void
+  reset_time_integral_data();
 
   mutable bool clear_files;
 
@@ -134,8 +149,8 @@ private:
                                     std::vector<std::pair<unsigned int, dealii::Point<dim>>>>>>
     cells_and_ref_points;
 
-  // For all lines: for pressure reference point: list of all relevant cells and points in ref
-  // coordinates
+  // For all lines: for pressure reference point: list of all relevant cells and
+  // points in ref coordinates
   std::vector<std::vector<
     std::pair<typename dealii::DoFHandler<dim>::active_cell_iterator, dealii::Point<dim>>>>
     cells_and_ref_points_ref_pressure;
@@ -146,34 +161,55 @@ private:
   // accumulated physical time for time-weighted averaging
   double accumulated_time;
 
+  // time instant of the last call to `do_evaluate()`
+  double time_last;
+
   // homogeneous direction for averaging in space
   unsigned int averaging_direction;
 
-  // Velocity quantities
-  // For all lines: for all points along the line
-  std::vector<std::vector<dealii::Tensor<1, dim, double>>> velocity_global;
+  // We hold for each quantity global vectors for all lines and all points along
+  // the lines
+  // i) the accumulating time integral of values along the line,
+  // ii) instanteneous values of the last processed field, and
+  // iii) the instantaneous (not time-integrated) spatial variance of the last
+  //      processed field along the homogeneous direction. Since sample points
+  //      are not evenly spaced, we use the weighted variance
+  //      Var = (1/W) * sum_i w_i (mean - value_i)^2,
+  //      W = sum_i w_i,
+  //      with w_i the same quadrature/Jacobian weight used for the mean. Since
+  //      sum_i w_i*value_i = mean*W by definition of the mean, this yields
+  //      Var = <x^2>_z - mean^2, i.e., the weighted second moment minus mean^2.
+
+  // Velocity quantities. Note that the spatial variance of the velocity is not stored
+  // separately, since it is identical to the diagonal entries of the Reynolds stresses
+  // (`reynolds_last_global[d][d] - velocity_last_global[d] * velocity_last_global[d]`).
+  std::vector<std::vector<dealii::Tensor<1, dim, double>>> velocity_time_integral_global;
+  std::vector<std::vector<dealii::Tensor<1, dim, double>>> velocity_last_global;
 
   // Skin Friction quantities
-  // For all lines: for all points along the line
-  std::vector<std::vector<double>> wall_shear_global;
+  std::vector<std::vector<double>> wall_shear_time_integral_global;
+  std::vector<std::vector<double>> wall_shear_last_global;
+  std::vector<std::vector<double>> wall_shear_variance_last_global;
 
   // Reynolds Stress quantities
-  // For all lines: for all points along the line
-  std::vector<std::vector<dealii::SymmetricTensor<2, dim, double>>> reynolds_global;
+  std::vector<std::vector<dealii::SymmetricTensor<2, dim, double>>> reynolds_time_integral_global;
+  std::vector<std::vector<dealii::SymmetricTensor<2, dim, double>>> reynolds_last_global;
 
   // Dissipation quantities
-  // For all lines: for all points along the line
-  std::vector<std::vector<double>> dissipation_global; // = epsilon
+  std::vector<std::vector<double>> dissipation_time_integral_global; // = epsilon
+  std::vector<std::vector<double>> dissipation_last_global;          // = epsilon
+  std::vector<std::vector<double>> dissipation_variance_last_global; // = epsilon
 
   // Grid size quantities (he)
-  // For all lines: for all points along the line
-  std::vector<std::vector<double>> grid_size_global; //= he
+  std::vector<std::vector<double>> grid_size_time_integral_global; //= he
 
   // Pressure quantities
-  // For all lines: for all points along the line
-  std::vector<std::vector<double>> pressure_global;
+  std::vector<std::vector<double>> pressure_time_integral_global;
+  std::vector<std::vector<double>> pressure_last_global;
+  std::vector<std::vector<double>> pressure_variance_last_global;
   // For all lines
-  std::vector<double> reference_pressure_global;
+  std::vector<double> reference_pressure_time_integral_global;
+  std::vector<double> reference_pressure_last_global;
 
   // write final output
   bool write_final_output;

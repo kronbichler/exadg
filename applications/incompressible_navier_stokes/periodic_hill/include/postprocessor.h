@@ -152,16 +152,17 @@ public:
         if(consistent_splitting_operator)
           line_plot_calculator_statistics->evaluate(*consistent_splitting_operator->velocity_vector,
                                                     pressure,
+                                                    time,
                                                     time_step_size);
         else
-          line_plot_calculator_statistics->evaluate(velocity, pressure, time_step_size);
+          line_plot_calculator_statistics->evaluate(velocity, pressure, time, time_step_size);
       }
     }
 
     if(line_plot_calculator_statistics->time_control_statistics.write_preliminary_results(
          time, time_step_number))
     {
-      line_plot_calculator_statistics->write_output();
+      line_plot_calculator_statistics->write_output(time);
     }
   }
 

@@ -65,8 +65,8 @@ LinePlotCalculatorStatistics<dim, Number>::setup(LinePlotDataStatistics<dim> con
     AssertThrow(data.lines.size() > 0, dealii::ExcMessage("Empty data"));
 
     // allocate data structures
-    velocity_global.resize(data.lines.size());
-    pressure_global.resize(data.lines.size());
+    velocity_time_integral_global.resize(data.lines.size());
+    pressure_time_integral_global.resize(data.lines.size());
     global_points.resize(data.lines.size());
     cells_global_velocity.resize(data.lines.size());
     cells_global_pressure.resize(data.lines.size());
@@ -77,8 +77,8 @@ LinePlotCalculatorStatistics<dim, Number>::setup(LinePlotDataStatistics<dim> con
         ++line, ++line_iterator)
     {
       // Resize global variables for number of points on line
-      velocity_global[line_iterator].resize((*line)->n_points);
-      pressure_global[line_iterator].resize((*line)->n_points);
+      velocity_time_integral_global[line_iterator].resize((*line)->n_points);
+      pressure_time_integral_global[line_iterator].resize((*line)->n_points);
 
       // initialize global_points: use/assume equidistant points along line
       for(unsigned int i = 0; i < (*line)->n_points; ++i)
@@ -394,7 +394,7 @@ LinePlotCalculatorStatistics<dim, Number>::do_evaluate_velocity(VectorType const
         {
           if(counter_vector_local[p] > 0)
           {
-            velocity_global[line_iterator][p][d] +=
+            velocity_time_integral_global[line_iterator][p][d] +=
               velocity_vector_local[p][d] / counter_vector_local[p];
           }
         }
@@ -476,7 +476,8 @@ LinePlotCalculatorStatistics<dim, Number>::do_evaluate_pressure(VectorType const
         // Take average value over all adjacent cells for a given point.
         if(counter_vector_local[p] > 0)
         {
-          pressure_global[line_iterator][p] += pressure_vector_local[p] / counter_vector_local[p];
+          pressure_time_integral_global[line_iterator][p] +=
+            pressure_vector_local[p] / counter_vector_local[p];
         }
       }
     }
@@ -545,7 +546,7 @@ LinePlotCalculatorStatistics<dim, Number>::do_write_output() const
             // write velocity and average over time
             for(unsigned int d = 0; d < dim; ++d)
               f << std::setw(precision + 8) << std::left
-                << velocity_global[line_iterator][p][d] / number_of_samples;
+                << velocity_time_integral_global[line_iterator][p][d] / number_of_samples;
 
             f << std::endl;
           }
@@ -595,7 +596,7 @@ LinePlotCalculatorStatistics<dim, Number>::do_write_output() const
               f << std::setw(precision + 8) << std::left << global_points[line_iterator][p][d];
 
             f << std::setw(precision + 8) << std::left
-              << pressure_global[line_iterator][p] / number_of_samples;
+              << pressure_time_integral_global[line_iterator][p] / number_of_samples;
 
             f << std::endl;
           }
