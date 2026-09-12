@@ -511,6 +511,11 @@ private:
   {
     ApplicationBase<dim, Number>::parse_parameters();
 
+    // The coarse triangulation lives directly in `OutputDirectory`, one level above the
+    // "periodic_hill_span_<N>" subfolders, so capture it before `output_parameters.directory`
+    // is possibly rewritten to a span subfolder below.
+    coarse_triangulation_directory = this->output_parameters.directory;
+
     // Automatic "span" folder handling to chain restarts without manually editing the
     // input file between runs: each run's output (and, if `WriteRestart == true`, its
     // restart data) is written into a numbered subfolder "periodic_hill_span_<N>" of
@@ -656,11 +661,11 @@ private:
     this->param.turbulence_model_data.constant = 1.35;
 
     // RESTART
-    this->param.restarted_simulation                        = read_restart;
-    this->param.restart_data.write_restart                  = write_restart;
-    this->param.restart_data.write_vectors_to_vtu           = this->output_parameters.write;
-    this->param.restart_data.interval_time                  = restart_interval_time;
-    this->param.restart_data.directory_coarse_triangulation = restart_directory;
+    this->param.restarted_simulation              = read_restart;
+    this->param.restart_data.write_restart        = write_restart;
+    this->param.restart_data.write_vectors_to_vtu = false; // this->output_parameters.write;
+    this->param.restart_data.interval_time        = restart_interval_time;
+    this->param.restart_data.directory_coarse_triangulation = coarse_triangulation_directory;
     this->param.restart_data.directory_read                 = restart_directory;
     this->param.restart_data.directory_write                = this->output_parameters.directory;
     this->param.restart_data.filename            = this->output_parameters.filename + "_restart";
@@ -1493,7 +1498,10 @@ private:
   bool        read_restart               = false;
   double      restart_interval_time      = 8.0 * flow_through_time;
   double      restart_interval_wall_time = std::numeric_limits<double>::max();
-  std::string restart_directory          = "./output/";
+  std::string restart_directory          = "./output/periodic_hill_span_0/";
+
+  // Coarse triangulation directory above the span folders.
+  std::string coarse_triangulation_directory;
 
   // sampling
   bool         calculate_statistics        = true;

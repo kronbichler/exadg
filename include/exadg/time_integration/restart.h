@@ -511,7 +511,7 @@ deserialize_triangulation(RestartData const &     restart_data,
 {
   std::shared_ptr<dealii::Triangulation<dim>> triangulation_old;
 
-  std::string const filename = restart_data.directory_write + restart_data.filename;
+  std::string const filename = restart_data.directory_read + restart_data.filename;
 
   // Deserialize the checkpointed triangulation,
   if(triangulation_type == TriangulationType::Serial)
