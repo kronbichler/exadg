@@ -632,10 +632,10 @@ private:
     this->param.turbulence_model_data.constant = 1.35;
 
     // RESTART
-    this->param.restarted_simulation                        = read_restart;
-    this->param.restart_data.write_restart                  = write_restart;
-    this->param.restart_data.write_vectors_to_vtu           = false; // this->output_parameters.write;
-    this->param.restart_data.interval_time                  = restart_interval_time;
+    this->param.restarted_simulation              = read_restart;
+    this->param.restart_data.write_restart        = write_restart;
+    this->param.restart_data.write_vectors_to_vtu = false; // this->output_parameters.write;
+    this->param.restart_data.interval_time        = restart_interval_time;
     this->param.restart_data.directory_coarse_triangulation = coarse_triangulation_directory;
     this->param.restart_data.directory_read                 = restart_directory;
     this->param.restart_data.directory_write                = this->output_parameters.directory;
@@ -1141,12 +1141,13 @@ private:
     MyPostProcessorData<dim> my_pp_data;
     my_pp_data.pp_data = pp_data;
 
-    // line plot data: calculate statistics along lines Automatic "span"
-    // folder handling to chain the line data without manually editing the
-    // input file between runs: each run's output is written into a numbered
-    // subfolder SUBDIRECTORY_PREFIX + "_span_<N>" of `OutputDirectory`. We
-    // scan `OutputDirectory` for existing "span_<N>" folders and write into
-    // "periodic_hill_span_<N+1>".
+    // line plot data: calculate statistics along lines
+
+    // Automatic "span" folder handling to chain the line data without
+    // manually editing the input file between runs: each run's output is
+    // written into a numbered subfolder SUBDIRECTORY_PREFIX + "_span_<N>" of
+    // `OutputDirectory`. We scan `OutputDirectory` for existing "span_<N>"
+    // folders and write into "periodic_hill_span_<N+1>".
     std::string const span_prefix = "_span_";
 
     std::optional<unsigned int> const last_span =
