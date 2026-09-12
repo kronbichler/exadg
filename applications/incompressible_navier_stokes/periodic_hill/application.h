@@ -516,35 +516,6 @@ private:
     // is possibly rewritten to a span subfolder below.
     coarse_triangulation_directory = this->output_parameters.directory;
 
-    // Automatic "span" folder handling to chain restarts without manually editing the
-    // input file between runs: each run's output (and, if `WriteRestart == true`, its
-    // restart data) is written into a numbered subfolder "periodic_hill_span_<N>" of
-    // `OutputDirectory`. A fresh run (`ReadRestart == false`) simply uses
-    // `OutputDirectory` as-is. A restarted run (`ReadRestart == true`) scans
-    // `OutputDirectory` for existing "periodic_hill_span_<N>" folders, reads from the one
-    // with the largest N found (asserting that at least "periodic_hill_span_0",
-    // containing the initial snapshot, exists), and writes into "periodic_hill_span_<N+1>".
-    if(read_restart)
-    {
-      std::string const span_prefix = "periodic_hill_span_";
-
-      std::optional<unsigned int> const last_span =
-        find_last_indexed_subdirectory(this->output_parameters.directory,
-                                       span_prefix,
-                                       this->mpi_comm);
-
-      AssertThrow(last_span.has_value(),
-                  dealii::ExcMessage("ReadRestart = true, but no folder \"" + span_prefix +
-                                     "<N>\" was found in \"" + this->output_parameters.directory +
-                                     "\". Expected at least \"" + span_prefix +
-                                     "0\" containing the initial snapshot to restart from."));
-
-      restart_directory =
-        this->output_parameters.directory + span_prefix + std::to_string(*last_span) + "/";
-      this->output_parameters.directory =
-        this->output_parameters.directory + span_prefix + std::to_string(*last_span + 1) + "/";
-    }
-
     // viscosity needs to be recomputed since the parameters inviscid, Re are
     // read from the input file
     viscosity = inviscid ? 0.0 : bulk_velocity * height_hill / Re;
@@ -661,10 +632,10 @@ private:
     this->param.turbulence_model_data.constant = 1.35;
 
     // RESTART
-    this->param.restarted_simulation              = read_restart;
-    this->param.restart_data.write_restart        = write_restart;
-    this->param.restart_data.write_vectors_to_vtu = false; // this->output_parameters.write;
-    this->param.restart_data.interval_time        = restart_interval_time;
+    this->param.restarted_simulation                        = read_restart;
+    this->param.restart_data.write_restart                  = write_restart;
+    this->param.restart_data.write_vectors_to_vtu           = this->output_parameters.write;
+    this->param.restart_data.interval_time                  = restart_interval_time;
     this->param.restart_data.directory_coarse_triangulation = coarse_triangulation_directory;
     this->param.restart_data.directory_read                 = restart_directory;
     this->param.restart_data.directory_write                = this->output_parameters.directory;
@@ -1170,9 +1141,26 @@ private:
     MyPostProcessorData<dim> my_pp_data;
     my_pp_data.pp_data = pp_data;
 
-    // line plot data: calculate statistics along lines
-    my_pp_data.line_plot_data.directory =
-      this->output_parameters.directory + subdirectory_statistics;
+    // line plot data: calculate statistics along lines Automatic "span"
+    // folder handling to chain the line data without manually editing the
+    // input file between runs: each run's output is written into a numbered
+    // subfolder SUBDIRECTORY_PREFIX + "_span_<N>" of `OutputDirectory`. We
+    // scan `OutputDirectory` for existing "span_<N>" folders and write into
+    // "periodic_hill_span_<N+1>".
+    std::string const span_prefix = "_span_";
+
+    std::optional<unsigned int> const last_span =
+      find_last_indexed_subdirectory(this->output_parameters.directory,
+                                     subdirectory_statistics + span_prefix,
+                                     this->mpi_comm);
+
+    if(last_span.has_value())
+      my_pp_data.line_plot_data.directory = this->output_parameters.directory +
+                                            subdirectory_statistics + span_prefix +
+                                            std::to_string(*last_span + 1) + "/";
+    else
+      my_pp_data.line_plot_data.directory =
+        this->output_parameters.directory + subdirectory_statistics + span_prefix + "0/";
 
     // mean velocity
     std::shared_ptr<Quantity> quantity_velocity;
@@ -1498,7 +1486,7 @@ private:
   bool        read_restart               = false;
   double      restart_interval_time      = 8.0 * flow_through_time;
   double      restart_interval_wall_time = std::numeric_limits<double>::max();
-  std::string restart_directory          = "./output/periodic_hill_span_0/";
+  std::string restart_directory          = "./output/";
 
   // Coarse triangulation directory above the span folders.
   std::string coarse_triangulation_directory;
