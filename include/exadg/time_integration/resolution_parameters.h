@@ -51,13 +51,11 @@ struct TemporalResolutionParameters
       prm.add_parameter("RefineTimeMin",
                         refine_time_min,
                         "Minimal number of time refinements.",
-                        dealii::Patterns::Integer(0, 20),
-                        true);
+                        dealii::Patterns::Integer(0, 20));
       prm.add_parameter("RefineTimeMax",
                         refine_time_max,
                         "Maximal number of time refinements.",
-                        dealii::Patterns::Integer(0, 20),
-                        true);
+                        dealii::Patterns::Integer(0, 20));
     }
     prm.leave_subsection();
   }
