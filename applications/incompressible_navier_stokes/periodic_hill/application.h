@@ -585,7 +585,7 @@ private:
       temporal_convergence_study ? TimeStepCalculation::UserSpecified : TimeStepCalculation::CFL;
     this->param.adaptive_time_stepping          = temporal_convergence_study ? false : true;
     this->param.max_velocity                    = bulk_velocity;
-    this->param.cfl                             = 0.32; // 0.375;
+    this->param.cfl                             = 0.35; // 0.375;
     this->param.cfl_exponent_fe_degree_velocity = 1.5;
     this->param.time_step_size                  = 1.0e-4;
     this->param.order_time_integrator           = 3;
@@ -1191,7 +1191,7 @@ private:
 
     // lines
     std::shared_ptr<LineHomogeneousAveraging<dim>> vel_0, vel_005, vel_05, vel_1, vel_2, vel_3,
-      vel_4, vel_5, vel_6, vel_7, vel_8, vel_9, vel_10;
+      vel_4, vel_5, vel_6, vel_7, vel_8, vel_85, vel_9, vel_10;
     vel_0.reset(new LineHomogeneousAveraging<dim>());
     vel_005.reset(new LineHomogeneousAveraging<dim>());
     vel_05.reset(new LineHomogeneousAveraging<dim>());
@@ -1203,6 +1203,7 @@ private:
     vel_6.reset(new LineHomogeneousAveraging<dim>());
     vel_7.reset(new LineHomogeneousAveraging<dim>());
     vel_8.reset(new LineHomogeneousAveraging<dim>());
+    vel_85.reset(new LineHomogeneousAveraging<dim>());
     vel_9.reset(new LineHomogeneousAveraging<dim>());
     vel_10.reset(new LineHomogeneousAveraging<dim>());
 
@@ -1217,6 +1218,7 @@ private:
     vel_6->average_homogeneous_direction   = true;
     vel_7->average_homogeneous_direction   = true;
     vel_8->average_homogeneous_direction   = true;
+    vel_85->average_homogeneous_direction  = true;
     vel_9->average_homogeneous_direction   = true;
     vel_10->average_homogeneous_direction  = true;
 
@@ -1231,6 +1233,7 @@ private:
     vel_6->averaging_direction   = 2;
     vel_7->averaging_direction   = 2;
     vel_8->averaging_direction   = 2;
+    vel_85->averaging_direction  = 2;
     vel_9->averaging_direction   = 2;
     vel_10->averaging_direction  = 2;
 
@@ -1263,6 +1266,8 @@ private:
       vel_7->end               = dealii::Point<dim>(7 * H, top, 0);
       vel_8->begin             = dealii::Point<dim>(8 * H, H + f(8 * H, H, L) + eps, 0);
       vel_8->end               = dealii::Point<dim>(8 * H, top, 0);
+      vel_85->begin            = dealii::Point<dim>(8.5 * H, H + f(8.5 * H, H, L) + eps, 0);
+      vel_85->end              = dealii::Point<dim>(8.5 * H, top, 0);
 
       vel_9->begin = dealii::Point<dim>(0 * H, top, 0);
       vel_9->end   = dealii::Point<dim>(9 * H, top, 0);
@@ -1287,6 +1292,7 @@ private:
     vel_6->n_points   = points_per_line;
     vel_7->n_points   = points_per_line;
     vel_8->n_points   = points_per_line;
+    vel_85->n_points  = points_per_line;
     vel_9->n_points   = points_per_line;
     vel_10->n_points  = points_per_line;
 
@@ -1335,6 +1341,10 @@ private:
     vel_8->quantities.push_back(quantity_reynolds);
     vel_8->quantities.push_back(quantity_dissipation);
     vel_8->quantities.push_back(quantity_skin_friction_bulk);
+    vel_85->quantities.push_back(quantity_velocity);
+    vel_85->quantities.push_back(quantity_reynolds);
+    vel_85->quantities.push_back(quantity_dissipation);
+    vel_85->quantities.push_back(quantity_skin_friction_bulk);
 
     vel_9->quantities.push_back(quantity_velocity);
     vel_9->quantities.push_back(quantity_reynolds);
@@ -1366,6 +1376,7 @@ private:
     vel_6->name   = this->output_parameters.filename + "_x_6";
     vel_7->name   = this->output_parameters.filename + "_x_7";
     vel_8->name   = this->output_parameters.filename + "_x_8";
+    vel_85->name  = this->output_parameters.filename + "_x_85";
     vel_9->name   = this->output_parameters.filename + "_top";
     vel_10->name  = this->output_parameters.filename + "_bottom";
 
@@ -1381,6 +1392,7 @@ private:
     my_pp_data.line_plot_data.lines.push_back(vel_6);
     my_pp_data.line_plot_data.lines.push_back(vel_7);
     my_pp_data.line_plot_data.lines.push_back(vel_8);
+    my_pp_data.line_plot_data.lines.push_back(vel_85);
     my_pp_data.line_plot_data.lines.push_back(vel_9);
     my_pp_data.line_plot_data.lines.push_back(vel_10);
 
@@ -1392,7 +1404,7 @@ private:
     my_pp_data.line_plot_data.time_control_data_statistics.time_control_data
       .trigger_every_time_steps = sample_every_timesteps;
     my_pp_data.line_plot_data.time_control_data_statistics
-      .write_preliminary_results_every_nth_time_step = sample_every_timesteps * 1000;
+      .write_preliminary_results_every_nth_time_step = sample_every_timesteps * 100;
 
     // Reset the accumulated time-integral (mean) quantities every time line
     // output is written, so that each set of line-plot files reflects only the
