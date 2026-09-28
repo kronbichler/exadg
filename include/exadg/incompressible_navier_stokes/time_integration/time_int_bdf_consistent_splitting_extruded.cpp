@@ -862,8 +862,11 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       reached_residual = control.last_value();
 
       // Prepare the Chebyshev solver for the other cases in case this is not
-      // the cleanup part
-      constexpr unsigned int min_eigenvalue_iterations = 5;
+      // the cleanup part; we only accept the upper eigenvalue bound for
+      // Chebyshev if we did at least 8 iterations, otherwise the CG solution
+      // might be too inaccurate and miss high eigenvalues (which leads to
+      // convergence problems with Chebyshev).
+      constexpr unsigned int min_eigenvalue_iterations = 8;
       if(control.last_step() >= min_eigenvalue_iterations && min_eig > 0.0 && max_eig >= min_eig)
       {
         // Update the estimate for the condition number: We choose a low
