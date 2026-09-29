@@ -70,7 +70,7 @@ box_distort(dealii::Point<dim> const & point_in,
 };
 
 /*
- * Initial condition for the velocity for the standard periodic hill benchmark. Qudratic flow
+ * Initial condition for the velocity for the standard periodic hill benchmark. Quadratic flow
  * profile in upper part of the channel with added Gaussian noise.
  */
 template<int dim>
@@ -475,6 +475,12 @@ public:
                         "Setting this limit can terminate a simulation also when the given "
                         "end time was not yet reached.",
                         dealii::Patterns::Double(0.0));
+      prm.add_parameter("GridDeformationType",
+                        grid_deformation_type,
+                        "Enum to describe the available types of the hill manifold, "
+                        "including a basic tanh profile with GridStretchFactor as well "
+                        "as redistributions of elements to place more weight in areas "
+                        "with high dissipation rate.");
       prm.add_parameter("GridStretchFactor",
                         grid_stretch_factor,
                         "Factor describing grid stretching in vertical direction.",
@@ -809,20 +815,25 @@ private:
                                     dealii::update_quadrature_points);
     const std::vector<unsigned int> hierarchic_to_lexicographic_numbering =
       dealii::FETools::hierarchic_to_lexicographic_numbering<dim>(this->param.mapping_degree);
+    const std::shared_ptr<dealii::ChartManifold<dim>> manifold = get_manifold();
+
+    // The two panels of PeriodicHillManifoldOptimizedMesh are only C^0
+    // continuous at x = length_channel / 2, which must hence be an element face
+    AssertThrow(not consider_mapping or
+                  grid_deformation_type != GridDeformationType::GradedMeshOptimizationShift or
+                  (coarse_mesh_refinements[0] % 2 == 0 and not consider_box_distort),
+                dealii::ExcMessage("GradedMeshOptimizationShift requires an even number of "
+                                   "coarse cells in x-direction and no box distortion."));
+
     const auto mapping_function_fine =
       [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
       -> std::vector<dealii::Point<dim>> {
-      PeriodicHillManifold<dim> manifold(height_hill,
-                                         length_channel,
-                                         height_channel_at_hill_top,
-                                         grid_stretch_factor);
       fe_values.reinit(cell);
 
       std::vector<dealii::Point<dim>> points_moved(fe_values.n_quadrature_points);
       for(unsigned int i = 0; i < fe_values.n_quadrature_points; ++i)
       {
-        // need to adjust for hierarchic numbering of
-        // dealii::MappingQCache
+        // need to adjust for hierarchic numbering of dealii::MappingQCache
         dealii::Point<dim> const point_in_box =
           box_distort(fe_values.quadrature_point(hierarchic_to_lexicographic_numbering[i]),
                       consider_box_distort,
@@ -830,7 +841,7 @@ private:
                       height_hill,
                       height_channel_at_hill_top);
         if(consider_mapping)
-          points_moved[i] = manifold.push_forward(point_in_box);
+          points_moved[i] = manifold->push_forward(point_in_box);
         else
           points_moved[i] = point_in_box;
       }
@@ -903,7 +914,7 @@ private:
 
       // We use a manifold class for this intermediate process because in a
       // massively parallel computation different scenarios may appear in
-      // articifical cells, which change during refinement and the associated
+      // artificial cells, which change during refinement and the associated
       // partitioning.
       {
         const double                       size_y   = (p_2[1] - p_1[1]) / 24;
@@ -1003,12 +1014,10 @@ private:
       std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
     mapping_q_cache->initialize(*grid.triangulation, mapping_function_fine);
 
-    grid.mapping_function = [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
+    // capture manifold by value, as the function is stored in the grid
+    grid.mapping_function =
+      [&, manifold](typename dealii::Triangulation<dim>::cell_iterator const & cell)
       -> std::vector<dealii::Point<dim>> {
-      PeriodicHillManifold<dim>       manifold(height_hill,
-                                         length_channel,
-                                         height_channel_at_hill_top,
-                                         grid_stretch_factor);
       std::vector<dealii::Point<dim>> points_moved(cell->n_vertices());
       for(unsigned int i = 0; i < cell->n_vertices(); ++i)
       {
@@ -1021,7 +1030,7 @@ private:
                                                             height_channel_at_hill_top);
 
         if(consider_mapping)
-          points_moved[i] = manifold.push_forward(point_in_box);
+          points_moved[i] = manifold->push_forward(point_in_box);
         else
           points_moved[i] = point_in_box;
       }
@@ -1269,10 +1278,7 @@ private:
 
       vel_10->begin    = dealii::Point<dim>(0 * H, flat_bottom, 0);
       vel_10->end      = dealii::Point<dim>(9 * H, flat_bottom, 0);
-      vel_10->manifold = std::make_shared<PeriodicHillManifold<dim>>(H,
-                                                                     L,
-                                                                     height_channel_at_hill_top,
-                                                                     grid_stretch_factor);
+      vel_10->manifold = get_manifold();
     }
 
     // set the number of points along the lines
@@ -1421,6 +1427,32 @@ private:
     return pp;
   }
 
+  std::shared_ptr<dealii::ChartManifold<dim>>
+  get_manifold() const
+  {
+    if(grid_deformation_type == GridDeformationType::GradedMeshUniform)
+      return std::make_shared<PeriodicHillManifoldTanh<dim>>(height_hill,
+                                                             length_channel,
+                                                             height_channel_at_hill_top,
+                                                             grid_stretch_factor,
+                                                             /* manual_trafo */ false);
+    else if(grid_deformation_type == GridDeformationType::GradedMeshManualShift)
+      return std::make_shared<PeriodicHillManifoldTanh<dim>>(height_hill,
+                                                             length_channel,
+                                                             height_channel_at_hill_top,
+                                                             grid_stretch_factor,
+                                                             /* manual_trafo */ true);
+    else if(grid_deformation_type == GridDeformationType::GradedMeshOptimizationShift)
+      return std::make_shared<PeriodicHillManifoldOptimizedMesh<dim>>(height_hill,
+                                                                      length_channel,
+                                                                      height_channel_at_hill_top,
+                                                                      grid_stretch_factor);
+    else
+      AssertThrow(false, dealii::ExcMessage("Unknown mesh deformation type for manifold."));
+
+    return nullptr;
+  }
+
   // Reynolds number, viscosity, bulk velocity
 
   bool   inviscid = false;
@@ -1470,11 +1502,12 @@ private:
   double wall_time_limit = std::numeric_limits<double>::max();
 
   // grid
-  bool   consider_box_distort = false; // distort the box grid before mapping
-  bool   consider_mapping     = true;  // map the box to give the classic periodic hill geometry
-  double grid_stretch_factor  = 1.6;
+  bool consider_box_distort = false; // distort the box grid before mapping
+  bool consider_mapping     = true;  // map the box to give the classic periodic hill geometry
+  GridDeformationType grid_deformation_type = GridDeformationType::GradedMeshUniform;
+  double              grid_stretch_factor   = 1.6;
 
-  // dicretization
+  // discretization
   TemporalDiscretization temporal_discretization = TemporalDiscretization::Undefined;
   TriangulationType      triangulation_type      = TriangulationType::Distributed;
   SpatialDiscretization  spatial_discretization  = SpatialDiscretization::L2;
