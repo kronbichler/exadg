@@ -144,7 +144,7 @@ public:
       // Shift elements towards the lower part of the domain
       const double xi_1_hat =
         std::tanh(gamma * (y - 0.08 * std::sin(dealii::numbers::PI * y))) / std::tanh(gamma);
-      xi[1] = H + (xi_1_hat * 0.5 + 0.5) * HEIGHT;
+      xi[1] = xi_1_hat * 0.5 + 0.5;
 
       // Create shift of mesh elements towards the left, where dissipation is
       // higher in the wake of the hill. The idea is to have the element
@@ -196,12 +196,13 @@ public:
     else
     {
       const double xi_1_hat = std::tanh(gamma * y) / std::tanh(gamma);
-      xi[1]                 = (xi_1_hat * 0.5 + 0.5) * HEIGHT;
+      xi[1]                 = xi_1_hat * 0.5 + 0.5;
     }
 
     // Finally move the points near the boundary to ensure approximately
     // equal-length elements (apart from at the hill top, where we want finer
-    // element distribution).
+    // element distribution). At this point, xi[1] holds the weight in [0, 1]
+    // for blending between the bottom and top walls.
     const double xi_0 =
       xi[0] < LENGTH / 2 ? get_scaled_x_point(xi[0]) : LENGTH - get_scaled_x_point(LENGTH - xi[0]);
 
@@ -281,12 +282,13 @@ private:
 
 /**
  * Alternative to the basic PeriodicHillManifoldTanh class, where the mesh
- * displacements is based on the optimization of the mesh. The actual
- * computation was done for a 64 x 48 x 32 mesh of the periodic hill with
- * element FE_RaviartThomasNodal(6) (degree 7/6 in normal/tangential part)
- * using statistics of 10 flow-through times the developed phase, and aims
- * to balance (h / eta)^2 with Kolmogorov length eta and mesh size h =
- * vol(K)^(1/3) with the fe_values.jacobian(q).determinant() quantity in the
+ * displacement is based on an optimization of the mesh. The actual
+ * computation was done for a 64 x 48 x 32 mesh of the periodic hill
+ * at Reynolds number 10595 with element FE_RaviartThomasNodal(6)
+ * (degree 7/6 in normal/tangential part) using statistics of 10
+ * flow-through times in the developed phase, and aims to balance (h / eta)^2
+ * with the Kolmogorov length eta and mesh size h = vol(K)^(1/3)
+ * with the fe_values.jacobian(q).determinant() quantity in the
  * 2D x-y slice of the mesh using a linear elasticity problem with `mu = (h
  * / eta)^2 * fe_values.jacobian(q).determinant()` and `lambda = -0.33 * mu`
  * (almost pure shear problem).
@@ -312,16 +314,17 @@ public:
       INVERSE_LENGTH(1.0 / LENGTH),
       INVERSE_HEIGHT(1.0 / HEIGHT),
       tanh_gamma(std::tanh(GRID_STRETCH_FAC)),
-      deriv_tanh_gamma(2 / (tanh_gamma * std::cosh(GRID_STRETCH_FAC) * std::cosh(GRID_STRETCH_FAC)))
+      deriv_tanh_gamma(GRID_STRETCH_FAC /
+                       (tanh_gamma * std::cosh(GRID_STRETCH_FAC) * std::cosh(GRID_STRETCH_FAC)))
   {
-    // Assume we have a slope of -1.8 (the actual slope extremum is around
+    // Assume we have a slope of -2 (the actual slope extremum is around
     // -0.86, but due to resolution requirements near the hill top choose a
-    // higher value) that transitions from a steeper part
-    // a less steep part more flat part. Start by defining a piecewise linear function (a
-    // more complicated function to check the actual path was tried but found
-    // to not be better but just more expensive) and then transition over a
-    // length corresponding to the hill height to the flat part; the actual
-    // evaluation will use a quintic Hermite interpolating polynomial.
+    // higher value) that transitions from a steeper part to a flatter part.
+    // Start by defining a piecewise linear function (a more complicated
+    // function to check the actual path was tried, but not found to perform
+    // better at a higher cost) and then transition over a length corresponding
+    // to the hill height to the flat part; the actual evaluation will use a
+    // Hermite interpolating polynomial of degree 7, see below.
     const double slope_assumed        = -2;
     const double scaling_curved_start = 0.7 * H;
     const double scaling_curved_end   = 1.8 * H;
@@ -337,10 +340,10 @@ public:
     const double x_transition_value_2 = scaling_curved_end;
     const double x_transition_value_3 = x_transition_point_3;
 
-    // We use a single 7-th order Hermite polynomial per helf length to place
+    // We use a single 7-th order Hermite polynomial per half length to place
     // the points more densely along the sloped part. The function has zero
     // second derivative on the left and 4 continuous derivatives at x=0.5,
-    // where we stitch the halfs together. Specifically, the 8 conditions are:
+    // where we stitch the halves together. Specifically, the 8 conditions are:
     // f(0) = 0, f'(0) = d0, f''(0) = 0, f(1) = v1, f'(1) = d1, f''(1) = 0,
     // f'''(1) = 0, f''''(1) = 0.  And in the stored coefficients, we drop the
     // two coefficients with value 0.
@@ -477,13 +480,15 @@ public:
     dealii::Point<dim> xi = xi_in;
     const double       y  = 2.0 * (xi[1] - H) * INVERSE_HEIGHT - 1.0;
 
-    // Cubic Hermite polynomial with same value and slope as tanh(2*y)/tanh(2)
-    // at +1 and -1, which was used as the base mesh for optimization.
+    // Cubic Hermite polynomial with same value and slope as
+    // tanh(gamma*y)/tanh(gamma) at +1 and -1, with gamma = GRID_STRETCH_FAC.
+    // The base mesh used for the optimization had gamma = 2.
     const double xi_1_hat = y * 0.5 * ((3. - deriv_tanh_gamma) + (deriv_tanh_gamma - 1.) * y * y);
 
     // Option that deforms mesh based on polynomial interpolation from a given
     // set of interpolation points, applied after the cubic Hermite
-    // approximation
+    // approximation. Note that the two panels are only C^0 continuous at
+    // x = LENGTH/2, so this line must coincide with element faces.
     const bool   left_panel = xi[0] < LENGTH / 2;
     const double r0 =
       (left_panel) ? (xi[0] * INVERSE_LENGTH * 2) : (2 * xi[0] - LENGTH) * INVERSE_LENGTH;
@@ -540,7 +545,7 @@ public:
   get_scaled_x_point(const double x_in) const
   {
     // 7-th order Hermite polynomial, which has 4 continuous derivatives at
-    // x=0.5, the position where the halfs are stitched together; the
+    // x=0.5, the position where the halves are stitched together; the
     // coefficients are set up in the constructor; several terms are zero
     // because f(0) = 0, f''(0) = 0.
     const double t = x_in * INVERSE_LENGTH * 2;

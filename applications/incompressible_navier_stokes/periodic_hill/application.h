@@ -70,7 +70,7 @@ box_distort(dealii::Point<dim> const & point_in,
 };
 
 /*
- * Initial condition for the velocity for the standard periodic hill benchmark. Qudratic flow
+ * Initial condition for the velocity for the standard periodic hill benchmark. Quadratic flow
  * profile in upper part of the channel with added Gaussian noise.
  */
 template<int dim>
@@ -815,10 +815,19 @@ private:
                                     dealii::update_quadrature_points);
     const std::vector<unsigned int> hierarchic_to_lexicographic_numbering =
       dealii::FETools::hierarchic_to_lexicographic_numbering<dim>(this->param.mapping_degree);
+    const std::shared_ptr<dealii::ChartManifold<dim>> manifold = get_manifold();
+
+    // The two panels of PeriodicHillManifoldOptimizedMesh are only C^0
+    // continuous at x = length_channel / 2, which must hence be an element face
+    AssertThrow(not consider_mapping or
+                  grid_deformation_type != GridDeformationType::GradedMeshOptimizationShift or
+                  (coarse_mesh_refinements[0] % 2 == 0 and not consider_box_distort),
+                dealii::ExcMessage("GradedMeshOptimizationShift requires an even number of "
+                                   "coarse cells in x-direction and no box distortion."));
+
     const auto mapping_function_fine =
       [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
       -> std::vector<dealii::Point<dim>> {
-      const std::shared_ptr<dealii::ChartManifold<dim>> manifold = get_manifold();
       fe_values.reinit(cell);
 
       std::vector<dealii::Point<dim>> points_moved(fe_values.n_quadrature_points);
@@ -905,7 +914,7 @@ private:
 
       // We use a manifold class for this intermediate process because in a
       // massively parallel computation different scenarios may appear in
-      // articifical cells, which change during refinement and the associated
+      // artificial cells, which change during refinement and the associated
       // partitioning.
       {
         const double                       size_y   = (p_2[1] - p_1[1]) / 24;
@@ -1005,10 +1014,11 @@ private:
       std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
     mapping_q_cache->initialize(*grid.triangulation, mapping_function_fine);
 
-    grid.mapping_function = [&](typename dealii::Triangulation<dim>::cell_iterator const & cell)
+    // capture manifold by value, as the function is stored in the grid
+    grid.mapping_function =
+      [&, manifold](typename dealii::Triangulation<dim>::cell_iterator const & cell)
       -> std::vector<dealii::Point<dim>> {
-      const std::shared_ptr<dealii::ChartManifold<dim>> manifold = get_manifold();
-      std::vector<dealii::Point<dim>>                   points_moved(cell->n_vertices());
+      std::vector<dealii::Point<dim>> points_moved(cell->n_vertices());
       for(unsigned int i = 0; i < cell->n_vertices(); ++i)
       {
         // need to adjust for hierarchic numbering of
@@ -1439,6 +1449,8 @@ private:
                                                                       grid_stretch_factor);
     else
       AssertThrow(false, dealii::ExcMessage("Unknown mesh deformation type for manifold."));
+
+    return nullptr;
   }
 
   // Reynolds number, viscosity, bulk velocity
@@ -1495,7 +1507,7 @@ private:
   GridDeformationType grid_deformation_type = GridDeformationType::GradedMeshUniform;
   double              grid_stretch_factor   = 1.6;
 
-  // dicretization
+  // discretization
   TemporalDiscretization temporal_discretization = TemporalDiscretization::Undefined;
   TriangulationType      triangulation_type      = TriangulationType::Distributed;
   SpatialDiscretization  spatial_discretization  = SpatialDiscretization::L2;
