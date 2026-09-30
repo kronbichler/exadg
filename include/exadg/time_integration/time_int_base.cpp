@@ -89,7 +89,6 @@ void
 TimeIntBase::advance_one_timestep_pre_solve(bool const print_header)
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(started() and not finished())
   {
@@ -105,28 +104,26 @@ TimeIntBase::advance_one_timestep_pre_solve(bool const print_header)
     do_timestep_pre_solve(print_header);
   }
 
-  timer_tree->insert({"Timeloop"}, timer.wall_time());
+  timer_tree->insert_leaf("Timeloop", timer.wall_time());
 }
 
 void
 TimeIntBase::advance_one_timestep_solve()
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(started() and not finished())
   {
     do_timestep_solve();
   }
 
-  timer_tree->insert({"Timeloop"}, timer.wall_time());
+  timer_tree->insert_leaf("Timeloop", timer.wall_time());
 }
 
 void
 TimeIntBase::advance_one_timestep_post_solve()
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(started() and not finished())
   {
@@ -148,7 +145,7 @@ TimeIntBase::advance_one_timestep_post_solve()
     time += get_time_step_size();
   }
 
-  timer_tree->insert({"Timeloop"}, timer.wall_time());
+  timer_tree->insert_leaf("Timeloop", timer.wall_time());
 }
 
 void

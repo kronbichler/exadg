@@ -44,24 +44,45 @@ TimerTree::clear()
 }
 
 void
-TimerTree::insert(std::vector<std::string> const ids, double const wall_time)
+TimerTree::insert_leaf(std::string const & id, double const wall_time)
+{
+  if(this->id == "") // the tree is currently empty
+  {
+    AssertThrow(sub_trees.empty(), dealii::ExcMessage("invalid state found. aborting."));
+
+    this->id = id;
+
+    data = std::make_shared<Data>();
+    data->wall_time += wall_time;
+  }
+  else if(this->id == id) // the tree already has some entries
+  {
+    if(data.get() == nullptr)
+      data = std::make_shared<Data>();
+
+    data->wall_time += wall_time;
+  }
+  else // the provided name does not fit to this tree
+  {
+    AssertThrow(false,
+                dealii::ExcMessage("The name provided is " + id + ", but must be " + this->id +
+                                   " instead."));
+  }
+}
+
+void
+TimerTree::insert(std::vector<std::string> const & ids, double const wall_time)
 {
   AssertThrow(ids.size() > 0, dealii::ExcMessage("empty name."));
-
-  if(this->id == "") // the tree is currently empty
+  if(ids.size() == 1)
+    insert_leaf(ids[0], wall_time);
+  else if(this->id == "") // the tree is currently empty
   {
     AssertThrow(sub_trees.empty(), dealii::ExcMessage("invalid state found. aborting."));
 
     this->id = ids[0];
 
-    if(ids.size() == 1) // leaves of tree reached, insert the data
-    {
-      data = std::make_shared<Data>();
-      data->wall_time += wall_time;
-
-      return;
-    }
-    else // go deeper
+    // have several levels, go deeper
     {
       std::vector<std::string> remaining_id = erase_first(ids);
 
@@ -72,16 +93,7 @@ TimerTree::insert(std::vector<std::string> const ids, double const wall_time)
   }
   else if(this->id == ids[0]) // the tree already has some entries
   {
-    if(ids.size() == 1) // leaves of tree reached, insert the data
-    {
-      if(data.get() == nullptr)
-        data = std::make_shared<Data>();
-
-      data->wall_time += wall_time;
-
-      return;
-    }
-    else // find correct sub-tree or insert new sub-tree
+    // find correct sub-tree or insert new sub-tree
     {
       std::vector<std::string> remaining_id = erase_first(ids);
 
@@ -114,9 +126,9 @@ TimerTree::insert(std::vector<std::string> const ids, double const wall_time)
 }
 
 void
-TimerTree::insert(std::vector<std::string>   ids,
-                  std::shared_ptr<TimerTree> sub_tree,
-                  std::string const          new_name)
+TimerTree::insert(std::vector<std::string> const &   ids,
+                  std::shared_ptr<TimerTree> const & sub_tree,
+                  std::string const                  new_name)
 {
   AssertThrow(ids.size() > 0, dealii::ExcMessage("Empty ID specified."));
   AssertThrow(id == ids[0], dealii::ExcMessage("Invalid ID specified."));
@@ -211,7 +223,9 @@ TimerTree::get_max_level() const
 void
 TimerTree::copy_from(std::shared_ptr<TimerTree> other)
 {
-  *this = *other;
+  id        = other->id;
+  data      = other->data;
+  sub_trees = other->sub_trees;
 }
 
 std::vector<std::string>
