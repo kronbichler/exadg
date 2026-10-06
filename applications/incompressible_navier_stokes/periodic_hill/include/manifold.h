@@ -299,7 +299,7 @@ class PeriodicHillManifoldOptimizedMesh : public dealii::ChartManifold<dim>
   // This is the degree of the optimization computation performed, which uses
   // two panels for the left and right half of the hill, respectively (the
   // final distribution is non-symmetric, so use two separate functions).
-  static constexpr unsigned int n_shapes = 7;
+  static constexpr unsigned int n_shapes = 6;
 
 public:
   PeriodicHillManifoldOptimizedMesh(const double H,
@@ -317,149 +317,81 @@ public:
       deriv_tanh_gamma(GRID_STRETCH_FAC /
                        (tanh_gamma * std::cosh(GRID_STRETCH_FAC) * std::cosh(GRID_STRETCH_FAC)))
   {
-    // Assume we have a slope of -2 (the actual slope extremum is around
-    // -0.86, but due to resolution requirements near the hill top choose a
-    // higher value) that transitions from a steeper part to a flatter part.
-    // Start by defining a piecewise linear function (a more complicated
-    // function to check the actual path was tried, but not found to perform
-    // better at a higher cost) and then transition over a length corresponding
-    // to the hill height to the flat part; the actual evaluation will use a
-    // Hermite interpolating polynomial of degree 7, see below.
-    const double slope_assumed        = -2;
-    const double scaling_curved_start = 0.7 * H;
-    const double scaling_curved_end   = 1.8 * H;
-    const double curve_length_sloped  = std::sqrt(1. + slope_assumed * slope_assumed);
-    const double curve_length =
-      0.5 * (scaling_curved_start + scaling_curved_end) * (curve_length_sloped - 1.) + LENGTH / 2;
-    const double x_transition_point_1 =
-      curve_length_sloped * scaling_curved_start * LENGTH * 0.5 / curve_length;
-    const double x_transition_point_2 =
-      LENGTH * 0.5 - (LENGTH * 0.5 - scaling_curved_end) * LENGTH * 0.5 / curve_length;
-    const double x_transition_point_3 = LENGTH * 0.5;
-    const double x_transition_value_1 = scaling_curved_start;
-    const double x_transition_value_2 = scaling_curved_end;
-    const double x_transition_value_3 = x_transition_point_3;
-
-    // We use a single 7-th order Hermite polynomial per half length to place
-    // the points more densely along the sloped part. The function has zero
-    // second derivative on the left and 4 continuous derivatives at x=0.5,
-    // where we stitch the halves together. Specifically, the 8 conditions are:
-    // f(0) = 0, f'(0) = d0, f''(0) = 0, f(1) = v1, f'(1) = d1, f''(1) = 0,
-    // f'''(1) = 0, f''''(1) = 0.  And in the stored coefficients, we drop the
-    // two coefficients with value 0.
-    const double d0 = x_transition_value_1 / x_transition_point_1 * x_transition_value_3;
-    const double v1 = x_transition_value_3;
-    const double d1 = (x_transition_value_3 - x_transition_value_2) /
-                      (x_transition_point_3 - x_transition_point_2) * x_transition_value_3;
-
-    coefficients_hermite = {{d0,
-                             35 * v1 - 20 * d1 - 15 * d0,
-                             -105 * v1 + 65 * d1 + 40 * d0,
-                             126 * v1 - 81 * d1 - 45 * d0,
-                             46 * d1 - 70 * v1 + 24 * d0,
-                             15 * v1 - 10 * d1 - 5 * d0}};
-
     // These coefficients were determined by the offline computation
     // underlying this class.
     const dealii::ndarray<double, n_shapes * n_shapes, 2> panel_left{
       {{{0, 0}},
-       {{0.08488805186072, 0}},
-       {{0.2655756032646, 0}},
-       {{0.5, 0}},
-       {{0.7344243967354, 0}},
-       {{0.9151119481393, 0}},
-       {{1, 0}},
-       {{0, 0.0862239029776}},
-       {{0.122449463918, 0.08475565616348}},
-       {{0.3134130750993, 0.1277273712494}},
-       {{0.5161135710844, 0.08528085829237}},
-       {{0.7269076827709, 0.07475349773668}},
-       {{0.8890713200363, 0.08286858751728}},
-       {{0.9669753494535, 0.08895998328973}},
-       {{0, 0.2395340672242}},
-       {{0.1567898829495, 0.2015207589759}},
-       {{0.3475648736373, 0.2255270208406}},
-       {{0.5350414216554, 0.2000609619101}},
-       {{0.7176881134132, 0.1975089174241}},
-       {{0.8647450893527, 0.20346231199}},
-       {{0.9344042279655, 0.2119361181576}},
-       {{0, 0.412174915857}},
-       {{0.156747180515, 0.3748162953837}},
-       {{0.3700143749472, 0.3644255436685}},
-       {{0.5422340590131, 0.3421917855631}},
-       {{0.7142067668018, 0.3486475530682}},
-       {{0.8508273942615, 0.3566253088925}},
-       {{0.9153207792259, 0.365053764028}},
-       {{0, 0.6095545998635}},
-       {{0.1451760564156, 0.5902996742813}},
-       {{0.3604543869669, 0.5601909811179}},
-       {{0.5448217987142, 0.5476012197965}},
-       {{0.7126694784277, 0.5549426208589}},
-       {{0.8490665609672, 0.5617434021536}},
-       {{0.9157871743652, 0.5658120853449}},
-       {{0, 0.8506688932468}},
-       {{0.1120038403225, 0.8518311328378}},
-       {{0.3088727573184, 0.8526504630219}},
-       {{0.5168709898329, 0.8612678292511}},
-       {{0.7252553157077, 0.8724553309176}},
-       {{0.8882268910253, 0.8711988777596}},
-       {{0.9662340468823, 0.8724823126874}},
+       {{0.1, 0}},
+       {{0.33, 0}},
+       {{0.6, 0}},
+       {{0.83, 0}},
+       {{0.96, 0}},
+       {{0, 0.06647031929003}},
+       {{0.119910082911, 0.08337123854814}},
+       {{0.3541294189223, 0.1201795440998}},
+       {{0.6062314801498, 0.09211021175056}},
+       {{0.832971729543, 0.09110759540774}},
+       {{0.9597414470868, 0.09278163680258}},
+       {{0, 0.2210898279564}},
+       {{0.1396609872107, 0.2626165596777}},
+       {{0.3796831193867, 0.2726145937072}},
+       {{0.6180839582171, 0.2500093909338}},
+       {{0.8413014950466, 0.2540225019543}},
+       {{0.9618140703449, 0.2588694247019}},
+       {{0, 0.4806824526036}},
+       {{0.1386163534207, 0.5063423347537}},
+       {{0.3880221405396, 0.5145340263284}},
+       {{0.6326967211713, 0.4952366873722}},
+       {{0.8548978600039, 0.4866325732659}},
+       {{0.9716606792956, 0.4853901577388}},
+       {{0, 0.8452892515068}},
+       {{0.1247086869754, 0.8456221679126}},
+       {{0.3673023037199, 0.8472821569383}},
+       {{0.6395067406935, 0.8466762207868}},
+       {{0.8732925972969, 0.8475398890991}},
+       {{0.9902686633815, 0.8479238363019}},
        {{0, 1}},
-       {{0.08488805186072, 1}},
-       {{0.2655756032646, 1}},
-       {{0.5, 1}},
-       {{0.7344243967354, 1}},
-       {{0.9151119481393, 1}},
+       {{0.1174723380353, 1}},
+       {{0.3573842417597, 1}},
+       {{0.6426157582403, 1}},
+       {{0.8825276619647, 1}},
        {{1, 1}}}};
     const dealii::ndarray<double, n_shapes * n_shapes, 2> panel_right{
-      {{{0, 0}},
-       {{0.08488805186072, 0}},
-       {{0.2655756032646, 0}},
-       {{0.5, 0}},
-       {{0.7344243967354, 0}},
-       {{0.9151119481393, 0}},
+      {{{-0.04, 0}},
+       {{0.11, 0}},
+       {{0.42, 0}},
+       {{0.75, 0}},
+       {{0.93, 0}},
        {{1, 0}},
-       {{-0.03302465054651, 0.08895998328973}},
-       {{0.04691580988036, 0.08862348622582}},
-       {{0.2187412469525, 0.08741524628976}},
-       {{0.445047568607, 0.09180405597729}},
-       {{0.6639567001611, 0.1179170588696}},
-       {{0.8846759872993, 0.1034990038377}},
-       {{1, 0.0862239029776}},
-       {{-0.06559577203452, 0.2119361181576}},
-       {{0.007260341194406, 0.2136388439994}},
-       {{0.1639816074322, 0.2202214424149}},
-       {{0.3812584675338, 0.2274518303099}},
-       {{0.604135471394, 0.2626953353172}},
-       {{0.8516725562502, 0.2630417608455}},
-       {{1, 0.2395340672242}},
-       {{-0.08467922077408, 0.365053764028}},
-       {{-0.01707566652446, 0.3710629699774}},
-       {{0.1331873442952, 0.3870641262714}},
-       {{0.3464694437837, 0.4025826196895}},
-       {{0.5794758771119, 0.4322545207644}},
-       {{0.8449325350412, 0.4355240694618}},
-       {{1, 0.412174915857}},
-       {{-0.08421282563484, 0.5658120853449}},
-       {{-0.01554677551131, 0.5744901382617}},
-       {{0.1374348520456, 0.5858613683461}},
-       {{0.3564424845144, 0.604964757936}},
-       {{0.6028603037661, 0.6148017303782}},
-       {{0.8646451287138, 0.6292913936227}},
-       {{1, 0.6095545998635}},
-       {{-0.03376595311774, 0.8724823126874}},
-       {{0.04546719729648, 0.8729789770786}},
-       {{0.2138510363756, 0.8697006184888}},
-       {{0.4424169579444, 0.8694820459734}},
-       {{0.6785432468803, 0.8584143510768}},
-       {{0.8980036122317, 0.8702676427422}},
-       {{1, 0.8506688932468}},
+       {{-0.04025855291323, 0.09278163680258}},
+       {{0.1022152870465, 0.09456817923534}},
+       {{0.4021846584892, 0.09599305017798}},
+       {{0.7240626695039, 0.1102516393834}},
+       {{0.9129551708171, 0.08200505684339}},
+       {{1, 0.06647031929003}},
+       {{-0.03818592965513, 0.2588694247019}},
+       {{0.09499751612433, 0.2642096325971}},
+       {{0.3736736967808, 0.2771183753064}},
+       {{0.672258255811, 0.3103905774699}},
+       {{0.8949094560199, 0.2565874483271}},
+       {{1, 0.2210898279564}},
+       {{-0.0283393207044, 0.4853901577388}},
+       {{0.09401791520149, 0.4883538451008}},
+       {{0.3502113596142, 0.5084829569008}},
+       {{0.6391873025833, 0.5382263645677}},
+       {{0.88351980771, 0.5060412631376}},
+       {{1, 0.4806824526036}},
+       {{-0.009731336618486, 0.8479238363019}},
+       {{0.1093114541632, 0.8485529746208}},
+       {{0.353838286351, 0.8488181117045}},
+       {{0.6416293738446, 0.8530774177462}},
+       {{0.8820030900678, 0.8486713904614}},
+       {{1, 0.8452892515068}},
        {{0, 1}},
-       {{0.08488805186072, 1}},
-       {{0.2655756032646, 1}},
-       {{0.5, 1}},
-       {{0.7344243967354, 1}},
-       {{0.9151119481393, 1}},
+       {{0.1174723380353, 1}},
+       {{0.3573842417597, 1}},
+       {{0.6426157582403, 1}},
+       {{0.8825276619647, 1}},
        {{1, 1}}}};
 
     interpolation_points[0].resize(panel_left.size());
@@ -507,22 +439,8 @@ public:
         coeffs.data(), {}, shapes.data(), 0, dummy);
 
     xi[0] = LENGTH * 0.5 * val[0] + (left_panel ? 0. : LENGTH * 0.5);
-    xi[1] = val[1];
-
-    // Finally move the points near the boundary to ensure approximately
-    // equal-length elements and some finer distribution near the hill top.
-    const double xi_0 =
-      xi[0] < LENGTH / 2 ? get_scaled_x_point(xi[0]) : LENGTH - get_scaled_x_point(LENGTH - xi[0]);
-
-    dealii::Point<dim> xi_bottom;
-    xi_bottom[0] = xi_0;
-    xi_bottom[1] = H + f(xi_0, H, LENGTH);
-    if(dim > 2)
-      xi_bottom[2] = xi[2];
-
-    dealii::Point<dim> xi_top = xi;
-    xi_top[1]                 = H + HEIGHT;
-    return xi_top * xi[1] + xi_bottom * (1.0 - xi[1]);
+    xi[1] = (1.0 - val[1]) * (H + f(xi[0], H, LENGTH)) + val[1] * (H + HEIGHT);
+    return xi;
   }
 
   dealii::Point<dim>
