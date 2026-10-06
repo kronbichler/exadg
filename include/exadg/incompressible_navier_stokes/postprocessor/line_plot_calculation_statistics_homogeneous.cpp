@@ -42,6 +42,42 @@ namespace ExaDG
 {
 namespace IncNS
 {
+namespace
+{
+// Helper function to determine wether or not a line needs to evaluate the velocity.
+inline bool
+quantity_needs_velocity(QuantityType const type)
+{
+  return type == QuantityType::Velocity or type == QuantityType::SkinFriction or
+         type == QuantityType::ReynoldsStresses or type == QuantityType::Dissipation;
+}
+
+// Reject invalid line configurations during `setup()`.
+template<int dim>
+void
+assert_valid_quantity_dependencies(Line<dim> const & line, unsigned int const line_index)
+{
+  bool has_velocity          = false;
+  bool has_reynolds_stresses = false;
+  for(std::shared_ptr<Quantity> const & quantity : line.quantities)
+  {
+    if(quantity->type == QuantityType::Velocity)
+      has_velocity = true;
+    if(quantity->type == QuantityType::ReynoldsStresses)
+      has_reynolds_stresses = true;
+  }
+
+  AssertThrow(not has_reynolds_stresses or has_velocity,
+              dealii::ExcMessage("Line " + std::to_string(line_index) + " (\"" + line.name +
+                                 "\") requests QuantityType::ReynoldsStresses without "
+                                 "QuantityType::Velocity. The Reynolds stresses are computed as "
+                                 "<u_i u_j> - <u_i> <u_j>, but the mean velocity <u_i> is only "
+                                 "accumulated if QuantityType::Velocity is requested on the same "
+                                 "line; otherwise the output would silently be the raw second "
+                                 "moment <u_i u_j>. Add QuantityType::Velocity to this line."));
+}
+} // namespace
+
 template<int dim, typename Number>
 LinePlotCalculatorStatisticsHomogeneous<dim, Number>::LinePlotCalculatorStatisticsHomogeneous(
   dealii::DoFHandler<dim> const & dof_handler_velocity_in,
@@ -103,8 +139,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::intersect_lines_with_cell(
     bool pressure_has_to_be_evaluated = false;
     for(const std::shared_ptr<Quantity> & quantity : line->quantities)
     {
-      if(quantity->type == QuantityType::Velocity or quantity->type == QuantityType::SkinFriction or
-         quantity->type == QuantityType::ReynoldsStresses)
+      if(quantity_needs_velocity(quantity->type))
       {
         velocity_has_to_be_evaluated = true;
       }
@@ -241,6 +276,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
 
       AssertThrow(averaging_direction == line_hom->averaging_direction,
                   dealii::ExcMessage("All lines must use the same averaging direction."));
+
+      assert_valid_quantity_dependencies(*line, line_iterator);
 
       // Resize global variables for # of points on line
       if(dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0)
@@ -547,6 +584,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::setup(
 
       AssertThrow(averaging_direction == line_hom->averaging_direction,
                   dealii::ExcMessage("All lines must use the same averaging direction."));
+
+      assert_valid_quantity_dependencies(*line, line_iterator);
 
       // Resize global variables for # of points on line
       if(dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0)
@@ -1126,9 +1165,7 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
     for(const std::shared_ptr<Quantity> & quantity : line.quantities)
     {
       // evaluate quantities that involve velocity
-      if(quantity->type == QuantityType::Velocity or quantity->type == QuantityType::SkinFriction or
-         quantity->type == QuantityType::ReynoldsStresses or
-         quantity->type == QuantityType::Dissipation)
+      if(quantity_needs_velocity(quantity->type))
       {
         evaluate_velocity = true;
       }
@@ -1192,6 +1229,8 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
             }
           }
           else
+          {
+            tmp_array.resize(velocity_dgq_on_cell.size());
             for(unsigned int c = 0; c < dim; ++c)
             {
               dealii::internal::EvaluatorTensorProduct<dealii::internal::evaluate_evenodd,
@@ -1202,13 +1241,21 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
                                                        Number>
                 eval(
                   shape_values_eo_dgq.data(), nullptr, nullptr, fe_u.degree + 1, fe_u.degree + 1);
+              // DoFs of component c (contiguous block of (degree+1)^dim values)
+              // -> tmp_array, interpolated in x-direction.
               eval.template values<0, true, false>(velocity.begin() + cell_indices[0] +
                                                      c * velocity_dgq_on_cell.size(),
                                                    tmp_array.data());
+              // In-place interpolation in z-direction (allowed for the last
+              // direction, see the assertion in EvaluatorTensorProduct::apply).
               if constexpr(dim == 3)
                 eval.template values<2, true, false>(tmp_array.data(), tmp_array.data());
-              eval.template values<1, true, false>(tmp_array.data(), &velocity_dgq_on_cell[0][c]);
+              // Interpolation in y-direction, written with stride `dim` into
+              // component c of the interleaved Tensor<1, dim> array.
+              eval.template values<1, true, false, dim>(tmp_array.data(),
+                                                        &velocity_dgq_on_cell[0][c]);
             }
+          }
           eval_ptr = velocity_dgq_on_cell.data();
         }
         else
@@ -1481,6 +1528,17 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_evaluate(
           }
         }
         ++counter_all_cells;
+      }
+    }
+    else
+    {
+      // This line does not need the velocity, e.g., a line requesting only QuantityType::Pressure.
+      // Skip this line's entries to keep the counters aligned with the caches. The pressure
+      // evaluation below uses its own counter.
+      for(auto const & cell_and_points : cells_and_ref_points[index])
+      {
+        ++counter_all_cells;
+        counter_line += cell_and_points.second.size();
       }
     }
 
@@ -1938,6 +1996,26 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_write_output(double con
             for(unsigned int d = 0; d < dim; ++d)
               f << std::setw(precision + 8) << std::left << global_points[line_iterator][p][d];
 
+            /*
+             * The columns "u_iu_j" are the covariance about the mean of the *current averaging
+             * interval* I (length T = `accumulated_time`), with <.> = (1/T) int_I <.>_z dt and
+             * <.>_z the average in the homogeneous direction:
+             *
+             *   R_ij = <u_i u_j> - <u_i> <u_j>.
+             *
+             * The mean velocity <u_i> requires `QuantityType::Velocity` on the same line, which is
+             * asserted in `setup()`.
+             *
+             * Note that I can be the interval since the last write, i.e., every output file holds
+             * the covariance about its *own batch mean* <u>_b, which needs to be accounted for when
+             * summing over sums of intervals:
+             *
+             *   R = sum_b w_b (R_b + <u>_b <u>_b^T) - <u> <u>^T,
+             *   <u> = sum_b w_b <u>_b.
+             *
+             * This reproduces exactly the covariance of a single averaging interval covering all
+             * batches.
+             */
             for(unsigned int i = 0; i < dim; ++i)
             {
               for(unsigned int j = i; j < dim; ++j)
@@ -1954,7 +2032,10 @@ LinePlotCalculatorStatisticsHomogeneous<dim, Number>::do_write_output(double con
             {
               for(unsigned int j = i; j < dim; ++j)
               {
-                // last computed (instantaneous) equivalent of <u_i' u_j'>
+                // last computed (instantaneous) equivalent of <u_i' u_j'>:
+                // the covariance in the homogeneous direction of the *last
+                // sample only*, <u_i u_j>_z - <u_i>_z <u_j>_z, i.e., the
+                // spanwise scatter at one time instant.
                 f << std::setw(precision + 8) << std::left
                   << reynolds_last_global[line_iterator][p][i][j] -
                        velocity_last_global[line_iterator][p][i] *
