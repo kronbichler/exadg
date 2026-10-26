@@ -174,7 +174,6 @@ void
 TimeIntBDFCoupled<dim, Number>::do_timestep_solve()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // extrapolate old solutions to obtain a good initial guess for the solver, or
   // to update the viscosity model or the penalty parameters based on this
@@ -194,7 +193,6 @@ TimeIntBDFCoupled<dim, Number>::do_timestep_solve()
   if(this->param.viscous_problem() and this->param.viscosity_is_variable())
   {
     dealii::Timer timer_viscosity_update;
-    timer_viscosity_update.restart();
 
     pde_operator->update_viscosity(solution_np.block(0));
 
@@ -526,7 +524,6 @@ void
 TimeIntBDFCoupled<dim, Number>::penalty_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // right-hand side term: apply mass operator
   VectorType rhs;

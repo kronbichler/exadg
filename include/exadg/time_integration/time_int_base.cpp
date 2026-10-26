@@ -89,7 +89,6 @@ void
 TimeIntBase::advance_one_timestep_pre_solve(bool const print_header)
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(started() and not finished())
   {
@@ -112,7 +111,6 @@ void
 TimeIntBase::advance_one_timestep_solve()
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(started() and not finished())
   {
@@ -126,7 +124,6 @@ void
 TimeIntBase::advance_one_timestep_post_solve()
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(started() and not finished())
   {

@@ -287,7 +287,6 @@ void
 TimeIntBDFConsistentSplitting<dim, Number>::evaluate_convective_term()
 {
   dealii::Timer timer;
-  timer.restart();
 
   pde_operator->evaluate_convective_term(this->convective_term_np,
                                          velocity_np,
@@ -301,7 +300,6 @@ void
 TimeIntBDFConsistentSplitting<dim, Number>::pressure_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // compute right-hand-side vector
   VectorType rhs;
@@ -432,7 +430,6 @@ void
 TimeIntBDFConsistentSplitting<dim, Number>::momentum_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // in case we need to iteratively solve a linear or nonlinear system of equations
   if(this->param.viscous_problem() or this->param.non_explicit_convective_problem())
@@ -613,7 +610,6 @@ TimeIntBDFConsistentSplitting<dim, Number>::penalty_step()
   if(this->param.use_divergence_penalty == true or this->param.use_continuity_penalty == true)
   {
     dealii::Timer timer;
-    timer.restart();
 
     // compute right-hand-side vector
     VectorType rhs;

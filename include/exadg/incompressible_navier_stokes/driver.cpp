@@ -59,7 +59,6 @@ void
 Driver<dim, Number>::setup()
 {
   dealii::Timer timer;
-  timer.restart();
 
   pcout << std::endl << "Setting up incompressible Navier-Stokes solver:" << std::endl;
 
@@ -224,11 +223,9 @@ Driver<dim, Number>::ale_update() const
 {
   // move the mesh and update dependent data structures
   dealii::Timer timer;
-  timer.restart();
 
   dealii::Timer sub_timer;
 
-  sub_timer.restart();
   helpers_ale->move_grid(time_integrator->get_next_time());
   timer_tree.insert({"Incompressible flow", "ALE", "Reinit mapping"}, sub_timer.wall_time());
 

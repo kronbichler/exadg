@@ -154,7 +154,6 @@ void
 Driver<dim, Number>::setup()
 {
   dealii::Timer timer;
-  timer.restart();
 
   pcout << std::endl << "Setting up incompressible Navier-Stokes solver:" << std::endl;
 
