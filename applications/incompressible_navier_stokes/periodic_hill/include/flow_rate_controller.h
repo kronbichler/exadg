@@ -39,6 +39,7 @@ public:
       length_scale(H),
       f(0.0), // f(t=t_0) = f_0
       f_damping(0.0),
+      f_proportional(0.0),
       time_old(start_time),
       flow_rate(0.0),
       flow_rate_old(0.0),
@@ -49,7 +50,7 @@ public:
   double
   get_body_force() const
   {
-    return f + f_damping;
+    return f + f_damping + f_proportional;
   }
 
   void
@@ -58,11 +59,11 @@ public:
     flow_rate              = flow_rate_in;
     double const time_step = time - time_old;
 
-    // use an I-controller with damping (D) to asymptotically reach the desired target flow rate
+    // use an PI-controller with damping (D) to asymptotically reach the desired target flow rate
 
     // dimensional analysis: [k_I] = 1/(m^2 s^2) -> k_I = const * u_b^2 / H^4
     double const C_I = 100.0;
-    double const k_I = C_I * std::pow(bulk_velocity, 2.0) / std::pow(length_scale, 4.0);
+    double const k_I = C_I * std::pow(bulk_velocity, 2) / std::pow(length_scale, 4);
     f += k_I * (target_flow_rate - flow_rate) * time_step;
 
     // the time step size is 0 when this function is called the first time
@@ -73,6 +74,12 @@ public:
       double const k_D = C_D / std::pow(length_scale, 2.0);
       f_damping        = -k_D * (flow_rate - flow_rate_old) / time_step;
     }
+
+    // proportional term (P) to damp the oscillation of the I-controller
+    // dimensional analysis: [k_P] = 1/(m^2 s) -> k_P = const * u_b / H^3
+    double const C_P = 2.0;
+    double const k_P = C_P * bulk_velocity / std::pow(length_scale, 3);
+    f_proportional   = k_P * (target_flow_rate - flow_rate);
 
     flow_rate_old = flow_rate;
     time_old      = time;
@@ -147,6 +154,7 @@ private:
                   << std::to_string(mpi_process) << ")\n" << std::scientific << std::setprecision(4)
                   << "      f                = " << f << "\n"
                   << "      f_damping        = " << f_damping << "\n"
+                  << "      f_proportional   = " << f_proportional << "\n"
                   << "      time_old         = " << time_old << "\n"
                   << "      flow_rate        = " << flow_rate << "\n"
                   << "      flow_rate_old    = " << flow_rate_old << "\n"
@@ -162,6 +170,7 @@ private:
 
   double f;
   double f_damping;
+  double f_proportional;
 
   double time_old;
 
