@@ -184,8 +184,8 @@ private:
 
   const OperatorConsistentSplittingExtruded<dim, Number> * consistent_splitting_operator;
 
-  mutable bool                                   clear_files;
-  mutable std::vector<std::pair<double, double>> accumulated_flow_rate_results;
+  mutable bool                               clear_files;
+  mutable std::vector<std::array<double, 3>> accumulated_flow_rate_results;
 
   mutable double previous_time = -1.0;
 
@@ -241,7 +241,8 @@ private:
         if(clear_files == true)
         {
           f.open(filename.c_str(), std::ios::trunc);
-          f << std::endl << "# Time                Mean velocity [m/s]" << std::endl;
+          f << std::endl
+            << "# Time                Mean velocity [m/s] Body force [m/s^2]" << std::endl;
 
           clear_files = false;
         }
@@ -251,13 +252,15 @@ private:
         }
 
         unsigned int precision = 12;
-        for(std::pair<double, double> const & data : accumulated_flow_rate_results)
+        for(std::array<double, 3> const & data : accumulated_flow_rate_results)
           f << std::scientific << std::setprecision(precision) << std::setw(precision + 8)
-            << data.first << std::setw(precision + 8) << data.second << std::endl;
+            << data[0] << std::setw(precision + 8) << data[1] << std::setw(precision + 8) << data[2]
+            << std::endl;
         accumulated_flow_rate_results.clear();
       }
 
-      accumulated_flow_rate_results.emplace_back(time, value);
+      accumulated_flow_rate_results.push_back(
+        {{time, value, flow_rate_controller.get_body_force()}});
     }
   }
 };
