@@ -284,7 +284,10 @@ public:
   static constexpr unsigned int n_lanes = VectorizedArray<Number>::size();
   using VectorType                      = LinearAlgebra::distributed::Vector<Number>;
 
-  RaviartThomasOperator() = default;
+  RaviartThomasOperator()
+    : is_test(false), timings{}, factor_mass(0), factor_laplace(0), pressure_dof_indices(nullptr)
+  {
+  }
 
   template<typename OtherNumber>
   void
@@ -359,6 +362,11 @@ public:
             const auto line = constraints.get_constraint_entries(a);
             if(line != nullptr && line->size() == 1 && (*line)[0].second == Number(1.0))
               a = (*line)[0].first;
+            else if(line != nullptr && line->size() > 0)
+              AssertThrow(false,
+                          ExcMessage("Unsupported constraint of length " +
+                                     std::to_string(line->size()) +
+                                     " with non-unit constraint found"));
           }
           for(types::global_dof_index a : local_dof_indices)
             if(!locally_owned_dofs.is_element(a) && !constraints.is_constrained(a))
@@ -415,15 +423,15 @@ public:
         for(unsigned int i = 0; i < 2 * dim; ++i)
           for(unsigned int j = 0; j < n_lanes; ++j)
             default_argument[i][j] = numbers::invalid_unsigned_int;
-        neighbor_cells.resize(matrix_free.n_cell_batches(), default_argument);
-        mpi_exchange_data_on_faces.resize(matrix_free.n_cell_batches(), default_argument);
+        neighbor_cells.assign(matrix_free.n_cell_batches(), default_argument);
+        mpi_exchange_data_on_faces.assign(matrix_free.n_cell_batches(), default_argument);
       }
       {
         ndarray<unsigned int, 2 * dim + 1, n_lanes> default_argument;
         for(unsigned int i = 0; i < 2 * dim + 1; ++i)
           for(unsigned int j = 0; j < n_lanes; ++j)
             default_argument[i][j] = numbers::invalid_unsigned_int;
-        dof_indices.resize(matrix_free.n_cell_batches(), default_argument);
+        dof_indices.assign(matrix_free.n_cell_batches(), default_argument);
       }
 
       std::array<std::vector<unsigned int>, 2 * dim> cells_at_dirichlet_boundary_by_face;
@@ -521,6 +529,9 @@ public:
                 neighbor_cells[cell][f][v] = cell_indices[dcell->active_cell_index()];
               }
             }
+            else
+              AssertThrow(
+                f < 4, ExcMessage("Non-periodic boundaries in z direction currently unsupported"));
           }
         }
 
@@ -668,9 +679,9 @@ public:
 
   ~RaviartThomasOperator()
   {
+    const MPI_Comm comm = dof_handler->get_mpi_communicator();
     if(not this->is_test and timings[0] > 0)
     {
-      const MPI_Comm comm = dof_handler->get_mpi_communicator();
       std::cout << std::defaultfloat << std::setprecision(3);
       const double total_time =
         Utilities::MPI::sum(timings[9], comm) / timings[0] / Utilities::MPI::n_mpi_processes(comm);
@@ -693,8 +704,7 @@ public:
     }
     if(not this->is_test and timings[10] > 0)
     {
-      const MPI_Comm comm       = MPI_COMM_WORLD;
-      const double   total_time = Utilities::MPI::sum(timings[14], comm) / timings[10] /
+      const double total_time = Utilities::MPI::sum(timings[14], comm) / timings[10] /
                                 Utilities::MPI::n_mpi_processes(comm);
       if(Utilities::MPI::this_mpi_process(comm) == 0)
         std::cout << "Collected timings for mass operator <"
@@ -965,11 +975,11 @@ public:
           const unsigned int idx =
             mapping_info.face_mapping_data_index[cell][face][0][v] / n_q_points_1d / 4;
           AssertThrow(idx < mapping_info.ip_penalty_factors.size(),
-                      ExcIndexRange(0, mapping_info.ip_penalty_factors.size(), idx));
+                      ExcIndexRange(idx, 0, mapping_info.ip_penalty_factors.size()));
           const unsigned int neigh_idx =
             mapping_info.face_mapping_data_index[cell][face][1][v] / n_q_points_1d / 4;
           AssertThrow(neigh_idx < mapping_info.ip_penalty_factors.size(),
-                      ExcIndexRange(0, mapping_info.ip_penalty_factors.size(), neigh_idx));
+                      ExcIndexRange(neigh_idx, 0, mapping_info.ip_penalty_factors.size()));
           this->penalty_parameters[cell][face][v] =
             std::max(mapping_info.ip_penalty_factors[idx],
                      mapping_info.ip_penalty_factors[neigh_idx]) *
@@ -1342,7 +1352,7 @@ public:
                 pressure_boundary_vector.local_element(base + i1 * mm + i0);
         else
           for(unsigned int i = 0; i < data_per_face; ++i)
-            pressure_vector.local_element(idx + i) =
+            pressure_vector.local_element(idx + i) +=
               pressure_boundary_vector.local_element(base + i);
       }
   }
@@ -1379,12 +1389,16 @@ public:
       if(face_direction < 2)
       {
         std::array<unsigned int, n_lanes> shifted_data_indices, data_indices;
+        Assert(cells_at_dirichlet_boundary[cell].second[0] != numbers::invalid_unsigned_int,
+               ExcInternalError("Expect at least the first lane to be populated"));
         for(unsigned int v = 0; v < n_lanes; ++v)
         {
           const unsigned int cell_index = cells_at_dirichlet_boundary[cell].second[v];
           const unsigned int idx =
-            mapping_info
-              .face_mapping_data_index[cell_index / n_lanes][face][0][cell_index % n_lanes];
+            cell_index != numbers::invalid_unsigned_int ?
+              mapping_info
+                .face_mapping_data_index[cell_index / n_lanes][face][0][cell_index % n_lanes] :
+              data_indices[0];
           shifted_data_indices[v] = idx * 4;
           data_indices[v]         = idx;
         }
@@ -1408,10 +1422,22 @@ public:
             Point<dim> point;
             for(unsigned int d = 0; d < 2; ++d)
               point[d] = mapping_info.face_quadrature_points[data_indices[v] + q1][d];
+            Point<dim> check = point;
+            if constexpr(dim == 3)
+              check[2] = point[2] + 0.001;
             val[v] = 0;
             for(unsigned int e = 0; e < 2; ++e)
+            {
+              Assert(rhs_function.value(point, e) == rhs_function.value(check, e),
+                     ExcMessage("Currently, only forces constant in z direction "
+                                "are supported"));
               val[v] += rhs_function.value(point, e) *
                         mapping_info.face_normal_vector_xy[data_indices[v] + q1][e];
+            }
+            if constexpr(dim == 3)
+              Assert(rhs_function.value(point, 2) == 0,
+                     ExcMessage("Currently, only forces pointing in xy space "
+                                "are supported"));
           }
 
           for(unsigned int qz = 0, q = q1; qz < nn; ++qz, q += nn)
@@ -1612,7 +1638,7 @@ private:
   void
   compute_vector_access_pattern()
   {
-    const unsigned int        n_dofs     = partitioner->locally_owned_size();
+    const unsigned int n_dofs = partitioner->locally_owned_size();
     // This number is a tradeoff of creating sufficiently big chunks of data
     // (that allows the CPU to do more hardware prefetching and thus amortize
     // loads) and the increase in cache pressure. We did tests where values
@@ -3289,18 +3315,19 @@ private:
     {
       read_cell_values<degree, n_q_points_1d>(src.begin(), dof_indices[cell], quad_values);
 
+      // If the second derivative terms have a non-zero factor, compute the
+      // relevant parts of cell integrals and the associated face integrals
       if(factor_laplace != 0)
+      {
         compute_cell<CellOperation::helmholtz, n_q_points_1d>(shape_data,
                                                               cell,
                                                               quad_values,
                                                               out_values);
-      else
-        compute_cell_mass<n_q_points_1d>(cell, this->factor_mass, quad_values, out_values);
-
-      // Face integrals if Laplace factor is positive
-      if(factor_laplace != 0.)
         for(unsigned int f = 0; f < 2 * dim; ++f)
           compute_face<degree, true>(shape_data, src, cell, f, quad_values, out_values);
+      }
+      else
+        compute_cell_mass<n_q_points_1d>(cell, this->factor_mass, quad_values, out_values);
 
       integrate_cell_scatter<degree, n_q_points_1d>(dof_indices[cell],
                                                     n_active_entries_per_cell_batch(cell),
@@ -3309,39 +3336,44 @@ private:
     }
     else
     {
+      // TODO: Do we include the cross terms between the the two cells that
+      // share face DoFs (as the RT space is continuous in normal direction),
+      // and the associated Dirichlet values? Check this carefully.
       VectorizedArray<Number> diagonal[dofs_per_cell];
       for(unsigned int d = 0; d < dim; ++d)
         for(unsigned int i = 0; i < dofs_per_component; ++i)
         {
-          internal::EvaluatorTensorProductAnisotropic<dim, degree, n_q_points_1d, true> eval;
-          for(unsigned int j = 0; j < dofs_per_component; ++j)
-            out_values[j] = 0;
-          out_values[i] = 1;
-          if(d == 0)
           {
-            // always put the data last for the component in question,
-            // the rest will be zero
-            VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
-            eval.template normal<0>(shape_data[0], out_values, values);
-            eval.template tangential<1, 0>(shape_data[1], values, values);
-            if constexpr(dim > 2)
-              eval.template tangential<2, 0>(shape_data[1], values, values);
-          }
-          else if(d == 1)
-          {
-            VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
-            eval.template normal<1>(shape_data[0], out_values, values);
-            eval.template tangential<0, 1>(shape_data[1], values, values);
-            if constexpr(dim > 2)
-              eval.template tangential<2, 1>(shape_data[1], values, values);
-          }
-          else if(d == 2)
-          {
-            VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
+            internal::EvaluatorTensorProductAnisotropic<dim, degree, n_q_points_1d, true> eval;
+            for(unsigned int j = 0; j < dofs_per_component; ++j)
+              out_values[j] = 0;
+            out_values[i] = 1;
+            if(d == 0)
+            {
+              // always put the data last for the component in question,
+              // the rest will be zero
+              VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
+              eval.template normal<0>(shape_data[0], out_values, values);
+              eval.template tangential<1, 0>(shape_data[1], values, values);
+              if constexpr(dim > 2)
+                eval.template tangential<2, 0>(shape_data[1], values, values);
+            }
+            else if(d == 1)
+            {
+              VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
+              eval.template normal<1>(shape_data[0], out_values, values);
+              eval.template tangential<0, 1>(shape_data[1], values, values);
+              if constexpr(dim > 2)
+                eval.template tangential<2, 1>(shape_data[1], values, values);
+            }
+            else if(d == 2)
+            {
+              VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
 
-            eval.template normal<2>(shape_data[0], out_values, values);
-            eval.template tangential<0, 2>(shape_data[1], values, values);
-            eval.template tangential<1, 2>(shape_data[1], values, values);
+              eval.template normal<2>(shape_data[0], out_values, values);
+              eval.template tangential<0, 2>(shape_data[1], values, values);
+              eval.template tangential<1, 2>(shape_data[1], values, values);
+            }
           }
 
           for(unsigned int i = 0; i < n_points; ++i)
@@ -3353,16 +3385,16 @@ private:
           }
 
           if(factor_laplace != 0)
+          {
             compute_cell<CellOperation::helmholtz, n_q_points_1d>(shape_data,
                                                                   cell,
                                                                   quad_values,
                                                                   out_values);
-          else
-            compute_cell_mass<n_q_points_1d>(cell, this->factor_mass, quad_values, out_values);
-
-          if(factor_laplace != 0.)
             for(unsigned int f = 0; f < 2 * dim; ++f)
               compute_face<degree, false>(shape_data, src, cell, f, quad_values, out_values);
+          }
+          else
+            compute_cell_mass<n_q_points_1d>(cell, this->factor_mass, quad_values, out_values);
 
           for(unsigned int i = 0; i < n_points; ++i)
             quad_values[i] = out_values[i * dim + d];
@@ -3690,11 +3722,14 @@ private:
           }
           else if(cell_operation == CellOperation::convective_and_divergence)
           {
-            Tensor<1, dim, VectorizedArray<Number>> scaled_velocity;
-            for(unsigned int d = 0; d < dim; ++d)
-              scaled_velocity[d] = inv_jac_xy[0][d] * val_real[0] + inv_jac_xy[1][d] * val_real[1];
-            cfl_velocity =
-              std::max(cfl_velocity, scaled_velocity.norm_square() * (inv_jac_det * inv_jac_det));
+            {
+              // scaled velocity = inv_jac * val_real = 1/det(jac) * val_ref
+              Tensor<1, dim, VectorizedArray<Number>> scaled_velocity;
+              for(unsigned int d = 0; d < dim; ++d)
+                scaled_velocity[d] = val[d];
+              cfl_velocity =
+                std::max(cfl_velocity, scaled_velocity.norm_square() * (inv_jac_det * inv_jac_det));
+            }
             VectorizedArray<Number> tmp[2] = {grad_real[0][0] * t0 + grad_real[0][1] * t1,
                                               grad_real[1][0] * t0 + grad_real[1][1] * t1};
             for(unsigned int d = 0; d < dim; ++d)
@@ -3853,14 +3888,15 @@ private:
             {
               const VectorizedArray<Number> inv_jac_det_3d = inv_jac_det * h_z_inverse;
 
-              Tensor<1, dim, VectorizedArray<Number>> scaled_velocity;
-              for(unsigned int d = 0; d < 2; ++d)
-                scaled_velocity[d] =
-                  inv_jac_xy[0][d] * val_real[0] + inv_jac_xy[1][d] * val_real[1];
-              scaled_velocity[2] = val[2]; // h_z_inverse * val_real[2];
-              cfl_velocity =
-                std::max(cfl_velocity,
-                         scaled_velocity.norm_square() * (inv_jac_det_3d * inv_jac_det_3d));
+              {
+                // scaled velocity = inv_jac * val_real = 1/det(jac) * val_ref
+                Tensor<1, dim, VectorizedArray<Number>> scaled_velocity;
+                for(unsigned int d = 0; d < dim; ++d)
+                  scaled_velocity[d] = val[d];
+                cfl_velocity =
+                  std::max(cfl_velocity,
+                           scaled_velocity.norm_square() * (inv_jac_det_3d * inv_jac_det_3d));
+              }
               VectorizedArray<Number> tmp[3];
               for(unsigned int d = 0; d < dim; ++d)
               {
@@ -5668,18 +5704,24 @@ private:
                                       shifted_data_indices.data(),
                                       &jac_xy[0][0]);
 
+        // Assume body force does not depend on z direction
+        Tensor<1, dim, VectorizedArray<Number>> body_force;
+        for(unsigned int v = 0; v < n_lanes; ++v)
+        {
+          Point<dim> point;
+          for(unsigned int d = 0; d < 2; ++d)
+            point[d] =
+              mapping_info.quadrature_points[mapping_info.mapping_data_index[cell][v] + q1][d];
+          for(unsigned int d = 0; d < dim; ++d)
+            body_force[d][v] = rhs_function.value(point, d);
+        }
+
         if constexpr(dim == 2)
         {
-          VectorizedArray<Number> f_val[dim];
-          for(unsigned int v = 0; v < n_lanes; ++v)
-          {
-            Point<dim> point =
-              mapping_info.quadrature_points[mapping_info.mapping_data_index[cell][v] + q1];
-            f_val[0][v] = rhs_function.value(point, 0);
-            f_val[1][v] = rhs_function.value(point, 1);
-          }
-          const VectorizedArray<Number> s0 = jac_xy[0][0] * f_val[0] + jac_xy[1][0] * f_val[1];
-          const VectorizedArray<Number> s1 = jac_xy[0][1] * f_val[0] + jac_xy[1][1] * f_val[1];
+          const VectorizedArray<Number> s0 =
+            jac_xy[0][0] * body_force[0] + jac_xy[1][0] * body_force[1];
+          const VectorizedArray<Number> s1 =
+            jac_xy[0][1] * body_force[0] + jac_xy[1][1] * body_force[1];
 
           quad_values[q1 * dim]     = s0 * (mapping_info.quad_weights_xy[q1]);
           quad_values[q1 * dim + 1] = s1 * (mapping_info.quad_weights_xy[q1]);
@@ -5688,17 +5730,6 @@ private:
         {
           for(unsigned int qz = 0, q = q1; qz < nn; ++qz, q += nn * nn)
           {
-            Tensor<1, dim, VectorizedArray<Number>> val_real;
-            for(unsigned int v = 0; v < n_lanes; ++v)
-            {
-              Point<dim> point;
-              for(unsigned int d = 0; d < 2; ++d)
-                point[d] =
-                  mapping_info.quadrature_points[mapping_info.mapping_data_index[cell][v] + q1][d];
-              for(unsigned int d = 0; d < dim; ++d)
-                val_real[d][v] = rhs_function.value(point, d);
-            }
-
             const Number weight_z = mapping_info.quad_weights_z[qz];
             // need factors without h_z_inverse in code below because
             // it cancels with h_z
@@ -5711,9 +5742,8 @@ private:
 
             // jac_grad * (J^{-1} * (grad_in * factor)), re-use part in
             // braces as 'tmp' from above
-            VectorizedArray<Number> value_tmp[dim];
-            for(unsigned int d = 0; d < dim; ++d)
-              val_real[d] *= factor;
+            VectorizedArray<Number>                       value_tmp[dim];
+            const Tensor<1, dim, VectorizedArray<Number>> val_real = body_force * factor;
             for(unsigned int d = 0; d < 2; ++d)
               value_tmp[d] = jac_xy[0][d] * val_real[0] + jac_xy[1][d] * val_real[1];
             value_tmp[2] = h_z * val_real[2];
@@ -6326,6 +6356,7 @@ private:
         mapping_info.mapping_data_index[cell_indices[v] / n_lanes][cell_indices[v] % n_lanes] * 4;
 
     const Number h_z_inverse = mapping_info.h_z_inverse;
+    const Number h_z         = mapping_info.h_z;
 
     constexpr unsigned int nn = n_q_points_1d;
 
@@ -6364,7 +6395,7 @@ private:
                                  mapping_info.quad_weights_z[qz] *
                                  (jac_xy[d][0] * val[0] + jac_xy[d][1] * val[1]);
             velocities[q][2] =
-              mapping_info.quad_weights_xy[q1] * mapping_info.quad_weights_z[qz] * val[2];
+              mapping_info.quad_weights_xy[q1] * mapping_info.quad_weights_z[qz] * h_z * val[2];
           }
           else
           {
@@ -6452,8 +6483,8 @@ private:
     std::cout << std::endl;
 #endif
 
-    face_flux_buffer_index.resize(dof_indices.size());
-    all_left_face_fluxes_from_buffer.resize(dof_indices.size());
+    face_flux_buffer_index.assign(dof_indices.size(), {});
+    all_left_face_fluxes_from_buffer.assign(dof_indices.size(), {});
     const unsigned int n_data_per_face =
       Utilities::pow(mapping_info.quad_weights_z.size(), dim - 1) * 2 * dim;
 
