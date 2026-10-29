@@ -325,7 +325,6 @@ void
 TimeIntBDFDualSplittingExtruded<dim, Number>::convective_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   std::vector<Number> factors(this->vec_convective_term.size());
   // compute convective term and extrapolate convective term (if not Stokes equations)
@@ -414,7 +413,6 @@ void
 TimeIntBDFDualSplittingExtruded<dim, Number>::evaluate_convective_term()
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(this->param.convective_problem())
   {
@@ -441,7 +439,6 @@ void
 TimeIntBDFDualSplittingExtruded<dim, Number>::pressure_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // compute right-hand-side vector
   rhs_pressure(pressure_rhs);
@@ -549,7 +546,6 @@ void
 TimeIntBDFDualSplittingExtruded<dim, Number>::viscous_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // in case we need to iteratively solve a linear or nonlinear system of equations
   if(this->param.viscous_problem() or this->param.non_explicit_convective_problem())

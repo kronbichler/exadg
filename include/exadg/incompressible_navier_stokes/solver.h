@@ -66,7 +66,6 @@ run(std::string const & input_file,
     bool const          is_test)
 {
   dealii::Timer timer;
-  timer.restart();
 
   std::shared_ptr<IncNS::ApplicationBase<dim, Number>> application =
     IncNS::get_application<dim, Number>(input_file, mpi_comm);

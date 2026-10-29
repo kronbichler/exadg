@@ -693,7 +693,6 @@ void
 TimeIntBDF<dim, Number>::postprocessing() const
 {
   dealii::Timer timer;
-  timer.restart();
 
   // To allow a computation of errors at start_time (= if time step number is 1 and if the
   // simulation is not a restarted one), the mesh has to be at the correct position

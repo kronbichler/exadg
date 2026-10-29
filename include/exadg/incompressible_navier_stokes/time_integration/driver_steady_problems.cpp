@@ -102,7 +102,6 @@ void
 DriverSteadyProblems<dim, Number>::solve(double const time, bool unsteady_problem)
 {
   dealii::Timer timer;
-  timer.restart();
 
   postprocessing(time, unsteady_problem);
 
@@ -121,7 +120,6 @@ DriverSteadyProblems<dim, Number>::do_solve(double const time, bool unsteady_pro
     global_timer.restart();
 
   dealii::Timer timer;
-  timer.restart();
 
   if(print_solver_info(time, unsteady_problem))
     pcout << std::endl << "Solve steady state problem:" << std::endl;
@@ -143,7 +141,6 @@ DriverSteadyProblems<dim, Number>::do_solve(double const time, bool unsteady_pro
      this->param.treatment_of_variable_viscosity == TreatmentOfVariableViscosity::Explicit)
   {
     dealii::Timer timer_viscosity_update;
-    timer_viscosity_update.restart();
 
     pde_operator->update_viscosity(solution.block(0));
 
@@ -245,7 +242,6 @@ void
 DriverSteadyProblems<dim, Number>::postprocessing(double const time, bool unsteady_problem) const
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(unsteady_problem)
     postprocessor->do_postprocessing(solution.block(0),

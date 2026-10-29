@@ -384,7 +384,6 @@ void
 TimeIntBDFDualSplitting<dim, Number>::convective_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // compute convective term and extrapolate convective term (if not Stokes equations)
   if(this->param.convective_problem())
@@ -463,7 +462,6 @@ void
 TimeIntBDFDualSplitting<dim, Number>::evaluate_convective_term()
 {
   dealii::Timer timer;
-  timer.restart();
 
   if(this->param.convective_problem())
   {
@@ -483,7 +481,6 @@ void
 TimeIntBDFDualSplitting<dim, Number>::pressure_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // compute right-hand-side vector
   VectorType rhs(pressure_np);
@@ -664,7 +661,6 @@ void
 TimeIntBDFDualSplitting<dim, Number>::projection_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // compute right-hand-side vector
   VectorType rhs(velocity_np);
@@ -765,7 +761,6 @@ void
 TimeIntBDFDualSplitting<dim, Number>::viscous_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // in case we need to iteratively solve a linear or nonlinear system of equations
   if(this->param.viscous_problem() or this->param.non_explicit_convective_problem())
@@ -789,7 +784,6 @@ TimeIntBDFDualSplitting<dim, Number>::viscous_step()
     if(this->param.viscous_problem() and this->param.viscosity_is_variable())
     {
       dealii::Timer timer_viscosity_update;
-      timer_viscosity_update.restart();
 
       pde_operator->update_viscosity(velocity_np);
 
@@ -1052,7 +1046,6 @@ TimeIntBDFDualSplitting<dim, Number>::penalty_step()
   if(this->param.use_divergence_penalty == true or this->param.use_continuity_penalty == true)
   {
     dealii::Timer timer;
-    timer.restart();
 
     // compute right-hand-side vector
     VectorType rhs;

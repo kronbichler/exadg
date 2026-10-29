@@ -371,7 +371,6 @@ void
 TimeIntBDFPressureCorrection<dim, Number>::momentum_step()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // in case we need to iteratively solve a linear or nonlinear system of equations
   if(this->param.viscous_problem() or this->param.non_explicit_convective_problem())
@@ -394,7 +393,6 @@ TimeIntBDFPressureCorrection<dim, Number>::momentum_step()
     if(this->param.viscous_problem() and this->param.viscosity_is_variable())
     {
       dealii::Timer timer_viscosity_update;
-      timer_viscosity_update.restart();
 
       pde_operator->update_viscosity(velocity_np);
 
@@ -595,7 +593,6 @@ void
 TimeIntBDFPressureCorrection<dim, Number>::pressure_step(VectorType & pressure_increment)
 {
   dealii::Timer timer;
-  timer.restart();
 
   // compute right-hand side vector
   VectorType rhs(pressure_np);
@@ -814,7 +811,6 @@ void
 TimeIntBDFPressureCorrection<dim, Number>::projection_step(VectorType const & pressure_increment)
 {
   dealii::Timer timer;
-  timer.restart();
 
   // compute right-hand-side vector
   VectorType rhs(velocity_np);
@@ -890,7 +886,6 @@ void
 TimeIntBDFPressureCorrection<dim, Number>::evaluate_convective_term()
 {
   dealii::Timer timer;
-  timer.restart();
 
   // evaluate convective term once solution_np is known
   if(this->param.convective_problem() and
