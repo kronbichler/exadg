@@ -203,7 +203,8 @@ private:
                                   VectorTypeFloat,
                                   dealii::DiagonalMatrix<VectorTypeFloat>>;
   std::shared_ptr<ChebyshevSolver> momentum_solver_chebyshev;
-  double                           momentum_sliding_condition_number_estimate;
+  double                           momentum_sliding_max_eigenvalue;
+  double                           momentum_sliding_min_eigenvalue;
   double                           momentum_sliding_iteration_count;
 
   double factor_cfl;

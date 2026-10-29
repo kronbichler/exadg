@@ -59,7 +59,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
     divergences(this->order),
     pressure_nbc_rhs(this->param.order_extrapolation_pressure_nbc),
     factors_time_step_mass{},
-    momentum_sliding_condition_number_estimate(0),
+    momentum_sliding_max_eigenvalue(0),
+    momentum_sliding_min_eigenvalue(0),
     momentum_sliding_iteration_count(0),
     factor_cfl(-1.0),
     extra_pressure_nbc(this->param.order_extrapolation_pressure_nbc,
@@ -908,14 +909,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     double solve_time = 0;
     if(try_chebyshev_solver)
     {
-      // For computing the required iteration count against the given
-      // tolerance, we use a sliding average computed as
-      //   0.2 * new + 0.8 * previous_average  [reducing iteration counts]
-      // or
-      //   0.4 * new + 0.6 * previous_average  [increasing iteration counts]
-      // because we want to avoid the noise in the norm of the residual upon
-      // entry. (We will also use a sliding average for the actual estimate of
-      // the condition number further down.)
       const double target_reduction    = absolute_residual_target / initial_residual;
       const double requested_reduction = std::clamp(target_reduction, max_reduction_float, 1.9999);
 
@@ -925,19 +918,19 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       // the iteration number 'm'.
       const double iteration_count_guess =
         std::log(2. / requested_reduction) * 0.5 *
-        std::sqrt(std::max(momentum_sliding_condition_number_estimate, 1.0));
+        std::sqrt(std::max(momentum_sliding_max_eigenvalue / momentum_sliding_min_eigenvalue, 1.0));
 
+      // In case we have past solutions with Chebyshev, we might have found
+      // out that the estimation with the Varga formula is too pessimistic (as
+      // not all eigenvalues are presented in the present right-hand side). We
+      // thus use an exponential sliding average with the worst-case estimate
+      // 'iteration_count_guess' and previous experience.
       if(momentum_sliding_iteration_count == 0)
         momentum_sliding_iteration_count = iteration_count_guess;
       else
-      {
-        if(iteration_count_guess > momentum_sliding_iteration_count)
-          momentum_sliding_iteration_count =
-            0.6 * momentum_sliding_iteration_count + 0.4 * iteration_count_guess;
-        else
-          momentum_sliding_iteration_count =
-            0.8 * momentum_sliding_iteration_count + 0.2 * iteration_count_guess;
-      }
+        momentum_sliding_iteration_count =
+          0.8 * momentum_sliding_iteration_count + 0.2 * iteration_count_guess;
+
       n_iterations =
         std::clamp(static_cast<unsigned int>(std::ceil(momentum_sliding_iteration_count)),
                    1u,
@@ -958,10 +951,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     // As a fall-back in case the Chebyshev residual does not meet the
     // tolerance or in case Chebyshev was not selected, we use the CG
     // solver. As to the tolerance to determine whether Chebyshev was good
-    // enough, we intentionally choose a rather big failure factor of 3.0
+    // enough, we intentionally choose a rather big failure factor of 2.5
     // because the Chebyshev solver actually does one more iteration after the
     // one where the residual is gathered.
-    const double chebyshev_failure_factor        = 3.0;
+    const double chebyshev_failure_factor        = 2.5;
     const double chebyshev_severe_failure_factor = 6.0;
     const bool   need_cg_solver =
       !try_chebyshev_solver ||
@@ -973,8 +966,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     if(need_cg_solver)
     {
       dealii::SolverControl control(this->param.solver_data_momentum.max_iter,
-                                    extrapolate_accuracy.first *
-                                      this->param.solver_data_momentum.rel_tol);
+                                    absolute_residual_target);
 
       double                            min_eig = 0.0, max_eig = 0.0;
       dealii::SolverCG<VectorTypeFloat> solver_cg(control);
@@ -997,33 +989,54 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
       // Prepare the Chebyshev solver for the other cases in case this is not
       // the cleanup part; we only accept the upper eigenvalue bound for
-      // Chebyshev if we did at least 8 iterations, otherwise the CG solution
+      // Chebyshev if we did at least 5 iterations, otherwise the CG solution
       // might be too inaccurate and miss high eigenvalues (which leads to
       // convergence problems with Chebyshev).
-      constexpr unsigned int min_eigenvalue_iterations = 8;
+      constexpr unsigned int min_eigenvalue_iterations = 5;
       if(control.last_step() >= min_eigenvalue_iterations && min_eig > 0.0 && max_eig >= min_eig)
       {
-        // Update the estimate for the condition number: We choose a low
-        // factor 0.1 for the exponential sliding average here, meaning that
-        // the other updates to the condition number estimate done by the
-        // observed convergence rates of Chebyshev are given more weight. This
-        // means that the actually measured past residual reduction is assumed
-        // to be more accurate to predict the necessary iteration count in the
-        // next step as governed by the Chebyshev iteration count formula. The
-        // reason is that the CG estimate can fluctuate more between a more
-        // pessimistic state when the observed eigenvalues by the CG/Lanczos
-        // iteration are more extreme than the ones mattering for the next
-        // solution of the linear system, or more optimistic state when too
-        // few iterations are made. The tests made show that this choice works
-        // well for smooth solutions, where the prediction from past solver
-        // phases are really good. In other cases, we might need to revisit
-        // this choice.
-        if(momentum_sliding_condition_number_estimate <= 0 ||
-           !std::isfinite(momentum_sliding_condition_number_estimate))
-          momentum_sliding_condition_number_estimate = max_eig / min_eig;
-        else
-          momentum_sliding_condition_number_estimate =
-            0.9 * momentum_sliding_condition_number_estimate + 0.1 * max_eig / min_eig;
+        // Update the estimate for the eigenvalues that we pass to the
+        // Chebyshev solver. We use an exponential sliding average here,
+        // meaning that the previous value of the quantities is taken into
+        // account. If we found more extremal eigenvalues than what we have in
+        // our sliding averages, we use them immediately, otherwise we move
+        // slowly to those updated values.
+
+        // Only update the upper eigenvalue estimate when we did not do the
+        // PreconditionChebyshev case before, because Chebyshev will have
+        // damped the high-eigenvalue modes already and thus make them less
+        // visible to SolverCG.  An experience from practice is that the
+        // maximum eigenvalue of a Jacobi-preconditioned matrix stemming from
+        // a reaction-diffusion PDE is at least 2, so use 2.05 as a lower
+        // bound even if CG did not find such a big value. For other
+        // preconditions, we do not have gathered practical bounds that could
+        // be applied yet. This setting avoids some failures in Chebyshev when
+        // CG only does a small number of iterations.
+        if(not try_chebyshev_solver)
+        {
+          const double limited_max_eigenvalue =
+            (this->param.preconditioner_momentum == MomentumPreconditioner::PointJacobi ?
+               std::max(2.05, 1.1 * max_eig) :
+               1.1 * max_eig);
+          if(momentum_sliding_max_eigenvalue <= 0 ||
+             limited_max_eigenvalue > momentum_sliding_max_eigenvalue)
+            momentum_sliding_max_eigenvalue = limited_max_eigenvalue;
+          else
+            momentum_sliding_max_eigenvalue =
+              0.7 * momentum_sliding_max_eigenvalue + 0.3 * limited_max_eigenvalue;
+        }
+
+        // The Ritz values estimate by SolverCG will always be within the true
+        // eigenvalue range, so add a safety factor to the min eigenvalue as
+        // well. When updating the sliding average, only accept those
+        // estimates not too far off from the previous estimate.
+        const double limited_min_eigenvalue = 0.9 * min_eig;
+        if(momentum_sliding_min_eigenvalue <= 0 ||
+           limited_min_eigenvalue < momentum_sliding_min_eigenvalue)
+          momentum_sliding_min_eigenvalue = limited_min_eigenvalue;
+        else if(limited_min_eigenvalue < 2 * momentum_sliding_min_eigenvalue)
+          momentum_sliding_min_eigenvalue =
+            0.7 * momentum_sliding_min_eigenvalue + 0.3 * limited_min_eigenvalue;
 
         typename ChebyshevSolver::AdditionalData chebyshev_data;
         chebyshev_data.preconditioner.reset(&preconditioner_viscous, [](auto *) {
@@ -1032,16 +1045,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         });
         chebyshev_data.eig_cg_n_iterations = 0;
 
-        // An experience from practice is that the maximum eigenvalue of a
-        // Jacobi-preconditioned matrix stemming from a reaction-diffusion
-        // PDE is around 2, so use at least that value even if CG did not
-        // find such a big value. This avoids some failures in Chebyshev
-        // when CG only does a small number of iterations.
-        if(this->param.preconditioner_momentum == MomentumPreconditioner::PointJacobi)
-          chebyshev_data.max_eigenvalue = std::max(2.0, 1.05 * max_eig);
-        else
-          chebyshev_data.max_eigenvalue = 1.05 * max_eig;
-        chebyshev_data.smoothing_range = momentum_sliding_condition_number_estimate;
+        chebyshev_data.max_eigenvalue = momentum_sliding_max_eigenvalue;
+        chebyshev_data.smoothing_range =
+          momentum_sliding_max_eigenvalue / momentum_sliding_min_eigenvalue;
 
         // the actual degree will be set when we know the tolerance for the
         // solver
@@ -1052,14 +1058,17 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       }
 
       // If we got here after failing to meet the tolerance of Chebyshev, our
-      // condition number guess was probably not good enough. We should use
-      // the CG solver in the next iteration to refresh the
-      // eigenvalue/smoothing range parameter and get a better estimate of the
-      // sliding averages or, if the failure was not severe, try with more
-      // iterations.
+      // iteration guess that is based on observing previous convergence was
+      // probably too aggressive (or, in rare cases, the estimates for the
+      // eigenvalues yielded bounds where Chebyshev does not converge). For
+      // severe failures, we should use the CG solver in the next iteration to
+      // refresh the eigenvalue/smoothing range parameters and get a better
+      // estimate of the sliding averages of eigenvalues. In any case, also
+      // increase the iterations of Chebyshev to avoid a similar problem next
+      // time around.
       if(had_severe_chebyshev_failure)
         momentum_solver_chebyshev.reset();
-      else if(try_chebyshev_solver)
+      if(try_chebyshev_solver)
         momentum_sliding_iteration_count += 1;
 
       const double elapsed_time = timer2.wall_time();
@@ -1070,24 +1079,22 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     else
     {
       // If Chebyshev succeeded, we compute an estimate of the apparent
-      // condition number from the achieved residual reduction. It is done by
-      // rearranging the above Chebyshev iteration count formula for the
-      // condition number. The result is then fed into the sliding average for
-      // determining the iteration in the next step. Note that we subtract 1
-      // from the iteration count because the guess returned by the Chebyshev
-      // solver indicates the residual one iteration before the end.
+      // condition number from the achieved residual reduction, that can then
+      // inform us about what iteration count should have been used. It is
+      // done by rearranging the above Chebyshev iteration count formula for
+      // the condition number. Note that we subtract 1 from the iteration
+      // count because the guess returned by the Chebyshev solver indicates
+      // the residual one iteration before the end.
       const double achieved_reduction = reached_residual / initial_residual;
       if(n_iterations > 1 && achieved_reduction > 0 && achieved_reduction < 2.)
       {
-        const double denominator = 0.5 * std::log(2.0 / achieved_reduction);
+        const double denominator = std::log(2.0 / achieved_reduction);
         if(std::abs(denominator) > max_reduction_float)
         {
-          const double apparent_condition_number =
-            std::pow(static_cast<double>(n_iterations - 1) / denominator, 2);
-
-          if(std::isfinite(apparent_condition_number) && apparent_condition_number >= 1.0)
-            momentum_sliding_condition_number_estimate =
-              0.8 * momentum_sliding_condition_number_estimate + 0.2 * apparent_condition_number;
+          momentum_sliding_iteration_count =
+            0.7 * momentum_sliding_iteration_count +
+            0.3 * (momentum_sliding_iteration_count - 1) *
+              std::log(2. / (absolute_residual_target / initial_residual)) / denominator;
         }
       }
     }
@@ -1134,9 +1141,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
     if(this->print_solver_info() and not(this->is_test))
     {
-      this->pcout << std::endl
-                  << std::setprecision(4) << "Viscous step prepare: " << t_rhs;
-      if (not used_extrapolation)
+      this->pcout << std::endl << std::setprecision(4) << "Viscous step prepare: " << t_rhs;
+      if(not used_extrapolation)
         this->pcout << "/" << t_proj;
       this->pcout << "/" << t_residual << " s, solve " << solve_time + timer2.wall_time() << " s";
     }
