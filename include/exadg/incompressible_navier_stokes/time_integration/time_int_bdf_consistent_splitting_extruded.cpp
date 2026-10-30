@@ -906,12 +906,16 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       this->get_time_step_number() > 10 && this->get_time_step_number() % 32 != 0 &&
       momentum_solver_chebyshev != nullptr;
 
+    // The clamped reduction is also used to update the iteration count after
+    // a successful Chebyshev solve further down, where an unclamped target
+    // reduction above 2 (very good initial guess) would make the count
+    // negative.
+    const double target_reduction    = absolute_residual_target / initial_residual;
+    const double requested_reduction = std::clamp(target_reduction, max_reduction_float, 1.9999);
+
     double solve_time = 0;
     if(try_chebyshev_solver)
     {
-      const double target_reduction    = absolute_residual_target / initial_residual;
-      const double requested_reduction = std::clamp(target_reduction, max_reduction_float, 1.9999);
-
       // This is a convergence formula for the Chebyshev solver, based on the
       // book by Varga, Matrix Iterative Analysis. Their Chapter 5, page 156,
       // formula (5.27) provides an error formula, which is then solved for
@@ -1084,17 +1088,23 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       // done by rearranging the above Chebyshev iteration count formula for
       // the condition number. Note that we subtract 1 from the iteration
       // count because the guess returned by the Chebyshev solver indicates
-      // the residual one iteration before the end.
+      // the residual one iteration before the end. We skip the update when
+      // Chebyshev did not reduce the residual (possible if the initial
+      // residual was already close to the target), because an achieved
+      // reduction close to 2 gives a tiny denominator and thus a huge count.
+      // The result is clamped to the valid range of iteration counts.
       const double achieved_reduction = reached_residual / initial_residual;
-      if(n_iterations > 1 && achieved_reduction > 0 && achieved_reduction < 2.)
+      if(n_iterations > 1 && achieved_reduction > 0 && achieved_reduction < 1.)
       {
         const double denominator = std::log(2.0 / achieved_reduction);
         if(std::abs(denominator) > max_reduction_float)
         {
           momentum_sliding_iteration_count =
-            0.7 * momentum_sliding_iteration_count +
-            0.3 * (momentum_sliding_iteration_count - 1) *
-              std::log(2. / (absolute_residual_target / initial_residual)) / denominator;
+            std::clamp(0.7 * momentum_sliding_iteration_count +
+                         0.3 * static_cast<double>(n_iterations - 1) *
+                           std::log(2. / requested_reduction) / denominator,
+                       1.0,
+                       static_cast<double>(this->param.solver_data_momentum.max_iter));
         }
       }
     }
