@@ -33,6 +33,7 @@
 #include <deal.II/matrix_free/tensor_product_kernels.h>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/extruded_mapping_info.h>
+#include <exadg/incompressible_navier_stokes/spatial_discretization/operators/momentum_operator_rt_single_exchange.h>
 
 namespace RTOperator
 {
@@ -535,12 +536,6 @@ public:
           }
         }
 
-      const unsigned int n_t = fe.degree;
-      const unsigned int n_n = n_t + 1;
-      // data: projected to face, 2 because of values and derivatives
-      const unsigned int data_per_face =
-        2 * (Utilities::pow(n_t, dim - 1) + n_n * Utilities::pow(n_t, dim - 2) * (dim - 1));
-
       // find out how the neighbor wants us to send the data -> we sort by the
       // global cell index. We use a reverse order of processes as the data
       // access might favor nearby access to cell data.
@@ -554,7 +549,7 @@ public:
         send_data_cell_index.reserve(sizes);
         send_data_face_index.reserve(sizes);
       }
-      unsigned int offset = 0;
+      unsigned int face_index = 0;
       for(auto it = proc_neighbors.rbegin(); it != proc_neighbors.rend(); ++it)
       {
         std::sort(it->second.begin(),
@@ -594,16 +589,10 @@ public:
         {
           const unsigned int cell                               = it->second[i][0] / n_lanes;
           const unsigned int v                                  = it->second[i][0] % n_lanes;
-          mpi_exchange_data_on_faces[cell][it->second[i][4]][v] = offset;
-
-          offset += data_per_face;
+          mpi_exchange_data_on_faces[cell][it->second[i][4]][v] = face_index;
+          ++face_index;
         }
       }
-      mpi_requests.resize(send_data_process.size() * 2);
-      import_values.clear();
-      import_values.resize_fast(send_data_cell_index.size() * data_per_face);
-      export_values.clear();
-      export_values.resize_fast(send_data_cell_index.size() * data_per_face);
     }
 
     cell_level_index.resize(matrix_free.n_cell_batches());
@@ -643,6 +632,15 @@ public:
 
     shape_info = matrix_free.get_shape_info();
 
+    // The face integrals take the value of the normal component on the
+    // neighbor from the current cell, which requires shape functions that
+    // are nodal on the faces in normal direction
+    for(unsigned int side = 0; side < 2; ++side)
+      for(unsigned int i = 0; i <= fe.degree; ++i)
+        AssertThrow(std::abs(shape_info.data[0].shape_data_on_face[side][i] -
+                             (i == side * fe.degree ? 1. : 0.)) < 1e-12,
+                    ExcMessage("Expected nodal shape functions in normal direction"));
+
     {
       QGauss<1> quad(fe.degree + (fe.degree + 1) / 2);
 
@@ -671,6 +669,40 @@ public:
 
     detect_dependencies_of_face_integrals();
 
+    single_exchange.reinit(dof_handler,
+                           shape_info,
+                           *partitioner,
+                           dof_indices,
+                           cell_level_index,
+                           mpi_exchange_data_on_faces,
+                           send_data_process,
+                           send_data_cell_index,
+                           send_data_face_index);
+    if(single_exchange.usable)
+    {
+      mpi_recv_buffer.clear();
+      mpi_recv_buffer.resize_fast(single_exchange.recv_buffer_size);
+      mpi_send_buffer.clear();
+      mpi_send_buffer.resize_fast(single_exchange.send_buffer_size);
+      mpi_requests.resize(2 * single_exchange.partners.size());
+    }
+    else
+    {
+      const unsigned int n_t = fe.degree;
+      const unsigned int n_n = n_t + 1;
+      // data: projected to face, values and derivatives of the tangential
+      // components, only derivatives of the normal component (the value is
+      // continuous and thus available on the cell itself)
+      const unsigned int data_per_face =
+        Utilities::pow(n_t, dim - 1) + 2 * n_n * Utilities::pow(n_t, dim - 2) * (dim - 1);
+
+      mpi_requests.resize(send_data_process.size() * 2);
+      mpi_recv_buffer.clear();
+      mpi_recv_buffer.resize_fast(send_data_cell_index.size() * data_per_face);
+      mpi_send_buffer.clear();
+      mpi_send_buffer.resize_fast(send_data_cell_index.size() * data_per_face);
+    }
+
     set_parameters(0., 1.0);
 
     for(double & t : timings)
@@ -693,10 +725,18 @@ public:
                   << (std::is_same_v<Number, double> ? "double" : "float") << "> in "
                   << static_cast<unsigned long>(timings[0])
                   << " evaluations [t_total=" << total_time * timings[0] << "s]" << std::endl;
-      Helper::print_time(timings[1] / timings[0], "Update cell ghost values", comm, total_time);
+      Helper::print_time(timings[1] / timings[0],
+                         single_exchange.usable ? "Pack all ghosts and send" :
+                                                  "Update cell ghost values",
+                         comm,
+                         total_time);
       if(Utilities::MPI::n_mpi_processes(comm) > 1)
       {
-        Helper::print_time(timings[3] / timings[0], "Exchange data dg ghosts", comm, total_time);
+        Helper::print_time(timings[3] / timings[0],
+                           single_exchange.usable ? "Wait and unpack ghosts" :
+                                                    "Exchange data face ghosts",
+                           comm,
+                           total_time);
         Helper::print_time(timings[4] / timings[0], "Pre-loop before ghosts", comm, total_time);
       }
 
@@ -861,9 +901,55 @@ public:
   {
     const unsigned int n_cell_batches = dof_indices.size();
 
-    src.update_ghost_values();
+    if(single_exchange.usable)
+    {
+      // Single communication algorithm: the messages only contain data
+      // computed from locally owned entries, so we can pack them as soon as
+      // the entries touched by the packing have passed through before_loop,
+      // without previously calling 'src.update_ghost_values'.
+      const unsigned int n_partners = single_exchange.partners.size();
+      single_exchange.start_receives(mpi_recv_buffer.data(),
+                                     src.get_mpi_communicator(),
+                                     mpi_requests.data());
 
-    exchange_data_for_face_integrals<true>(src);
+      // ghost entities must not contribute to the packed face data
+      Assert(src.has_ghost_elements() == false, ExcInternalError());
+
+      const unsigned int n_t = shape_info.data[0].fe_degree;
+      if(n_t == 2)
+        single_exchange_pack_and_send<2>(src);
+      else if(n_t == 3)
+        single_exchange_pack_and_send<3>(src);
+      else if(n_t == 4)
+        single_exchange_pack_and_send<4>(src);
+#ifndef DEBUG
+      else if(n_t == 5)
+        single_exchange_pack_and_send<5>(src);
+      else if(n_t == 6)
+        single_exchange_pack_and_send<6>(src);
+      else if(n_t == 7)
+        single_exchange_pack_and_send<7>(src);
+      else if(n_t == 8)
+        single_exchange_pack_and_send<8>(src);
+      else if(n_t == 9)
+        single_exchange_pack_and_send<9>(src);
+#endif
+      else
+        AssertThrow(false, ExcNotImplemented());
+
+      if(n_partners > 0)
+      {
+        const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+        AssertThrowMPI(ierr);
+      }
+      single_exchange.unpack_and_complete(mpi_recv_buffer.data(),
+                                          const_cast<Number *>(src.begin()));
+    }
+    else
+    {
+      src.update_ghost_values();
+      exchange_data_for_face_integrals<true>(src);
+    }
 
     // since we just zero out the dst vector, can use the mass list
     for(unsigned int range = cell_loop_pre_list_index[n_cell_batches];
@@ -1029,8 +1115,66 @@ public:
         ++range)
       before_loop(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
 
-    if(factor_laplace != 0.)
+    if(factor_laplace != 0. && single_exchange.usable)
     {
+      // Single communication algorithm: the messages only contain data
+      // computed from locally owned entries, so we can pack them as soon as
+      // the entries touched by the packing have passed through before_loop,
+      // without previously calling 'src.update_ghost_values'.
+      const unsigned int n_partners = single_exchange.partners.size();
+      single_exchange.start_receives(mpi_recv_buffer.data(),
+                                     src.get_mpi_communicator(),
+                                     mpi_requests.data());
+
+      // ghost entities must not contribute to the packed face data
+      Assert(src.has_ghost_elements() == false, ExcInternalError());
+
+      for(unsigned int range = cell_loop_pre_list_index[n_cell_batches + 1];
+          range < cell_loop_pre_list_index[n_cell_batches + 2];
+          ++range)
+        before_loop(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
+
+      timings[4] += time.wall_time();
+      time.restart();
+
+      const unsigned int n_t = shape_info.data[0].fe_degree;
+      if(n_t == 2)
+        single_exchange_pack_and_send<2>(src);
+      else if(n_t == 3)
+        single_exchange_pack_and_send<3>(src);
+      else if(n_t == 4)
+        single_exchange_pack_and_send<4>(src);
+#ifndef DEBUG
+      else if(n_t == 5)
+        single_exchange_pack_and_send<5>(src);
+      else if(n_t == 6)
+        single_exchange_pack_and_send<6>(src);
+      else if(n_t == 7)
+        single_exchange_pack_and_send<7>(src);
+      else if(n_t == 8)
+        single_exchange_pack_and_send<8>(src);
+      else if(n_t == 9)
+        single_exchange_pack_and_send<9>(src);
+#endif
+      else
+        AssertThrow(false, ExcNotImplemented());
+      timings[1] += time.wall_time();
+      time.restart();
+
+      if(n_partners > 0)
+      {
+        const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+        AssertThrowMPI(ierr);
+      }
+      single_exchange.unpack_and_complete(mpi_recv_buffer.data(),
+                                          const_cast<Number *>(src.begin()));
+      timings[3] += time.wall_time();
+    }
+    else if(factor_laplace != 0.)
+    {
+      // Two-step data communication for the Laplacian, first filling all cell
+      // values that then get sent as compressed face data to the other
+      // process
       src.update_ghost_values_start();
       timings[1] += time.wall_time();
       time.restart();
@@ -1166,8 +1310,8 @@ public:
     return MemoryConsumption::memory_consumption(dof_indices) +
            MemoryConsumption::memory_consumption(neighbor_cells) +
            MemoryConsumption::memory_consumption(mpi_exchange_data_on_faces) +
-           MemoryConsumption::memory_consumption(import_values) +
-           MemoryConsumption::memory_consumption(export_values) +
+           MemoryConsumption::memory_consumption(mpi_recv_buffer) +
+           MemoryConsumption::memory_consumption(mpi_send_buffer) +
            MemoryConsumption::memory_consumption(all_owned_faces) +
            mapping_info.memory_consumption() +
            MemoryConsumption::memory_consumption(interpolate_quad_to_boundary) +
@@ -1572,8 +1716,8 @@ private:
   std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>>     neighbor_cells;
   std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>>     mpi_exchange_data_on_faces;
   mutable std::vector<MPI_Request>                                 mpi_requests;
-  mutable AlignedVector<Number>                                    import_values;
-  mutable AlignedVector<Number>                                    export_values;
+  mutable AlignedVector<Number>                                    mpi_recv_buffer;
+  mutable AlignedVector<Number>                                    mpi_send_buffer;
   Table<2, unsigned char>                                          all_owned_faces;
 
   std::vector<std::pair<unsigned int, std::array<unsigned int, n_lanes>>>
@@ -1615,6 +1759,34 @@ private:
   mutable AlignedVector<Number>                        face_flux_buffer;
   std::vector<ndarray<unsigned int, 2 * dim, n_lanes>> face_flux_buffer_index;
   std::vector<std::array<bool, dim>>                   all_left_face_fluxes_from_buffer;
+
+  SingleExchange::Data<dim, Number> single_exchange;
+
+  // Pack the messages of the single exchange from locally owned entries of
+  // src and send them; the face data is evaluated with the regular indices
+  // while the ghost range of src is zero, in the same format as in
+  // vmult_pack_and_send_data()
+  template<int n_t>
+  void
+  single_exchange_pack_and_send(const VectorType & src) const
+  {
+    const auto & partners    = single_exchange.partners;
+    Number *     send_buffer = mpi_send_buffer.data();
+    for(unsigned int p = 0; p < partners.size(); ++p)
+    {
+      const auto & partner = partners[p];
+      single_exchange.pack_ghost_section(partner, src.begin(), send_buffer);
+      pack_face_data<n_t>(src.begin(),
+                          partner.first_face,
+                          partner.first_face + partner.n_faces,
+                          single_exchange.face_section(partner, send_buffer));
+      single_exchange.pack_supplement_section(partner, src.begin(), send_buffer);
+      single_exchange.start_send(p,
+                                 send_buffer,
+                                 src.get_mpi_communicator(),
+                                 mpi_requests.data() + partners.size());
+    }
+  }
 
   unsigned int
   n_active_entries_per_cell_batch(const unsigned int cell) const
@@ -2443,9 +2615,21 @@ private:
     const Number * DEAL_II_RESTRICT shape_data_t =
       shape_info.data[1].shape_data_on_face[side].data();
 
+    // The normal component of the velocity is continuous over the face and
+    // the shape functions are nodal in the normal direction, so we do not
+    // need to read the dofs on the face itself (index 'side'). Only the
+    // normal derivative of that component is computed here, and the
+    // contribution of the dofs on the face to that derivative is added at
+    // the quadrature points in compute_face() from the values of the
+    // current cell. The output layout is, in component order, val+grad for
+    // tangential components and grad only for the normal component.
+
     // x component
     for(unsigned int f = 0; f < 2; ++f)
     {
+      if(face_direction == 0 && f == side)
+        continue;
+
       // check if indices unconstrained
       bool all_indices_unconstrained = true;
       for(const unsigned int i : dof_indices[f])
@@ -2479,21 +2663,14 @@ private:
                                       data_cell);
         if(face_direction == 0)
         {
-          VectorizedArray<Number> * out_val  = out + i2 * n_t;
-          VectorizedArray<Number> * out_grad = out + dofs_per_face + i2 * n_t;
+          VectorizedArray<Number> * out_grad = out + i2 * n_t;
           for(unsigned int i1 = 0; i1 < n_t; ++i1)
           {
-            VectorizedArray<Number> sum_v = data_f[0][i2 * n_t + i1] * shape_data_n[0] +
-                                            data_f[1][i2 * n_t + i1] * shape_data_n[n_t];
-            VectorizedArray<Number> sum_g = data_f[0][i2 * n_t + i1] * shape_data_n[n_n] +
-                                            data_f[1][i2 * n_t + i1] * shape_data_n[n_n + n_t];
+            VectorizedArray<Number> sum_g =
+              data_f[1 - side][i2 * n_t + i1] * shape_data_n[n_n + (1 - side) * n_t];
             for(unsigned int i = 0; i < n_t - 1; ++i)
-            {
-              sum_v += data_cell[i1 * (n_t - 1) + i] * shape_data_n[i + 1];
               sum_g += data_cell[i1 * (n_t - 1) + i] * shape_data_n[n_n + i + 1];
-            }
 
-            out_val[i1]  = sum_v;
             out_grad[i1] = sum_g;
           }
         }
@@ -2553,7 +2730,7 @@ private:
       for(unsigned int i2 = 0; i2 < n_t; ++i2)
         for(unsigned int i1 = 0; i1 < n_t - 1; ++i1)
           indices_of_cell_data[i2 * (n_t - 1) + i1] = i2 * (n_t + 1) + i1 + 1;
-      if(dofs_per_plane >= 4)
+      if constexpr(dofs_per_plane >= 4)
         for(unsigned int i2 = 0; i2 < dofs_per_plane; i2 += 4)
         {
           const unsigned int      i = std::min(i2, dofs_per_plane - 4);
@@ -2605,11 +2782,14 @@ private:
       }
     }
 
-    out += (face_direction == 0) ? 2 * n_t * n_t : 2 * n_t * n_n;
+    out += (face_direction == 0) ? n_t * n_t : 2 * n_t * n_n;
 
     // y component
     for(unsigned int f = 0; f < 2; ++f)
     {
+      if(face_direction == 1 && f == side)
+        continue;
+
       // check if indices unconstrained
       bool all_indices_unconstrained = true;
       for(const unsigned int i : dof_indices[2 + f])
@@ -2677,21 +2857,14 @@ private:
         else
         {
           // face_direction == 1
-          VectorizedArray<Number> * out_val  = out + i2 * n_t;
-          VectorizedArray<Number> * out_grad = out + dofs_per_face + i2 * n_t;
+          VectorizedArray<Number> * out_grad = out + i2 * n_t;
           for(unsigned int i1 = 0; i1 < n_t; ++i1)
           {
-            VectorizedArray<Number> sum_v = data_f[0][i2 * n_t + i1] * shape_data_n[0] +
-                                            data_f[1][i2 * n_t + i1] * shape_data_n[n_t];
-            VectorizedArray<Number> sum_g = data_f[0][i2 * n_t + i1] * shape_data_n[n_n] +
-                                            data_f[1][i2 * n_t + i1] * shape_data_n[n_n + n_t];
+            VectorizedArray<Number> sum_g =
+              data_f[1 - side][i2 * n_t + i1] * shape_data_n[n_n + (1 - side) * n_t];
             for(unsigned int i = 0; i < n_t - 1; ++i)
-            {
-              sum_v += data_cell[i * n_t + i1] * shape_data_n[i + 1];
               sum_g += data_cell[i * n_t + i1] * shape_data_n[n_n + i + 1];
-            }
 
-            out_val[i1]  = sum_v;
             out_grad[i1] = sum_g;
           }
         }
@@ -2776,7 +2949,7 @@ private:
     }
 
     // z component
-    out += (face_direction == 1) ? 2 * n_t * n_t : 2 * n_t * n_n;
+    out += (face_direction == 1) ? n_t * n_t : 2 * n_t * n_n;
     if(dim > 2)
     {
       if(face_direction < 2)
@@ -2872,7 +3045,7 @@ private:
       else
       {
         // face_direction == 2
-        for(unsigned int f = 0; f < 2; ++f)
+        const unsigned int f = 1 - side;
         {
           // check if indices unconstrained
           bool all_indices_unconstrained = true;
@@ -2904,13 +3077,9 @@ private:
         for(unsigned int i2 = 0; i2 < dofs_per_face; i2 += 4)
         {
           const unsigned int                     i = std::min(i2, dofs_per_face - 4);
-          std::array<VectorizedArray<Number>, 4> sum_v, sum_g;
+          std::array<VectorizedArray<Number>, 4> sum_g;
           for(unsigned int e = 0; e < 4; ++e)
-          {
-            sum_v[e] = data_f[0][i + e] * shape_data_n[0] + data_f[1][i + e] * shape_data_n[n_t];
-            sum_g[e] =
-              data_f[0][i + e] * shape_data_n[n_n] + data_f[1][i + e] * shape_data_n[n_n + n_t];
-          }
+            sum_g[e] = data_f[f][i + e] * shape_data_n[n_n + f * n_t];
           for(unsigned int i1 = 0; i1 < n_t - 1; ++i1)
           {
             VectorizedArray<Number> entries[4];
@@ -2920,16 +3089,10 @@ private:
                                           dof_indices[2 * dim].data(),
                                           entries);
             for(unsigned int e = 0; e < 4; ++e)
-            {
-              sum_v[e] += entries[e] * shape_data_n[i1 + 1];
               sum_g[e] += entries[e] * shape_data_n[n_n + i1 + 1];
-            }
           }
           for(unsigned int e = 0; e < 4; ++e)
-          {
-            out[i + e]                 = sum_v[e];
-            out[i + e + dofs_per_face] = sum_g[e];
-          }
+            out[i + e] = sum_g[e];
         }
       }
     }
@@ -2960,19 +3123,15 @@ private:
   {
     constexpr unsigned int n_n               = n_t + 1;
     constexpr unsigned int hex_dofs_per_comp = Utilities::pow(n_t, dim - 1) * (n_t - 1);
+
+    // The normal component of the velocity is continuous over the face, so
+    // its value is taken from the current cell in compute_face_convective()
+    // and we only read the dim-1 tangential components here, in component
+    // order
     if(face / 2 == 0)
     {
-      unsigned int idx = dof_indices[face][lane];
-      if(idx != numbers::invalid_unsigned_int)
-        for(unsigned int i = 0; i < Utilities::pow(n_t, dim - 1); ++i)
-          write_vectorized_value(src.local_element(idx + i), lane, out[i]);
-      else
-        for(unsigned int i = 0; i < Utilities::pow(n_t, dim - 1); ++i)
-          write_vectorized_value(0.0, lane, out[i]);
-      out += Utilities::pow(n_t, dim - 1);
-
       const unsigned int start = (face % 2) * (n_t - 1);
-      idx                      = dof_indices[2][lane] + start;
+      unsigned int       idx   = dof_indices[2][lane] + start;
       if(dof_indices[2][lane] != numbers::invalid_unsigned_int)
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
           write_vectorized_value(src.local_element(idx + i * n_t), lane, out[i * n_n]);
@@ -3042,15 +3201,6 @@ private:
                                  lane,
                                  out[i1 * n_n + i0 + 1]);
       out += Utilities::pow(n_t, dim - 2) * n_n;
-
-      idx = dof_indices[face][lane];
-      if(idx != numbers::invalid_unsigned_int)
-        for(unsigned int i = 0; i < Utilities::pow(n_t, dim - 1); ++i)
-          write_vectorized_value(src.local_element(idx + i), lane, out[i]);
-      else
-        for(unsigned int i = 0; i < Utilities::pow(n_t, dim - 1); ++i)
-          write_vectorized_value(0.0, lane, out[i]);
-      out += Utilities::pow(n_t, dim - 1);
 
       if constexpr(dim == 3)
       {
@@ -3122,15 +3272,6 @@ private:
           write_vectorized_value(src.local_element(idx + i1 * n_t + i0),
                                  lane,
                                  out[(i1 + 1) * n_t + i0]);
-      out += Utilities::pow(n_t, dim - 2) * n_n;
-
-      idx = dof_indices[face][lane];
-      if(idx != numbers::invalid_unsigned_int)
-        for(unsigned int i = 0; i < Utilities::pow(n_t, dim - 1); ++i)
-          write_vectorized_value(src.local_element(idx + i), lane, out[i]);
-      else
-        for(unsigned int i = 0; i < Utilities::pow(n_t, dim - 1); ++i)
-          write_vectorized_value(0.0, lane, out[i]);
     }
   }
 
@@ -3143,16 +3284,20 @@ private:
       const int n_t = shape_info.data[0].fe_degree;
       const int n_n = n_t + 1;
 
-      // data: just exchange values on face
+      // data: values on face for the tangential components (the normal
+      // component is continuous), if derivatives are requested, add
+      // derivatives of tangential components and the normal derivative of
+      // the normal component
       const int data_per_face =
-        (Utilities::pow(n_t, dim - 1) + n_n * Utilities::pow(n_t, dim - 2) * (dim - 1)) *
-        (exchange_derivatives ? 2 : 1);
+        exchange_derivatives ?
+          Utilities::pow(n_t, dim - 1) + 2 * n_n * Utilities::pow(n_t, dim - 2) * (dim - 1) :
+          n_n * Utilities::pow(n_t, dim - 2) * (dim - 1);
 
       AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
       unsigned int offset = 0;
       for(unsigned int p = 0; p < send_data_process.size(); ++p)
       {
-        MPI_Irecv(&import_values[offset * data_per_face],
+        MPI_Irecv(&mpi_recv_buffer[offset * data_per_face],
                   send_data_process[p].second * data_per_face * sizeof(Number),
                   MPI_BYTE,
                   send_data_process[p].first,
@@ -3161,8 +3306,7 @@ private:
                   &mpi_requests[p]);
         offset += send_data_process[p].second;
       }
-      AssertDimension(offset * data_per_face * (exchange_derivatives ? 1 : 2),
-                      import_values.size());
+      AssertIndexRange(offset * data_per_face, mpi_recv_buffer.size() + 1);
 
       if(n_t == 2)
         vmult_pack_and_send_data<2, exchange_derivatives>(src);
@@ -3190,78 +3334,95 @@ private:
     }
   }
 
+  // Evaluate the face data (values and derivatives) of the faces
+  // [first_face, end_face) of send_data_cell_index and send_data_face_index
+  // and store them contiguously starting at 'out', vectorized over faces
+  // with the same face number
+  template<int n_t>
+  void
+  pack_face_data(const Number *     src,
+                 const unsigned int first_face,
+                 const unsigned int end_face,
+                 Number *           out) const
+  {
+    constexpr unsigned int n_n = n_t + 1;
+    constexpr unsigned int data_per_face =
+      Utilities::pow(n_t, dim - 1) + 2 * n_n * Utilities::pow(n_t, dim - 2) * (dim - 1);
+
+    std::array<VectorizedArray<Number>, dim * 3 * n_n * n_t> tmp_vec;
+
+    for(unsigned int count = first_face; count < end_face;)
+    {
+      const unsigned int face = send_data_face_index[count];
+
+      // to use vectorized code path, must check that faces are available,
+      // faces are sorted by face number within each partner
+      unsigned int n_faces = 1;
+      if(count + n_lanes <= end_face && send_data_face_index[count + n_lanes - 1] == face)
+        n_faces = n_lanes;
+      else
+        while(count + n_faces < end_face && send_data_face_index[count + n_faces] == face)
+          ++n_faces;
+      AssertIndexRange(n_faces, n_lanes + 1);
+
+      dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> dof_indices_vec;
+      std::array<unsigned int, n_lanes>                   indices;
+      for(unsigned int v = 0; v < n_faces; ++v, ++count)
+      {
+        indices[v]              = (count - first_face) * data_per_face;
+        const unsigned int cell = send_data_cell_index[count] / n_lanes;
+        const unsigned int lane = send_data_cell_index[count] % n_lanes;
+        AssertDimension(face, send_data_face_index[count]);
+        for(unsigned int f = 0; f < 2 * dim + 1; ++f)
+          dof_indices_vec[f][v] = dof_indices[cell][f][lane];
+      }
+      for(unsigned int v = n_faces; v < n_lanes; ++v)
+        for(unsigned int f = 0; f < 2 * dim + 1; ++f)
+          dof_indices_vec[f][v] = dof_indices_vec[f][0];
+      read_face_values<n_t>(src, face, dof_indices_vec, tmp_vec.data());
+
+      // copy to dedicated data field
+      if(n_faces == n_lanes)
+        vectorized_transpose_and_store(false, data_per_face, tmp_vec.data(), indices.data(), out);
+      else
+        for(unsigned int v = 0; v < n_faces; ++v)
+          for(unsigned int i = 0; i < data_per_face; ++i)
+            out[indices[v] + i] = tmp_vec[i][v];
+    }
+  }
+
   template<int n_t, bool include_face_derivative = true>
   void
   vmult_pack_and_send_data(const VectorType & src) const
   {
     constexpr int n_n = n_t + 1;
     constexpr int data_per_face =
-      (include_face_derivative ? 2 : 1) *
-      (Utilities::pow(n_t, dim - 1) + n_n * Utilities::pow(n_t, dim - 2) * (dim - 1));
-
-    std::array<VectorizedArray<Number>, dim * 3 * n_n * n_t> tmp_vec;
+      (include_face_derivative ? Utilities::pow(n_t, dim - 1) : 0) +
+      (include_face_derivative ? 2 : 1) * n_n * Utilities::pow(n_t, dim - 2) * (dim - 1);
 
     AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
     unsigned int offset = 0;
     for(unsigned int p = 0; p < send_data_process.size(); ++p)
     {
       const unsigned int my_faces = send_data_process[p].second;
-      for(unsigned int count = offset; count < offset + my_faces;)
-      {
-        const unsigned int face = send_data_face_index[count];
-
-        if(include_face_derivative)
-        {
-          // to use vectorized code path, must check that faces are
-          // available
-          unsigned int n_faces = 1;
-          if(count + n_lanes <= offset + my_faces &&
-             send_data_face_index[count + n_lanes - 1] == face)
-            n_faces = n_lanes;
-          else
-            while(count + n_faces < offset + my_faces &&
-                  send_data_face_index[count + n_faces] == face)
-              ++n_faces;
-          AssertIndexRange(n_faces, n_lanes + 1);
-
-          dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> dof_indices_vec;
-          std::array<unsigned int, n_lanes>                   indices;
-          for(unsigned int v = 0; v < n_faces; ++v, ++count)
-          {
-            indices[v]              = count * data_per_face;
-            const unsigned int cell = send_data_cell_index[count] / n_lanes;
-            const unsigned int lane = send_data_cell_index[count] % n_lanes;
-            AssertDimension(face, send_data_face_index[count]);
-            for(unsigned int f = 0; f < 2 * dim + 1; ++f)
-              dof_indices_vec[f][v] = dof_indices[cell][f][lane];
-          }
-          for(unsigned int v = n_faces; v < n_lanes; ++v)
-          {
-            for(unsigned int f = 0; f < 2 * dim + 1; ++f)
-              dof_indices_vec[f][v] = dof_indices_vec[f][0];
-          }
-          read_face_values<n_t>(src.begin(), face, dof_indices_vec, tmp_vec.data());
-
-          // copy to dedicated data field
-          if(n_faces == n_lanes)
-            vectorized_transpose_and_store(
-              false, data_per_face, tmp_vec.data(), indices.data(), export_values.data());
-          else
-            for(unsigned int v = 0; v < n_faces; ++v)
-              for(unsigned int i = 0; i < data_per_face; ++i)
-                export_values[indices[v] + i] = tmp_vec[i][v];
-        }
-        else
+      if(include_face_derivative)
+        pack_face_data<n_t>(src.begin(),
+                            offset,
+                            offset + my_faces,
+                            mpi_send_buffer.data() + offset * data_per_face);
+      else
+        for(unsigned int count = offset; count < offset + my_faces; ++count)
         {
           const unsigned int cell = send_data_cell_index[count] / n_lanes;
           const unsigned int lane = send_data_cell_index[count] % n_lanes;
-          read_face_values_only<n_t>(
-            src, face, dof_indices[cell], lane, export_values.data() + count * data_per_face);
-          ++count;
+          read_face_values_only<n_t>(src,
+                                     send_data_face_index[count],
+                                     dof_indices[cell],
+                                     lane,
+                                     mpi_send_buffer.data() + count * data_per_face);
         }
-      }
 
-      MPI_Isend(&export_values[offset * data_per_face],
+      MPI_Isend(&mpi_send_buffer[offset * data_per_face],
                 my_faces * data_per_face * sizeof(Number),
                 MPI_BYTE,
                 send_data_process[p].first,
@@ -3271,9 +3432,9 @@ private:
       offset += my_faces;
     }
     if(include_face_derivative)
-      AssertDimension(offset * data_per_face, export_values.size());
+      AssertDimension(offset * data_per_face, mpi_send_buffer.size());
     else
-      AssertDimension(offset * data_per_face * 2, export_values.size());
+      AssertIndexRange(offset * data_per_face, mpi_send_buffer.size() + 1);
   }
 
   void
@@ -4141,6 +4302,52 @@ private:
     }
   }
 
+  // The normal component of the velocity is continuous across faces, so
+  // the value on the neighbor is the value interpolated from the interior
+  // of the current cell. As read_face_values() skips the dofs on the face
+  // when computing the normal derivative of that component, add their
+  // contribution, using that the shape functions are nodal in normal
+  // direction and only the shape function on the face is non-zero there.
+  template<int n_q_points_face>
+  void
+  add_face_value_to_normal_derivative(
+    const unsigned int            f,
+    const VectorizedArray<Number> values_face[2][dim][n_q_points_face + 1],
+    VectorizedArray<Number>       grads_face[2][dim][n_q_points_face * dim + 1]) const
+  {
+    const unsigned int face_direction = f / 2;
+    const unsigned int side_neighbor  = 1 - f % 2;
+    const unsigned int n_t            = shape_info.data[0].fe_degree;
+    const unsigned int n_n            = n_t + 1;
+    const Number       shape_derivative_on_face =
+      shape_info.data[0].shape_data_on_face[side_neighbor][n_n + side_neighbor * n_t];
+    for(unsigned int q = 0; q < n_q_points_face; ++q)
+      grads_face[1][face_direction][q * dim + face_direction] +=
+        shape_derivative_on_face * values_face[0][face_direction][q];
+  }
+
+  // Set up pointers to the values and derivatives on the exterior side of
+  // a face. As the normal component of the velocity is continuous, its value
+  // and its tangential derivatives on the exterior side are the ones of the
+  // interior side, and only the normal derivative is taken from the
+  // exterior.
+  template<int n_q_points_face>
+  void
+  set_exterior_pointers(const unsigned int            face_direction,
+                        const VectorizedArray<Number> values_face[2][dim][n_q_points_face + 1],
+                        const VectorizedArray<Number> grads_face[2][dim][n_q_points_face * dim + 1],
+                        const VectorizedArray<Number> * values_exterior[dim],
+                        const VectorizedArray<Number> * grads_exterior[dim][dim]) const
+  {
+    for(unsigned int d = 0; d < dim; ++d)
+    {
+      values_exterior[d] = values_face[d == face_direction ? 0 : 1][d];
+      for(unsigned int e = 0; e < dim; ++e)
+        grads_exterior[d][e] =
+          grads_face[(d == face_direction && e != face_direction) ? 0 : 1][d] + e;
+    }
+  }
+
   template<int degree, bool compute_exterior>
   void
   compute_face(
@@ -4230,38 +4437,33 @@ private:
     {
       read_face_values<degree>(src.begin(), f + (f % 2 ? -1 : 1), dof_indices_neighbor, face_array);
 
-      constexpr dealii::ndarray<int, 3, 3> dofs_per_direction{
-        {{{n_n, n_t, n_t}}, {{n_t, n_n, n_t}}, {{n_t, n_t, n_n}}}};
-
       // For faces located on MPI-remote processes, we replace the dummy
       // data read out above by the data sent to us
+      constexpr unsigned int data_per_face = n_t * n_t + 2 * 2 * n_t * n_n;
       for(unsigned int v = 0; v < n_lanes; ++v)
         if(mpi_exchange_data_on_faces[cell][f][v] != numbers::invalid_unsigned_int)
-          for(unsigned int d = 0, c = 0; d < dim; ++d)
-          {
-            unsigned int dofs_on_this_face = 1;
-            for(unsigned int e = 0; e < dim; ++e)
-              if(e != d)
-                dofs_on_this_face *= dofs_per_direction[f / 2][e];
-            for(unsigned int i = 0; i < 2 * dofs_on_this_face; ++i)
-            {
-              face_array[i + 2 * c][v] =
-                import_values[mpi_exchange_data_on_faces[cell][f][v] + i + c * 2];
-            }
-            c += dofs_on_this_face;
-          }
+        {
+          const unsigned int slot = mpi_exchange_data_on_faces[cell][f][v];
+          const Number *     imported_data_ptr =
+            mpi_recv_buffer.data() + (single_exchange.usable ?
+                                        single_exchange.recv_face_offset[slot] :
+                                        slot * data_per_face);
+          for(unsigned int i = 0; i < data_per_face; ++i)
+            face_array[i][v] = imported_data_ptr[i];
+        }
 
+      // Only the normal derivative of the normal component is read from
+      // the neighbor, the value and the contribution of the value to the
+      // derivative is added below once the values of this cell are known
       const VectorizedArray<Number> * values_dofs = face_array + face_direction * n_t * n_n * 2;
-      VectorizedArray<Number> *       values      = values_face[1][face_direction];
+      VectorizedArray<Number> *       values      = nullptr;
       VectorizedArray<Number> *       gradients   = grads_face[1][face_direction];
       eval_iso.template values<0, true, false>(values_dofs, scratch_data);
-      eval_iso.template values<1, true, false>(scratch_data, values);
-      eval_iso.template values<0, true, false>(values_dofs + n_t * n_t, scratch_data);
       eval_iso.template values<1, true, false, dim>(scratch_data, gradients + face_direction);
 
       if(face_direction == 0)
       {
-        values_dofs = face_array + 2 * n_t * n_t;
+        values_dofs = face_array + n_t * n_t;
         values      = values_face[1][1];
         gradients   = grads_face[1][1];
       }
@@ -4280,7 +4482,7 @@ private:
 
       if(face_direction < 2)
       {
-        values_dofs = face_array + 2 * n_t * n_t + 2 * n_t * n_n;
+        values_dofs = face_array + n_t * n_t + 2 * n_t * n_n;
         values      = values_face[1][2];
         gradients   = grads_face[1][2];
       }
@@ -4340,13 +4542,20 @@ private:
         grads_face[0][2][deriv_idx]  = d2;
       }
 
+    if constexpr(compute_exterior)
+      add_face_value_to_normal_derivative<n_q_points_face>(f, values_face, grads_face);
+
     // Only need some tangential derivative in xy plane, as the domain is
-    // extruded in z direction
+    // extruded in z direction. The tangential derivatives of the normal
+    // component on the exterior are the same as on the interior side, so
+    // skip them.
     if(face_direction < 2)
       for(unsigned int side = 0; side < (compute_exterior ? 2 : 1); ++side)
       {
         for(unsigned int d = 0; d < dim; ++d)
         {
+          if(side == 1 && d == face_direction)
+            continue;
           const unsigned int first  = face_direction == 0 ? 1 : 0;
           const unsigned int second = face_direction == 1 ? 2 : first + 1;
           eval_g.template gradients<0, true, false, dim>(values_face[side][d],
@@ -4359,6 +4568,11 @@ private:
                                                            grads_face[side][d] + second);
         }
       }
+
+    const VectorizedArray<Number> * values_ext[dim];
+    const VectorizedArray<Number> * grads_ext[dim][dim];
+    set_exterior_pointers<n_q_points_face>(
+      face_direction, values_face, grads_face, values_ext, grads_ext);
 
     const Number                  h_z         = mapping_info.h_z;
     const Number                  h_z_inverse = mapping_info.h_z_inverse;
@@ -4443,14 +4657,14 @@ private:
         {
           const VectorizedArray<Number> val[2][3] = {
             {values_face[0][0][q], values_face[0][1][q], values_face[0][2][q]},
-            {values_face[1][0][q], values_face[1][1][q], values_face[1][2][q]}};
+            {values_ext[0][q], values_ext[1][q], values_ext[2][q]}};
           const VectorizedArray<Number> grad[2][3][2] = {
             {{grads_face[0][0][q * dim], grads_face[0][0][q * dim + 1]},
              {grads_face[0][1][q * dim], grads_face[0][1][q * dim + 1]},
              {grads_face[0][2][q * dim], grads_face[0][2][q * dim + 1]}},
-            {{grads_face[1][0][q * dim], grads_face[1][0][q * dim + 1]},
-             {grads_face[1][1][q * dim], grads_face[1][1][q * dim + 1]},
-             {grads_face[1][2][q * dim], grads_face[1][2][q * dim + 1]}}};
+            {{grads_ext[0][0][q * dim], grads_ext[0][1][q * dim]},
+             {grads_ext[1][0][q * dim], grads_ext[1][1][q * dim]},
+             {grads_ext[2][0][q * dim], grads_ext[2][1][q * dim]}}};
 
           Tensor<1, dim, VectorizedArray<Number>> val_real[2];
           Tensor<1, dim, VectorizedArray<Number>> normal_derivatives[2];
@@ -4581,13 +4795,13 @@ private:
 
         const VectorizedArray<Number> val[2][3] = {
           {values_face[0][0][q], values_face[0][1][q], values_face[0][2][q]},
-          {values_face[1][0][q], values_face[1][1][q], values_face[1][2][q]}};
+          {values_ext[0][q], values_ext[1][q], values_ext[2][q]}};
         const VectorizedArray<Number> grad[2][3] = {{grads_face[0][0][q * dim + 2],
                                                      grads_face[0][1][q * dim + 2],
                                                      grads_face[0][2][q * dim + 2]},
-                                                    {grads_face[1][0][q * dim + 2],
-                                                     grads_face[1][1][q * dim + 2],
-                                                     grads_face[1][2][q * dim + 2]}};
+                                                    {grads_ext[0][2][q * dim],
+                                                     grads_ext[1][2][q * dim],
+                                                     grads_ext[2][2][q * dim]}};
 
         Tensor<1, dim, VectorizedArray<Number>> val_real[2];
         Tensor<1, dim, VectorizedArray<Number>> normal_derivatives[2];
@@ -4848,49 +5062,39 @@ private:
         read_face_values_only<degree>(
           src, f + (f % 2 ? -1 : 1), dof_indices_neighbor, lane, face_array);
 
-    constexpr dealii::ndarray<int, 3, 3> dofs_per_direction{
-      {{{n_n, n_t, n_t}}, {{n_t, n_n, n_t}}, {{n_t, n_t, n_n}}}};
-
     // For faces located on MPI-remote processes, we replace the dummy
-    // data read out above by the data sent to us
+    // data read out above by the data sent to us. For the convective term
+    // without divergence, we use only values of the tangential components,
+    // otherwise values and derivatives of the tangential components and the
+    // normal derivative of the normal component
+    constexpr unsigned int data_per_face =
+      include_convective_divergence ? n_t * n_t + 2 * 2 * n_t * n_n : 2 * n_t * n_n;
     for(unsigned int v = 0; v < n_lanes; ++v)
       if(mpi_exchange_data_on_faces[cell][f][v] != numbers::invalid_unsigned_int)
-        for(unsigned int d = 0, c = 0; d < dim; ++d)
-        {
-          unsigned int dofs_on_this_face = 1;
-          for(unsigned int e = 0; e < dim; ++e)
-            if(e != d)
-              dofs_on_this_face *= dofs_per_direction[f / 2][e];
-          if(include_convective_divergence)
-            for(unsigned int i = 0; i < 2 * dofs_on_this_face; ++i)
-            {
-              face_array[i + 2 * c][v] =
-                import_values[mpi_exchange_data_on_faces[cell][f][v] + i + c * 2];
-            }
-          else
-            for(unsigned int i = 0; i < dofs_on_this_face; ++i)
-            {
-              // for convective term, we use only value, so the index offsets
-              // need to be divided by 2
-              face_array[i + c][v] =
-                import_values[mpi_exchange_data_on_faces[cell][f][v] / 2 + i + c];
-            }
-          c += dofs_on_this_face;
-        }
+      {
+        const unsigned int slot = mpi_exchange_data_on_faces[cell][f][v];
+        const Number *     imported_data_ptr =
+          mpi_recv_buffer.data() + (single_exchange.usable ?
+                                      single_exchange.recv_face_offset[slot] :
+                                      slot * data_per_face);
+        for(unsigned int i = 0; i < data_per_face; ++i)
+          face_array[i][v] = imported_data_ptr[i];
+      }
 
     if(include_convective_divergence)
     {
+      // Only the normal derivative of the normal component is read from
+      // the neighbor, the value and the contribution of the value to the
+      // derivative is added below once the values of this cell are known
       const VectorizedArray<Number> * values_dofs = face_array + face_direction * n_t * n_n * 2;
-      VectorizedArray<Number> *       values      = values_face[1][face_direction];
+      VectorizedArray<Number> *       values      = nullptr;
       VectorizedArray<Number> *       gradients   = grads_face[1][face_direction];
       eval_iso.template values<0, true, false>(values_dofs, scratch_data);
-      eval_iso.template values<1, true, false>(scratch_data, values);
-      eval_iso.template values<0, true, false>(values_dofs + n_t * n_t, scratch_data);
       eval_iso.template values<1, true, false, dim>(scratch_data, gradients + face_direction);
 
       if(face_direction == 0)
       {
-        values_dofs = face_array + 2 * n_t * n_t;
+        values_dofs = face_array + n_t * n_t;
         values      = values_face[1][1];
         gradients   = grads_face[1][1];
       }
@@ -4909,7 +5113,7 @@ private:
 
       if(face_direction < 2)
       {
-        values_dofs = face_array + 2 * n_t * n_t + 2 * n_t * n_n;
+        values_dofs = face_array + n_t * n_t + 2 * n_t * n_n;
         values      = values_face[1][2];
         gradients   = grads_face[1][2];
       }
@@ -4929,34 +5133,16 @@ private:
     }
     else
     {
-      const VectorizedArray<Number> * values_dofs = face_array + face_direction * n_t * n_n;
-      VectorizedArray<Number> *       values      = values_face[1][face_direction];
-      eval_iso.template values<0, true, false>(values_dofs, scratch_data);
-      eval_iso.template values<1, true, false>(scratch_data, values);
-
-      if(face_direction == 0)
-      {
-        values_dofs = face_array + n_t * n_t;
-        values      = values_face[1][1];
-      }
-      else
-      {
-        values_dofs = face_array;
-        values      = values_face[1][0];
-      }
+      // Only the tangential components are read from the neighbor, the
+      // normal component is set below once the values of this cell are
+      // known
+      const VectorizedArray<Number> * values_dofs = face_array;
+      VectorizedArray<Number> *       values      = values_face[1][face_direction == 0 ? 1 : 0];
       eval_aniso.template normal<0>(shape_data[0], values_dofs, values);
       eval_aniso.template tangential<1, 0>(shape_data[1], values, values);
 
-      if(face_direction < 2)
-      {
-        values_dofs = face_array + n_t * n_t + n_t * n_n;
-        values      = values_face[1][2];
-      }
-      else
-      {
-        values_dofs = face_array + n_t * n_n;
-        values      = values_face[1][1];
-      }
+      values_dofs = face_array + n_t * n_n;
+      values      = values_face[1][face_direction < 2 ? 2 : 1];
       eval_aniso.template normal<1>(shape_data[0], values_dofs, values);
       eval_aniso.template tangential<0, 1>(shape_data[1], values, values);
     }
@@ -5010,10 +5196,16 @@ private:
 
     if(include_convective_divergence)
     {
+      add_face_value_to_normal_derivative<n_q_points_face>(f, values_face, grads_face);
+
+      // The tangential derivatives of the normal component on the exterior
+      // are the same as on the interior side, so skip them
       for(unsigned int side = 0; side < 2; ++side)
       {
         for(unsigned int d = 0; d < dim; ++d)
         {
+          if(side == 1 && d == face_direction)
+            continue;
           const unsigned int first  = face_direction == 0 ? 1 : 0;
           const unsigned int second = face_direction == 1 ? 2 : first + 1;
           eval_g.template gradients<0, true, false, dim>(values_face[side][d],
@@ -5023,6 +5215,12 @@ private:
         }
       }
     }
+
+    const VectorizedArray<Number> * values_ext[dim];
+    const VectorizedArray<Number> * grads_ext[dim][dim];
+    set_exterior_pointers<n_q_points_face>(
+      face_direction, values_face, grads_face, values_ext, grads_ext);
+
     const Number h_z         = mapping_info.h_z;
     const Number h_z_inverse = mapping_info.h_z_inverse;
 
@@ -5104,7 +5302,7 @@ private:
         {
           const VectorizedArray<Number> val[2][3] = {
             {values_face[0][0][q], values_face[0][1][q], values_face[0][2][q]},
-            {values_face[1][0][q], values_face[1][1][q], values_face[1][2][q]}};
+            {values_ext[0][q], values_ext[1][q], values_ext[2][q]}};
 
           Tensor<1, dim, VectorizedArray<Number>> val_real[2];
           for(unsigned int s = 0; s < 2; ++s)
@@ -5141,9 +5339,9 @@ private:
               {{grads_face[0][0][qd], grads_face[0][0][qd + 1], grads_face[0][0][qd + 2]},
                {grads_face[0][1][qd], grads_face[0][1][qd + 1], grads_face[0][1][qd + 2]},
                {grads_face[0][2][qd], grads_face[0][2][qd + 1], grads_face[0][2][qd + 2]}},
-              {{grads_face[1][0][qd], grads_face[1][0][qd + 1], grads_face[1][0][qd + 2]},
-               {grads_face[1][1][qd], grads_face[1][1][qd + 1], grads_face[1][1][qd + 2]},
-               {grads_face[1][2][qd], grads_face[1][2][qd + 1], grads_face[1][2][qd + 2]}}};
+              {{grads_ext[0][0][qd], grads_ext[0][1][qd], grads_ext[0][2][qd]},
+               {grads_ext[1][0][qd], grads_ext[1][1][qd], grads_ext[1][2][qd]},
+               {grads_ext[2][0][qd], grads_ext[2][1][qd], grads_ext[2][2][qd]}}};
 
             // skip extruded part, second slot [dim] -> [2]
             VectorizedArray<Number> grad_real[2][2][dim];
@@ -5272,7 +5470,7 @@ private:
 
         const VectorizedArray<Number> val[2][3] = {
           {values_face[0][0][q], values_face[0][1][q], values_face[0][2][q]},
-          {values_face[1][0][q], values_face[1][1][q], values_face[1][2][q]}};
+          {values_ext[0][q], values_ext[1][q], values_ext[2][q]}};
 
         Tensor<1, dim, VectorizedArray<Number>> val_real[2];
         for(unsigned int s = 0; s < 2; ++s)
@@ -5308,7 +5506,7 @@ private:
           const unsigned int            qd         = q * dim;
           const VectorizedArray<Number> grad[2][3] = {
             {grads_face[0][2][qd], grads_face[0][2][qd + 1], grads_face[0][2][qd + 2]},
-            {grads_face[1][2][qd], grads_face[1][2][qd + 1], grads_face[1][2][qd + 2]}};
+            {grads_ext[2][0][qd], grads_ext[2][1][qd], grads_ext[2][2][qd]}};
           VectorizedArray<Number> grad_real[2][3];
           for(unsigned int s = 0; s < 2; ++s)
           {
