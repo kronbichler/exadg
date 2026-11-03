@@ -32,8 +32,12 @@
 #include <deal.II/matrix_free/matrix_free.h>
 #include <deal.II/matrix_free/tensor_product_kernels.h>
 
+#include <cstdint>
+#include <map>
+
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/extruded_mapping_info.h>
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/momentum_operator_rt_single_exchange.h>
+#include <exadg/solvers_and_preconditioners/preconditioners/scratch_matrix_vector_product.h>
 
 namespace RTOperator
 {
@@ -613,6 +617,8 @@ public:
 
     compute_vector_access_pattern();
 
+    setup_scratch();
+
     {
       std::vector<Polynomials::Polynomial<double>> basis =
         Polynomials::generate_complete_Lagrange_basis(quadrature.get_points());
@@ -803,7 +809,7 @@ public:
   void
   vmult(VectorType & dst, const VectorType & src) const
   {
-    vmult(
+    vmult_before_on_dst(
       dst,
       src,
       [&dst](const unsigned int start, const unsigned int end) {
@@ -817,7 +823,7 @@ public:
   void
   vmult_add(VectorType & dst, const VectorType & src) const
   {
-    vmult(
+    vmult_before_on_dst(
       dst,
       src,
       [](const unsigned int, const unsigned int) {},
@@ -1137,27 +1143,7 @@ public:
       timings[4] += time.wall_time();
       time.restart();
 
-      const unsigned int n_t = shape_info.data[0].fe_degree;
-      if(n_t == 2)
-        single_exchange_pack_and_send<2>(src);
-      else if(n_t == 3)
-        single_exchange_pack_and_send<3>(src);
-      else if(n_t == 4)
-        single_exchange_pack_and_send<4>(src);
-#ifndef DEBUG
-      else if(n_t == 5)
-        single_exchange_pack_and_send<5>(src);
-      else if(n_t == 6)
-        single_exchange_pack_and_send<6>(src);
-      else if(n_t == 7)
-        single_exchange_pack_and_send<7>(src);
-      else if(n_t == 8)
-        single_exchange_pack_and_send<8>(src);
-      else if(n_t == 9)
-        single_exchange_pack_and_send<9>(src);
-#endif
-      else
-        AssertThrow(false, ExcNotImplemented());
+      dispatch_single_exchange_pack_and_send(src);
       timings[1] += time.wall_time();
       time.restart();
 
@@ -1214,27 +1200,8 @@ public:
             ++range)
           before_loop(cell_loop_mass_pre_list[range].first, cell_loop_mass_pre_list[range].second);
 
-      const unsigned int degree = shape_info.data[0].fe_degree;
-      if(degree == 2)
-        do_cell_operation<2, true>(cell, src, dst);
-      else if(degree == 3)
-        do_cell_operation<3, true>(cell, src, dst);
-      else if(degree == 4)
-        do_cell_operation<4, true>(cell, src, dst);
-#ifndef DEBUG
-      else if(degree == 5)
-        do_cell_operation<5, true>(cell, src, dst);
-      else if(degree == 6)
-        do_cell_operation<6, true>(cell, src, dst);
-      else if(degree == 7)
-        do_cell_operation<7, true>(cell, src, dst);
-      else if(degree == 8)
-        do_cell_operation<8, true>(cell, src, dst);
-      else if(degree == 9)
-        do_cell_operation<9, true>(cell, src, dst);
-#endif
-      else
-        AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+      dispatch_cell_operation(cell, src, dst);
+
       for(unsigned int range = cell_loop_post_list_index[cell];
           range < cell_loop_post_list_index[cell + 1];
           ++range)
@@ -1255,6 +1222,129 @@ public:
         range < cell_loop_post_list_index[n_cell_batches + 1];
         ++range)
       after_loop(cell_loop_post_list[range].first, cell_loop_post_list[range].second);
+
+    if(factor_laplace != 0)
+    {
+      timings[8] += time.wall_time();
+      timings[9] += total_timer.wall_time();
+    }
+    else
+    {
+      timings[13] += time.wall_time();
+      timings[14] += total_timer.wall_time();
+    }
+  }
+
+  // Variant of the vmult() function with 'before_loop' and 'after_loop' for
+  // the case that 'before_loop' only touches entries of dst, but not of
+  // src. Then, src is final upon entry, so the ghost exchange can start
+  // right away, and 'before_loop' needs to run only before the first write
+  // into dst by the cell integrals (as given by the mass pre list), rather
+  // than before the first read of src by the face integrals of the
+  // neighbors. This keeps the range of entries between 'before_loop' and
+  // 'after_loop' much smaller.
+  void
+  vmult_before_on_dst(
+    VectorType &                                                        dst,
+    const VectorType &                                                  src,
+    const std::function<void(const unsigned int, const unsigned int)> & before_loop,
+    const std::function<void(const unsigned int, const unsigned int)> & after_loop) const
+  {
+    Timer total_timer;
+    if(factor_laplace != 0.)
+      timings[0] += 1;
+    else
+      timings[10] += 1;
+    Timer time;
+
+    const unsigned int n_cell_batches = dof_indices.size();
+
+    // entries written by other processes in the compress step, which must be
+    // processed before the cell loop
+    const auto before_loop_mpi_entries = [&]() {
+      for(unsigned int range = cell_loop_mass_pre_list_index[n_cell_batches];
+          range < cell_loop_mass_pre_list_index[n_cell_batches + 1];
+          ++range)
+        before_loop(cell_loop_mass_pre_list[range].first, cell_loop_mass_pre_list[range].second);
+    };
+
+    exchange_ghosts_overlapped(src, before_loop_mpi_entries);
+
+    time.restart();
+
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      for(unsigned int range = cell_loop_mass_pre_list_index[cell];
+          range < cell_loop_mass_pre_list_index[cell + 1];
+          ++range)
+        before_loop(cell_loop_mass_pre_list[range].first, cell_loop_mass_pre_list[range].second);
+
+      dispatch_cell_operation(cell, src, dst);
+
+      for(unsigned int range = cell_loop_post_list_index[cell];
+          range < cell_loop_post_list_index[cell + 1];
+          ++range)
+        after_loop(cell_loop_post_list[range].first, cell_loop_post_list[range].second);
+    }
+
+    if(factor_laplace != 0)
+      timings[7] += time.wall_time();
+    else
+      timings[12] += time.wall_time();
+
+    time.restart();
+    dst.compress_start(0, VectorOperation::add);
+    src.zero_out_ghost_values();
+    dst.compress_finish(VectorOperation::add);
+
+    for(unsigned int range = cell_loop_post_list_index[n_cell_batches];
+        range < cell_loop_post_list_index[n_cell_batches + 1];
+        ++range)
+      after_loop(cell_loop_post_list[range].first, cell_loop_post_list[range].second);
+
+    if(factor_laplace != 0)
+    {
+      timings[8] += time.wall_time();
+      timings[9] += total_timer.wall_time();
+    }
+    else
+    {
+      timings[13] += time.wall_time();
+      timings[14] += total_timer.wall_time();
+    }
+  }
+
+  // Variant of the matrix-vector product that accumulates the result into
+  // a small scratch array instead of a global vector, see
+  // ExaDG::ScratchMatrixVectorProduct for the format of the ranges passed
+  // to 'after_loop'. Like for vmult_before_on_dst(), the vector src must be
+  // final upon entry.
+  template<typename AfterLoop>
+  void
+  vmult_scratch(const VectorType & src, const AfterLoop & after_loop) const
+  {
+    Timer total_timer;
+    if(factor_laplace != 0.)
+      timings[0] += 1;
+    else
+      timings[10] += 1;
+
+    exchange_ghosts_overlapped(src, [&]() { scratch.prepare_loop(); });
+
+    Timer time;
+    scratch.cell_loop(
+      [&](const unsigned int cell, Number * scratch_array) {
+        dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
+      },
+      after_loop);
+
+    if(factor_laplace != 0)
+      timings[7] += time.wall_time();
+    else
+      timings[12] += time.wall_time();
+
+    time.restart();
+    scratch.finish_loop(after_loop, [&]() { src.zero_out_ghost_values(); });
 
     if(factor_laplace != 0)
     {
@@ -1747,6 +1837,19 @@ private:
   std::vector<unsigned int>                          send_data_cell_index;
   std::vector<unsigned char>                         send_data_face_index;
 
+  // Granularity of the pre and post lists. This number is a tradeoff of
+  // creating sufficiently big chunks of data (that allows the CPU to do more
+  // hardware prefetching and thus amortize loads) and the increase in cache
+  // pressure. We did tests where values between 128 and 512 did similarly
+  // for the latter, whereas 1024 started to deviate, so we can choose the
+  // largest size.
+  static constexpr unsigned int vector_access_chunk_size = 512;
+
+  // scratch array of vmult_scratch() and the offsets of the entities of
+  // each cell batch into it, in the same format as dof_indices
+  ExaDG::ScratchMatrixVectorProduct<Number>                        scratch;
+  std::vector<dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes>> scratch_indices;
+
   std::vector<unsigned int>                          cell_loop_pre_list_index;
   std::vector<std::pair<unsigned int, unsigned int>> cell_loop_pre_list;
   std::vector<unsigned int>                          cell_loop_mass_pre_list_index;
@@ -1761,6 +1864,126 @@ private:
   std::vector<std::array<bool, dim>>                   all_left_face_fluxes_from_buffer;
 
   SingleExchange::Data<dim, Number> single_exchange;
+
+  // Start and complete the ghost exchange of src for the loops in which src
+  // is final upon entry, running 'work' while the messages are in flight
+  void
+  exchange_ghosts_overlapped(const VectorType & src, const std::function<void()> & work) const
+  {
+    Timer time;
+    if(factor_laplace != 0. && single_exchange.usable)
+    {
+      const unsigned int n_partners = single_exchange.partners.size();
+      single_exchange.start_receives(mpi_recv_buffer.data(),
+                                     src.get_mpi_communicator(),
+                                     mpi_requests.data());
+
+      // ghost entities must not contribute to the packed face data
+      Assert(src.has_ghost_elements() == false, ExcInternalError());
+
+      dispatch_single_exchange_pack_and_send(src);
+      timings[1] += time.wall_time();
+      time.restart();
+
+      work();
+      timings[4] += time.wall_time();
+      time.restart();
+
+      if(n_partners > 0)
+      {
+        const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+        AssertThrowMPI(ierr);
+      }
+      single_exchange.unpack_and_complete(mpi_recv_buffer.data(),
+                                          const_cast<Number *>(src.begin()));
+      timings[3] += time.wall_time();
+    }
+    else if(factor_laplace != 0.)
+    {
+      src.update_ghost_values_start();
+      timings[1] += time.wall_time();
+      time.restart();
+
+      work();
+      timings[4] += time.wall_time();
+      time.restart();
+
+      src.update_ghost_values_finish();
+      timings[1] += time.wall_time();
+      time.restart();
+
+      exchange_data_for_face_integrals<true>(src);
+      timings[3] += time.wall_time();
+    }
+    else
+    {
+      src.update_ghost_values_start();
+      work();
+      src.update_ghost_values_finish();
+      timings[11] += time.wall_time();
+    }
+  }
+
+  void
+  dispatch_single_exchange_pack_and_send(const VectorType & src) const
+  {
+    const unsigned int n_t = shape_info.data[0].fe_degree;
+    if(n_t == 2)
+      single_exchange_pack_and_send<2>(src);
+    else if(n_t == 3)
+      single_exchange_pack_and_send<3>(src);
+    else if(n_t == 4)
+      single_exchange_pack_and_send<4>(src);
+#ifndef DEBUG
+    else if(n_t == 5)
+      single_exchange_pack_and_send<5>(src);
+    else if(n_t == 6)
+      single_exchange_pack_and_send<6>(src);
+    else if(n_t == 7)
+      single_exchange_pack_and_send<7>(src);
+    else if(n_t == 8)
+      single_exchange_pack_and_send<8>(src);
+    else if(n_t == 9)
+      single_exchange_pack_and_send<9>(src);
+#endif
+    else
+      AssertThrow(false, ExcNotImplemented());
+  }
+
+  void
+  dispatch_cell_operation(const unsigned int cell, const VectorType & src, VectorType & dst) const
+  {
+    dispatch_cell_operation(cell, src, dof_indices[cell], dst.begin());
+  }
+
+  void
+  dispatch_cell_operation(const unsigned int                                          cell,
+                          const VectorType &                                          src,
+                          const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dst_indices,
+                          Number *                                                    dst) const
+  {
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    if(degree == 2)
+      do_cell_operation<2, true>(cell, src, dst_indices, dst);
+    else if(degree == 3)
+      do_cell_operation<3, true>(cell, src, dst_indices, dst);
+    else if(degree == 4)
+      do_cell_operation<4, true>(cell, src, dst_indices, dst);
+#ifndef DEBUG
+    else if(degree == 5)
+      do_cell_operation<5, true>(cell, src, dst_indices, dst);
+    else if(degree == 6)
+      do_cell_operation<6, true>(cell, src, dst_indices, dst);
+    else if(degree == 7)
+      do_cell_operation<7, true>(cell, src, dst_indices, dst);
+    else if(degree == 8)
+      do_cell_operation<8, true>(cell, src, dst_indices, dst);
+    else if(degree == 9)
+      do_cell_operation<9, true>(cell, src, dst_indices, dst);
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
 
   // Pack the messages of the single exchange from locally owned entries of
   // src and send them; the face data is evaluated with the regular indices
@@ -1810,24 +2033,27 @@ private:
                                                    dof_handler.get());
   }
 
+  // For each chunk of 'chunk_size' locally owned vector entries, compute the
+  // cell batch index in the loop where the chunk is first read
+  // (touched_first_by, including the neighbors accessed by the face
+  // integrals), first written (touched_mass_first_by) and last written
+  // (touched_last_by). The values n_cell_batches and n_cell_batches + 1
+  // indicate entries that need to be processed before the cell loop as they
+  // are subject to MPI communication (pre lists) or after the cell loop once
+  // the compress step has finished (post list).
   void
-  compute_vector_access_pattern()
+  compute_touched_chunks(const unsigned int          chunk_size,
+                         std::vector<unsigned int> & touched_first_by,
+                         std::vector<unsigned int> & touched_mass_first_by,
+                         std::vector<unsigned int> & touched_last_by) const
   {
     const unsigned int n_dofs = partitioner->locally_owned_size();
-    // This number is a tradeoff of creating sufficiently big chunks of data
-    // (that allows the CPU to do more hardware prefetching and thus amortize
-    // loads) and the increase in cache pressure. We did tests where values
-    // between 128 and 512 did similarly for the latter, whereas 1024 started
-    // to deviate, so we can choose the largest size.
-    constexpr unsigned int    chunk_size = 512;
-    std::vector<unsigned int> touched_first_by((n_dofs + chunk_size - 1) / chunk_size,
-                                               numbers::invalid_unsigned_int);
-    std::vector<unsigned int> touched_mass_first_by((n_dofs + chunk_size - 1) / chunk_size,
-                                                    numbers::invalid_unsigned_int);
-    std::vector<unsigned int> touched_last_by((n_dofs + chunk_size - 1) / chunk_size,
-                                              numbers::invalid_unsigned_int);
-    const unsigned int        n_cell_batches = dof_indices.size();
-    const unsigned int        dofs_on_quad   = dof_handler->get_fe().dofs_per_face;
+    touched_first_by.assign((n_dofs + chunk_size - 1) / chunk_size, numbers::invalid_unsigned_int);
+    touched_mass_first_by.assign((n_dofs + chunk_size - 1) / chunk_size,
+                                 numbers::invalid_unsigned_int);
+    touched_last_by.assign((n_dofs + chunk_size - 1) / chunk_size, numbers::invalid_unsigned_int);
+    const unsigned int n_cell_batches = dof_indices.size();
+    const unsigned int dofs_on_quad   = dof_handler->get_fe().dofs_per_face;
     const unsigned int dofs_on_hex = dof_handler->get_fe().dofs_per_cell - 2 * dim * dofs_on_quad;
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
@@ -1904,25 +2130,6 @@ private:
     for(const auto & index : touched_last_by)
       AssertThrow(index != numbers::invalid_unsigned_int, ExcInternalError());
 
-    // debug output to assess sanity of implementation
-    if(false)
-    {
-      unsigned int n_batches_half = 0, n_batches_10 = 0;
-      for(unsigned int i = 0; i < touched_first_by.size(); ++i)
-        if(touched_last_by[i] - touched_first_by[i] > n_cell_batches / 2)
-          ++n_batches_half;
-        else if(touched_last_by[i] - touched_first_by[i] > 10)
-          ++n_batches_10;
-
-      Helper::print_time(static_cast<double>(n_batches_half) / touched_first_by.size(),
-                         "Pre-/post distance > 1/2 size",
-                         MPI_COMM_WORLD);
-      Helper::print_time(static_cast<double>(n_batches_half + n_batches_10) /
-                           touched_first_by.size(),
-                         "Pre-/post distance > 10",
-                         MPI_COMM_WORLD);
-    }
-
     // set the import indices in the data to be exchanged via the partitioner
     // to one index higher to indicate that we want to process them first and
     // to two indices higher for the face integrals.
@@ -1965,6 +2172,17 @@ private:
     for(auto it : partitioner->import_indices())
       for(unsigned int i = it.first; i < it.second; ++i)
         touched_last_by[i / chunk_size] = n_cell_batches;
+  }
+
+  void
+  compute_vector_access_pattern()
+  {
+    const unsigned int n_dofs         = partitioner->locally_owned_size();
+    const unsigned int n_cell_batches = dof_indices.size();
+
+    const unsigned int        chunk_size = vector_access_chunk_size;
+    std::vector<unsigned int> touched_first_by, touched_mass_first_by, touched_last_by;
+    compute_touched_chunks(chunk_size, touched_first_by, touched_mass_first_by, touched_last_by);
 
 #if 0
     std::cout << "data locality quality: ";
@@ -2049,6 +2267,32 @@ private:
       }
       }
 #endif
+  }
+
+  // Set up the scratch array of vmult_scratch() with the faces and cell
+  // interiors of the Raviart-Thomas element as entities
+  void
+  setup_scratch()
+  {
+    const unsigned int n_cell_batches = dof_indices.size();
+    const unsigned int dofs_on_quad   = dof_handler->get_fe().dofs_per_face;
+    const unsigned int dofs_on_hex = dof_handler->get_fe().dofs_per_cell - 2 * dim * dofs_on_quad;
+    scratch.reinit(
+      partitioner,
+      n_cell_batches,
+      [&](const unsigned int cell, const auto & add) {
+        for(unsigned int e = 0; e < 2 * dim + 1; ++e)
+          for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+            add(dof_indices[cell][e][v], e < 2 * dim ? dofs_on_quad : dofs_on_hex);
+      },
+      true);
+
+    scratch_indices = dof_indices;
+    for(auto & cell_indices : scratch_indices)
+      for(auto & entity_indices : cell_indices)
+        for(unsigned int & idx : entity_indices)
+          idx = scratch.scratch_index(idx);
+    scratch.release_setup_data();
   }
 
   template<int n_t, int n_points_1d>
@@ -3468,6 +3712,19 @@ private:
   void
   do_cell_operation(const unsigned int cell, const VectorType & src, VectorType & dst) const
   {
+    do_cell_operation<degree, compute_exterior>(cell, src, dof_indices[cell], dst.begin());
+  }
+
+  // Variant of the cell operation that writes the result into the array
+  // 'dst' at the positions given by 'dst_indices' (in the same format as
+  // dof_indices), whereas src is read with the regular dof_indices
+  template<int degree, bool compute_exterior>
+  void
+  do_cell_operation(const unsigned int                                          cell,
+                    const VectorType &                                          src,
+                    const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dst_indices,
+                    Number *                                                    dst) const
+  {
     constexpr unsigned int dofs_per_component = Utilities::pow(degree, dim - 1) * (degree + 1);
     constexpr unsigned int dofs_per_cell      = dim * dofs_per_component;
     constexpr unsigned int n_q_points_1d      = degree + 1;
@@ -3493,10 +3750,10 @@ private:
       else
         compute_cell_mass<n_q_points_1d>(cell, this->factor_mass, quad_values, out_values);
 
-      integrate_cell_scatter<degree, n_q_points_1d>(dof_indices[cell],
+      integrate_cell_scatter<degree, n_q_points_1d>(dst_indices,
                                                     n_active_entries_per_cell_batch(cell),
                                                     out_values,
-                                                    dst.begin());
+                                                    dst);
     }
     else
     {
@@ -3596,8 +3853,8 @@ private:
         }
       distribute_local_to_global_rt_compressed<dim, degree>(diagonal,
                                                             n_active_entries_per_cell_batch(cell),
-                                                            dof_indices[cell],
-                                                            dst.begin());
+                                                            dst_indices,
+                                                            dst);
     }
   }
 
@@ -5074,9 +5331,8 @@ private:
       {
         const unsigned int slot = mpi_exchange_data_on_faces[cell][f][v];
         const Number *     imported_data_ptr =
-          mpi_recv_buffer.data() + (single_exchange.usable ?
-                                      single_exchange.recv_face_offset[slot] :
-                                      slot * data_per_face);
+          mpi_recv_buffer.data() +
+          (single_exchange.usable ? single_exchange.recv_face_offset[slot] : slot * data_per_face);
         for(unsigned int i = 0; i < data_per_face; ++i)
           face_array[i][v] = imported_data_ptr[i];
       }
