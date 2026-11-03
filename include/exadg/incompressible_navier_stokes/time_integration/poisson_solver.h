@@ -43,6 +43,7 @@
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/laplace_operator_extruded.h>
 #include <exadg/operators/constraints.h>
+#include <exadg/solvers_and_preconditioners/preconditioners/chebyshev_scratch.h>
 
 
 namespace LaplaceOperator
@@ -882,11 +883,9 @@ public:
   using MatrixTypeDG               = LaplaceOperator::LaplaceOperatorDG<dim, Number>;
   using VectorType                 = dealii::LinearAlgebra::distributed::Vector<Number>;
   using SmootherPreconditionerType = dealii::DiagonalMatrix<VectorType>;
-  using SmootherType =
-    dealii::PreconditionChebyshev<MatrixType, VectorType, SmootherPreconditionerType>;
-  using SmootherTypeDG =
-    dealii::PreconditionChebyshev<MatrixTypeDG, VectorType, SmootherPreconditionerType>;
-  using MGTransferType = dealii::MGTransferMatrixFree<dim, Number>;
+  using SmootherType               = ExaDG::PreconditionChebyshevScratch<MatrixType>;
+  using SmootherTypeDG             = ExaDG::PreconditionChebyshevScratch<MatrixTypeDG>;
+  using MGTransferType             = dealii::MGTransferMatrixFree<dim, Number>;
 
   PoissonPreconditionerMG(
     const dealii::Mapping<dim> &                                   mapping_fine,
@@ -1277,13 +1276,14 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
                    rhs[level],
                    *smoother_data.preconditioner);
 
-      smoother_data.eig_cg_n_iterations = 0;
       if(eigenvalue_tracker.values.empty())
         smoother_data.max_eigenvalue = 1.0;
       else
         smoother_data.max_eigenvalue = eigenvalue_tracker.values.back();
 
       mg_smoother[level].initialize(mg_matrices[level], smoother_data);
+      if(not this->is_test)
+        mg_matrices[level].verify_vmult_scratch();
     }
 
     // create a different matrix on the finest level due to enable the
@@ -1322,12 +1322,13 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       make_zero_mean({}, rhs_dg);
       solver.solve(dg_matrix, solution_update_dg, rhs_dg, *smoother_data_dg.preconditioner);
 
-      smoother_data_dg.eig_cg_n_iterations = 0;
       if(eigenvalue_tracker.values.empty())
         smoother_data_dg.max_eigenvalue = 1.0;
       else
         smoother_data_dg.max_eigenvalue = eigenvalue_tracker.values.back();
       mg_smoother_dg.initialize(dg_matrix, smoother_data_dg);
+      if(not this->is_test)
+        dg_matrix.verify_vmult_scratch();
     }
     auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();
     transfer->reinit(dof_handler,

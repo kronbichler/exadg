@@ -35,6 +35,7 @@
 #include <deal.II/matrix_free/vector_access_internal.h>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/extruded_mapping_info.h>
+#include <exadg/solvers_and_preconditioners/preconditioners/scratch_matrix_vector_product.h>
 
 
 namespace LaplaceOperator
@@ -406,6 +407,8 @@ public:
 
     factor_laplace = 1.0;
     factor_mass    = 0.0;
+
+    setup_scratch();
   }
 
   void
@@ -431,6 +434,75 @@ public:
   {
     matrix_free.cell_loop(
       &LaplaceOperatorFE::local_apply, this, dst, src, operation_before_loop, operation_after_loop);
+  }
+
+  // Variant of the matrix-vector product that accumulates the result into
+  // a small scratch array instead of a global vector, see
+  // ExaDG::ScratchMatrixVectorProduct for the format of the ranges passed
+  // to 'after_loop'. Like for MatrixFree::cell_loop(), the constrained
+  // entries, which are the only ones not written by the cells, are set to
+  // the entries of src.
+  template<typename AfterLoop>
+  void
+  vmult_scratch(const VectorType & src, const AfterLoop & after_loop) const
+  {
+    const bool src_has_ghosts = src.has_ghost_elements();
+    if(!src_has_ghosts)
+      src.update_ghost_values_start();
+    scratch.prepare_loop();
+    if(!src_has_ghosts)
+      src.update_ghost_values_finish();
+
+    const auto copy_constrained =
+      [&](const unsigned int begin, const unsigned int end, Number * values) {
+        std::copy(src.begin() + begin, src.begin() + end, values);
+      };
+
+    const unsigned int degree = matrix_free.get_shape_info().data[0].fe_degree;
+    scratch.cell_loop(
+      [&](const unsigned int cell, Number * scratch_array) {
+        typename ExaDG::ScratchMatrixVectorProduct<Number>::View dst{scratch_array};
+        if(degree == 1)
+          apply_cell_operation<1>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 2)
+          apply_cell_operation<2>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 3)
+          apply_cell_operation<3>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 4)
+          apply_cell_operation<4>(cell, src, scratch_dof_indices, dst);
+#ifndef DEBUG
+        else if(degree == 5)
+          apply_cell_operation<5>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 6)
+          apply_cell_operation<6>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 7)
+          apply_cell_operation<7>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 8)
+          apply_cell_operation<8>(cell, src, scratch_dof_indices, dst);
+#endif
+        else
+          AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+      },
+      after_loop,
+      copy_constrained);
+
+    scratch.finish_loop(
+      after_loop,
+      [&]() {
+        if(!src_has_ghosts)
+          src.zero_out_ghost_values();
+      },
+      copy_constrained);
+  }
+
+  // Compare vmult_scratch() against vmult() and print the size of the
+  // scratch array
+  void
+  verify_vmult_scratch() const
+  {
+    scratch.verify(*this,
+                   "FE Laplace operator degree " + std::to_string(dof_handler->get_fe().degree),
+                   dof_handler->get_mpi_communicator());
   }
 
   types::global_dof_index
@@ -534,6 +606,41 @@ public:
   }
 
 private:
+  // Set up the scratch array of vmult_scratch() with the vertices, lines,
+  // quads and hexes of the element as entities
+  void
+  setup_scratch()
+  {
+    const unsigned int fe_degree        = dof_handler->get_fe().degree;
+    const unsigned int n_stored_per_dir = fe_degree == 1 ? 2 : 3;
+    const unsigned int n_stored         = Utilities::pow(n_stored_per_dir, dim);
+
+    // length of the entities in lexicographic order of the stored indices,
+    // given by the number of directions in the interior of the cell
+    std::vector<unsigned int> entity_length(n_stored, 1);
+    if(fe_degree > 1)
+      for(unsigned int i = 0; i < n_stored; ++i)
+        for(unsigned int d = 0, j = i; d < dim; ++d, j /= 3)
+          if(j % 3 == 1)
+            entity_length[i] *= fe_degree - 1;
+
+    const unsigned int n_cell_batches = matrix_free.n_cell_batches();
+    scratch.reinit(
+      matrix_free.get_dof_info().vector_partitioner,
+      n_cell_batches,
+      [&](const unsigned int cell, const auto & add) {
+        for(unsigned int i = 0; i < n_stored; ++i)
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            add(compressed_dof_indices[(cell * n_stored + i) * n_lanes + v], entity_length[i]);
+      },
+      true);
+
+    scratch_dof_indices = compressed_dof_indices;
+    for(unsigned int & idx : scratch_dof_indices)
+      idx = scratch.scratch_index(idx);
+    scratch.release_setup_data();
+  }
+
   void
   local_apply(const MatrixFree<dim, Number> &               data,
               VectorType &                                  dst,
@@ -598,6 +705,102 @@ private:
     }
   }
 
+  // Apply the operator on a cell batch and add the result into dst at the
+  // positions given by dst_indices, in the format of compressed_dof_indices
+  template<int degree, typename DstVectorType>
+  void
+  apply_cell_operation(const unsigned int                cell_index,
+                       const VectorType &                src,
+                       const std::vector<unsigned int> & dst_indices,
+                       DstVectorType &                   dst) const
+  {
+    constexpr unsigned int  n_q_points_1d = degree + 1;
+    constexpr unsigned int  n_q_points    = Utilities::pow(n_q_points_1d, dim);
+    VectorizedArray<Number> quad_values[n_q_points];
+
+    const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data =
+      matrix_free.get_shape_info().data[0];
+    if(degree <= 2)
+    {
+      const unsigned int * dof_indices =
+        compressed_dof_indices.data() + cell_index * Utilities::pow(degree + 1, dim) * n_lanes;
+      const unsigned char * unconstrained =
+        all_indices_unconstrained.data() + cell_index * Utilities::pow(degree + 1, dim);
+      for(unsigned int i = 0; i < n_q_points; ++i)
+        if(unconstrained[i])
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            quad_values[i][v] = src.local_element(dof_indices[i * n_lanes + v]);
+        else
+        {
+          quad_values[i] = VectorizedArray<Number>();
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+              quad_values[i][v] = src.local_element(dof_indices[i * n_lanes + v]);
+        }
+
+      dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_evenodd,
+                                                    dealii::internal::EvaluatorQuantity::value,
+                                                    dim,
+                                                    degree + 1,
+                                                    degree + 1>::do_forward(1,
+                                                                            shape_data
+                                                                              .shape_values_eo,
+                                                                            quad_values,
+                                                                            quad_values);
+    }
+    else
+      read_dof_values_compressed<degree, n_q_points_1d, 1>(src,
+                                                           compressed_dof_indices,
+                                                           all_indices_unconstrained,
+                                                           cell_index,
+                                                           shape_data.shape_values_eo,
+                                                           false,
+                                                           quad_values);
+
+    if(factor_laplace != 0)
+      compute_cell_lapl<n_q_points_1d>(shape_data,
+                                       mapping_info,
+                                       cell_index,
+                                       factor_mass,
+                                       factor_laplace,
+                                       quad_values,
+                                       quad_values);
+    else
+      AssertThrow(false, ExcNotImplemented());
+
+    if(degree <= 2)
+    {
+      dealii::internal::FEEvaluationImplBasisChange<
+        dealii::internal::evaluate_evenodd,
+        dealii::internal::EvaluatorQuantity::value,
+        dim,
+        degree + 1,
+        degree + 1>::do_backward(1, shape_data.shape_values_eo, false, quad_values, quad_values);
+      const unsigned int * dof_indices =
+        dst_indices.data() + cell_index * Utilities::pow(degree + 1, dim) * n_lanes;
+      const unsigned char * unconstrained =
+        all_indices_unconstrained.data() + cell_index * Utilities::pow(degree + 1, dim);
+      for(unsigned int i = 0; i < n_q_points; ++i)
+        if(unconstrained[i])
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            dst.local_element(dof_indices[i * n_lanes + v]) += quad_values[i][v];
+        else
+        {
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+              dst.local_element(dof_indices[i * n_lanes + v]) += quad_values[i][v];
+        }
+    }
+    else
+      distribute_local_to_global_compressed<degree, n_q_points_1d, 1>(dst,
+                                                                      dst_indices,
+                                                                      all_indices_unconstrained,
+                                                                      cell_index,
+                                                                      shape_data.shape_values_eo,
+                                                                      false,
+                                                                      quad_values);
+  }
+
   template<int degree, bool evaluate_operator>
   void
   do_cell_operation(const unsigned int cell_index, const VectorType & src, VectorType & dst) const
@@ -609,87 +812,7 @@ private:
     const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data =
       matrix_free.get_shape_info().data[0];
     if(evaluate_operator)
-    {
-      if(degree <= 2)
-      {
-        const unsigned int * dof_indices =
-          compressed_dof_indices.data() + cell_index * Utilities::pow(degree + 1, dim) * n_lanes;
-        const unsigned char * unconstrained =
-          all_indices_unconstrained.data() + cell_index * Utilities::pow(degree + 1, dim);
-        for(unsigned int i = 0; i < n_q_points; ++i)
-          if(unconstrained[i])
-            for(unsigned int v = 0; v < n_lanes; ++v)
-              quad_values[i][v] = src.local_element(dof_indices[i * n_lanes + v]);
-          else
-          {
-            quad_values[i] = VectorizedArray<Number>();
-            for(unsigned int v = 0; v < n_lanes; ++v)
-              if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
-                quad_values[i][v] = src.local_element(dof_indices[i * n_lanes + v]);
-          }
-
-        dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_evenodd,
-                                                      dealii::internal::EvaluatorQuantity::value,
-                                                      dim,
-                                                      degree + 1,
-                                                      degree + 1>::do_forward(1,
-                                                                              shape_data
-                                                                                .shape_values_eo,
-                                                                              quad_values,
-                                                                              quad_values);
-      }
-      else
-        read_dof_values_compressed<degree, n_q_points_1d, 1>(src,
-                                                             compressed_dof_indices,
-                                                             all_indices_unconstrained,
-                                                             cell_index,
-                                                             shape_data.shape_values_eo,
-                                                             false,
-                                                             quad_values);
-
-      if(factor_laplace != 0)
-        compute_cell_lapl<n_q_points_1d>(shape_data,
-                                         mapping_info,
-                                         cell_index,
-                                         factor_mass,
-                                         factor_laplace,
-                                         quad_values,
-                                         quad_values);
-      else
-        AssertThrow(false, ExcNotImplemented());
-
-      if(degree <= 2)
-      {
-        dealii::internal::FEEvaluationImplBasisChange<
-          dealii::internal::evaluate_evenodd,
-          dealii::internal::EvaluatorQuantity::value,
-          dim,
-          degree + 1,
-          degree + 1>::do_backward(1, shape_data.shape_values_eo, false, quad_values, quad_values);
-        const unsigned int * dof_indices =
-          compressed_dof_indices.data() + cell_index * Utilities::pow(degree + 1, dim) * n_lanes;
-        const unsigned char * unconstrained =
-          all_indices_unconstrained.data() + cell_index * Utilities::pow(degree + 1, dim);
-        for(unsigned int i = 0; i < n_q_points; ++i)
-          if(unconstrained[i])
-            for(unsigned int v = 0; v < n_lanes; ++v)
-              dst.local_element(dof_indices[i * n_lanes + v]) += quad_values[i][v];
-          else
-          {
-            for(unsigned int v = 0; v < n_lanes; ++v)
-              if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
-                dst.local_element(dof_indices[i * n_lanes + v]) += quad_values[i][v];
-          }
-      }
-      else
-        distribute_local_to_global_compressed<degree, n_q_points_1d, 1>(dst,
-                                                                        compressed_dof_indices,
-                                                                        all_indices_unconstrained,
-                                                                        cell_index,
-                                                                        shape_data.shape_values_eo,
-                                                                        false,
-                                                                        quad_values);
-    }
+      apply_cell_operation<degree>(cell_index, src, compressed_dof_indices, dst);
     else
     {
       VectorizedArray<Number> diag_values[n_q_points];
@@ -988,10 +1111,10 @@ public:
                                                        dof_values + q1 + c * dofs_per_comp);
   }
 
-  template<int fe_degree, int n_q_points_1d, int n_components>
+  template<int fe_degree, int n_q_points_1d, int n_components, typename DstVectorType>
   static void
   distribute_local_to_global_compressed(
-    VectorType &                               vec,
+    DstVectorType &                            vec,
     const std::vector<unsigned int> &          compressed_dof_indices,
     const std::vector<unsigned char> &         all_indices_unconstrained,
     const unsigned int                         cell_no,
@@ -1395,6 +1518,11 @@ private:
   std::vector<unsigned int>              compressed_dof_indices;
   std::vector<unsigned char>             all_indices_unconstrained;
 
+  // scratch array of vmult_scratch() and the indices into it, in the
+  // format of compressed_dof_indices
+  ExaDG::ScratchMatrixVectorProduct<Number> scratch;
+  std::vector<unsigned int>                 scratch_dof_indices;
+
   std::vector<dealii::ndarray<unsigned int, n_lanes, 2>> cell_level_index;
 
   Extruded::MappingInfo<dim, Number> mapping_info;
@@ -1605,6 +1733,8 @@ public:
 
     detect_dependencies_of_face_integrals();
 
+    setup_scratch();
+
     set_parameters(0., 1.0);
 
     for(double & t : timings)
@@ -1781,59 +1911,7 @@ public:
       timings[4] += time.wall_time();
     }
 
-    time.restart();
-
-    // only do the data exchange for face integral if we have Laplacian contribution
-    if(factor_laplace != 0. && Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) > 1)
-    {
-      const int nn = shape_info.data[0].fe_degree + 1;
-
-      // data: everything projected to face, 2 because of values and derivatives
-      const int data_per_face = 2 * Utilities::pow(nn, dim - 1);
-
-      AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
-      unsigned int offset = 0;
-      for(unsigned int p = 0; p < send_data_process.size(); ++p)
-      {
-        MPI_Irecv(&import_values[offset * data_per_face],
-                  send_data_process[p].second * data_per_face * sizeof(Number),
-                  MPI_BYTE,
-                  send_data_process[p].first,
-                  send_data_process[p].first + 47,
-                  src.get_mpi_communicator(),
-                  &mpi_requests[p]);
-        offset += send_data_process[p].second;
-      }
-      AssertDimension(offset * data_per_face, import_values.size());
-
-      if(nn == 2)
-        vmult_pack_and_send_data<2>(src);
-      else if(nn == 3)
-        vmult_pack_and_send_data<3>(src);
-      else if(nn == 4)
-        vmult_pack_and_send_data<4>(src);
-#ifndef DEBUG
-      else if(nn == 5)
-        vmult_pack_and_send_data<5>(src);
-      else if(nn == 6)
-        vmult_pack_and_send_data<6>(src);
-      else if(nn == 7)
-        vmult_pack_and_send_data<7>(src);
-      else if(nn == 8)
-        vmult_pack_and_send_data<8>(src);
-      else if(nn == 9)
-        vmult_pack_and_send_data<9>(src);
-#endif
-      else
-        AssertThrow(false, ExcNotImplemented());
-
-      timings[3] += time.wall_time();
-
-      time.restart();
-      if(!mpi_requests.empty())
-        MPI_Waitall(mpi_requests.size(), &mpi_requests[0], MPI_STATUSES_IGNORE);
-      timings[5] += time.wall_time();
-    }
+    exchange_face_data(src);
 
     time.restart();
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
@@ -1891,6 +1969,54 @@ public:
       timings[13] += time.wall_time();
       timings[14] += total_timer.wall_time();
     }
+  }
+
+  // Variant of the matrix-vector product that accumulates the result into
+  // a small scratch array instead of a global vector, see
+  // ExaDG::ScratchMatrixVectorProduct for the format of the ranges passed
+  // to 'after_loop'. As each cell only writes into its own entries, the
+  // result of a cell batch is passed on right after the cell batch.
+  template<typename AfterLoop>
+  void
+  vmult_scratch(const VectorType & src, const AfterLoop & after_loop) const
+  {
+    Timer total_timer;
+    if(factor_laplace != 0.)
+      timings[0] += 1;
+    else
+      timings[10] += 1;
+
+    scratch.prepare_loop();
+    exchange_face_data(src);
+
+    Timer time;
+    scratch.cell_loop(
+      [&](const unsigned int cell, Number * scratch_array) {
+        dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
+      },
+      after_loop);
+    scratch.finish_loop(after_loop, {});
+
+    if(factor_laplace != 0)
+    {
+      timings[7] += time.wall_time();
+      timings[8] += time.wall_time();
+      timings[9] += total_timer.wall_time();
+    }
+    else
+    {
+      timings[12] += time.wall_time();
+      timings[13] += time.wall_time();
+      timings[14] += total_timer.wall_time();
+    }
+  }
+
+  // Compare vmult_scratch() against vmult() and print the size of the
+  // scratch array
+  void
+  verify_vmult_scratch() const
+  {
+    scratch.verify(*this, "DG Laplace operator", dof_handler->get_mpi_communicator());
   }
 
   void
@@ -2145,6 +2271,10 @@ private:
   std::vector<std::pair<unsigned int, unsigned int>>           send_data_process;
   std::vector<unsigned int>                                    send_data_cell_index;
   std::vector<unsigned char>                                   send_data_face_index;
+
+  // scratch array of vmult_scratch() and the offsets of the cells into it
+  ExaDG::ScratchMatrixVectorProduct<Number>      scratch;
+  std::vector<std::array<unsigned int, n_lanes>> scratch_indices;
 
   Extruded::MappingInfo<dim, Number> mapping_info;
 
@@ -2649,6 +2779,65 @@ private:
     AssertDimension(offset * data_per_face, export_values.size());
   }
 
+  // Send and receive the data of src on the faces to other processes
+  // needed for the face integrals
+  void
+  exchange_face_data(const VectorType & src) const
+  {
+    Timer time;
+    // only do the data exchange for face integral if we have Laplacian contribution
+    if(factor_laplace != 0. && Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) > 1)
+    {
+      const int nn = shape_info.data[0].fe_degree + 1;
+
+      // data: everything projected to face, 2 because of values and derivatives
+      const int data_per_face = 2 * Utilities::pow(nn, dim - 1);
+
+      AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
+      unsigned int offset = 0;
+      for(unsigned int p = 0; p < send_data_process.size(); ++p)
+      {
+        MPI_Irecv(&import_values[offset * data_per_face],
+                  send_data_process[p].second * data_per_face * sizeof(Number),
+                  MPI_BYTE,
+                  send_data_process[p].first,
+                  send_data_process[p].first + 47,
+                  src.get_mpi_communicator(),
+                  &mpi_requests[p]);
+        offset += send_data_process[p].second;
+      }
+      AssertDimension(offset * data_per_face, import_values.size());
+
+      if(nn == 2)
+        vmult_pack_and_send_data<2>(src);
+      else if(nn == 3)
+        vmult_pack_and_send_data<3>(src);
+      else if(nn == 4)
+        vmult_pack_and_send_data<4>(src);
+#ifndef DEBUG
+      else if(nn == 5)
+        vmult_pack_and_send_data<5>(src);
+      else if(nn == 6)
+        vmult_pack_and_send_data<6>(src);
+      else if(nn == 7)
+        vmult_pack_and_send_data<7>(src);
+      else if(nn == 8)
+        vmult_pack_and_send_data<8>(src);
+      else if(nn == 9)
+        vmult_pack_and_send_data<9>(src);
+#endif
+      else
+        AssertThrow(false, ExcNotImplemented());
+
+      timings[3] += time.wall_time();
+
+      time.restart();
+      if(!mpi_requests.empty())
+        MPI_Waitall(mpi_requests.size(), &mpi_requests[0], MPI_STATUSES_IGNORE);
+      timings[5] += time.wall_time();
+    }
+  }
+
   void
   diagonal_operation(const unsigned int cell, VectorType & dst) const
   {
@@ -2717,6 +2906,94 @@ private:
     fe_operator.template distribute_local_to_global<degree>(cell, quad_values, dst);
   }
 
+  // Apply the operator on a cell batch and add the result into the array
+  // dst at the positions given by dst_indices
+  template<int degree>
+  void
+  do_cell_operation(const unsigned int                        cell,
+                    const VectorType &                        src,
+                    const std::array<unsigned int, n_lanes> & dst_indices,
+                    Number *                                  dst) const
+  {
+    constexpr unsigned int n_q_points_1d = degree + 1;
+    constexpr unsigned int n_points      = Utilities::pow(n_q_points_1d, dim);
+    const auto &           shape_data    = shape_info.data[0];
+
+    VectorizedArray<Number> quad_values[n_points], out_values[n_points];
+    read_cell_values<degree + 1, n_q_points_1d>(src.begin(), dof_indices[cell], quad_values);
+
+    if(factor_laplace != 0)
+      compute_cell_lapl<n_q_points_1d>(
+        shape_data, mapping_info, cell, factor_mass, factor_laplace, quad_values, out_values);
+    else
+      AssertThrow(false, ExcNotImplemented("Pure mass case not implemented yet"));
+
+    // Face integrals if Laplace factor is positive
+    if(factor_laplace != 0.)
+      for(unsigned int f = 0; f < 2 * dim; ++f)
+        compute_face<degree, true>(shape_data, src, cell, f, quad_values, out_values);
+
+    integrate_cell_scatter<degree + 1, n_q_points_1d>(dst_indices,
+                                                      n_active_entries_per_cell_batch(cell),
+                                                      out_values,
+                                                      dst);
+  }
+
+  void
+  dispatch_cell_operation(const unsigned int                        cell,
+                          const VectorType &                        src,
+                          const std::array<unsigned int, n_lanes> & dst_indices,
+                          Number *                                  dst) const
+  {
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    if(degree == 1)
+      do_cell_operation<1>(cell, src, dst_indices, dst);
+    else if(degree == 2)
+      do_cell_operation<2>(cell, src, dst_indices, dst);
+    else if(degree == 3)
+      do_cell_operation<3>(cell, src, dst_indices, dst);
+    else if(degree == 4)
+      do_cell_operation<4>(cell, src, dst_indices, dst);
+#ifndef DEBUG
+    else if(degree == 5)
+      do_cell_operation<5>(cell, src, dst_indices, dst);
+    else if(degree == 6)
+      do_cell_operation<6>(cell, src, dst_indices, dst);
+    else if(degree == 7)
+      do_cell_operation<7>(cell, src, dst_indices, dst);
+    else if(degree == 8)
+      do_cell_operation<8>(cell, src, dst_indices, dst);
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  // Set up the scratch array of vmult_scratch() with the cells as entities
+  void
+  setup_scratch()
+  {
+    const unsigned int n_cell_batches = dof_indices.size();
+    const unsigned int dofs_per_cell  = dof_handler->get_fe().dofs_per_cell;
+    scratch.reinit(
+      partitioner,
+      n_cell_batches,
+      [&](const unsigned int cell, const auto & add) {
+        for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+          add(dof_indices[cell][v], dofs_per_cell);
+      },
+      false);
+
+    scratch_indices.resize(n_cell_batches);
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      const unsigned int n_active = n_active_entries_per_cell_batch(cell);
+      for(unsigned int v = 0; v < n_lanes; ++v)
+        scratch_indices[cell][v] =
+          scratch.scratch_index(dof_indices[cell][std::min(v, n_active - 1)]);
+    }
+    scratch.release_setup_data();
+  }
+
   template<int degree, bool compute_exterior>
   void
   do_cell_operation(const unsigned int cell, const VectorType & src, VectorType & dst) const
@@ -2728,25 +3005,7 @@ private:
 
     VectorizedArray<Number> quad_values[n_points], out_values[n_points];
     if(compute_exterior)
-    {
-      read_cell_values<degree + 1, n_q_points_1d>(src.begin(), dof_indices[cell], quad_values);
-
-      if(factor_laplace != 0)
-        compute_cell_lapl<n_q_points_1d>(
-          shape_data, mapping_info, cell, factor_mass, factor_laplace, quad_values, out_values);
-      else
-        AssertThrow(false, ExcNotImplemented("Pure mass case not implemented yet"));
-
-      // Face integrals if Laplace factor is positive
-      if(factor_laplace != 0.)
-        for(unsigned int f = 0; f < 2 * dim; ++f)
-          compute_face<degree, true>(shape_data, src, cell, f, quad_values, out_values);
-
-      integrate_cell_scatter<degree + 1, n_q_points_1d>(dof_indices[cell],
-                                                        n_active_entries_per_cell_batch(cell),
-                                                        out_values,
-                                                        dst.begin());
-    }
+      do_cell_operation<degree>(cell, src, dof_indices[cell], dst.begin());
     else
     {
       const unsigned int n_entries_per_batch = n_active_entries_per_cell_batch(cell);

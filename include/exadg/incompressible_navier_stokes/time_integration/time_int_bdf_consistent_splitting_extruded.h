@@ -29,7 +29,7 @@ namespace RTOperator
 {
 template<int dim, typename Number>
 class RaviartThomasOperator;
-}
+} // namespace RTOperator
 
 namespace LaplaceOperator
 {
@@ -43,6 +43,9 @@ class PoissonPreconditionerMG;
 
 namespace ExaDG
 {
+template<typename OperatorType>
+class PreconditionChebyshevScratch;
+
 namespace IncNS
 {
 // forward declarations
@@ -199,9 +202,7 @@ private:
   std::array<double, 6>                                                 factors_time_step_mass;
 
   using ChebyshevSolver =
-    dealii::PreconditionChebyshev<RTOperator::RaviartThomasOperator<dim, float>,
-                                  VectorTypeFloat,
-                                  dealii::DiagonalMatrix<VectorTypeFloat>>;
+    PreconditionChebyshevScratch<RTOperator::RaviartThomasOperator<dim, float>>;
   std::shared_ptr<ChebyshevSolver> momentum_solver_chebyshev;
   double                           momentum_sliding_max_eigenvalue;
   double                           momentum_sliding_min_eigenvalue;

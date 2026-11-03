@@ -29,6 +29,7 @@
 #include <exadg/incompressible_navier_stokes/time_integration/poisson_solver.h>
 #include <exadg/incompressible_navier_stokes/time_integration/time_int_bdf_consistent_splitting_extruded.h>
 #include <exadg/incompressible_navier_stokes/user_interface/parameters.h>
+#include <exadg/solvers_and_preconditioners/preconditioners/chebyshev_scratch.h>
 #include <exadg/time_integration/restart.h>
 #include <exadg/time_integration/time_step_calculation.h>
 #include <exadg/time_integration/vector_handling.h>
@@ -208,6 +209,13 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
                       this->is_test);
 
   op_rt_float->set_penalty_parameters(pde_operator->get_viscous_kernel_data().IP_factor);
+  if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev and
+     not this->is_test)
+  {
+    op_rt_float->print_vector_access_statistics();
+    op_rt_float->set_parameters(1.0, 1.0);
+    op_rt_float->verify_vmult_scratch();
+  }
 
   op_rt_float->set_parameters(1.0, 0.0);
   op_rt_float->compute_diagonal(diagonal_mass);
@@ -1047,7 +1055,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
           // custom deleter that does nothing, since the surrounding class owns
           // the preconditioner
         });
-        chebyshev_data.eig_cg_n_iterations = 0;
 
         chebyshev_data.max_eigenvalue = momentum_sliding_max_eigenvalue;
         chebyshev_data.smoothing_range =
