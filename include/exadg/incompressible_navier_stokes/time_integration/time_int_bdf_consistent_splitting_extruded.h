@@ -22,8 +22,15 @@
 #ifndef EXADG_INCOMPRESSIBLE_NAVIER_STOKES_TIME_INTEGRATION_TIME_INT_BDF_CONSISTENT_SPLITTING_EXTRUDED_H_
 #define EXADG_INCOMPRESSIBLE_NAVIER_STOKES_TIME_INTEGRATION_TIME_INT_BDF_CONSISTENT_SPLITTING_EXTRUDED_H_
 
+// deal.II
+#include <deal.II/lac/vector_memory.h>
+
 // ExaDG
 #include <exadg/incompressible_navier_stokes/time_integration/time_int_bdf.h>
+
+#include <memory>
+#include <utility>
+#include <vector>
 
 namespace RTOperator
 {
@@ -51,6 +58,46 @@ namespace IncNS
 // forward declarations
 template<int dim, typename Number>
 class OperatorConsistentSplitting;
+
+// Vector memory with a pool of its own, in contrast to
+// dealii::GrowingVectorMemory, whose pool is shared by all solvers with the
+// same vector type. If solvers for vectors of different layout alternate,
+// e.g. the coarse-grid solver of the pressure multigrid and the momentum
+// solver, the shared pool reallocates the vectors in every solve, which is
+// expensive for vectors in MPI-3 shared memory.
+template<typename VectorType>
+class SeparateVectorMemory : public dealii::VectorMemory<VectorType>
+{
+public:
+  VectorType *
+  alloc() override
+  {
+    for(auto & [used, vector] : pool)
+      if(not used)
+      {
+        used = true;
+        return vector.get();
+      }
+    pool.emplace_back(true, std::make_unique<VectorType>());
+    return pool.back().second.get();
+  }
+
+  void
+  free(const VectorType * const v) override
+  {
+    for(auto & [used, vector] : pool)
+      if(vector.get() == v)
+      {
+        AssertThrow(used, dealii::ExcMessage("Vector freed twice"));
+        used = false;
+        return;
+      }
+    AssertThrow(false, dealii::ExcMessage("Vector not allocated by this object"));
+  }
+
+private:
+  std::vector<std::pair<bool, std::unique_ptr<VectorType>>> pool;
+};
 
 template<int dim, typename Number>
 class TimeIntBDFConsistentSplittingExtruded : public TimeIntBDF<dim, Number>
@@ -193,13 +240,15 @@ private:
   std::shared_ptr<LaplaceOperator::LaplaceOperatorDG<dim, Number>>      laplace_op;
   std::shared_ptr<LaplaceOperator::PoissonPreconditionerMG<dim, float>> poisson_preconditioner;
   VectorTypeFloat                                                       diagonal_mass;
-  VectorTypeFloat                                                       diagonal_laplace;
-  dealii::DiagonalMatrix<VectorTypeFloat>                               preconditioner_viscous;
-  dealii::DiagonalMatrix<VectorType>                                    preconditioner_mass;
-  VectorType                                                            solution_rt;
-  std::vector<VectorType>                                               solutions_convective;
-  VectorType                                                            rhs_rt;
-  std::array<double, 6>                                                 factors_time_step_mass;
+  // temporary vectors of the conjugate gradient solver for the momentum step
+  SeparateVectorMemory<VectorTypeFloat>   vector_memory_momentum;
+  VectorTypeFloat                         diagonal_laplace;
+  dealii::DiagonalMatrix<VectorTypeFloat> preconditioner_viscous;
+  dealii::DiagonalMatrix<VectorType>      preconditioner_mass;
+  VectorType                              solution_rt;
+  std::vector<VectorType>                 solutions_convective;
+  VectorType                              rhs_rt;
+  std::array<double, 6>                   factors_time_step_mass;
 
   using ChebyshevSolver =
     PreconditionChebyshevScratch<RTOperator::RaviartThomasOperator<dim, float>>;
@@ -219,7 +268,9 @@ private:
   Utilities::StatisticalQuantity stat_pressure_time_projection;
   Utilities::StatisticalQuantity stat_pressure_time_solve;
 
-  Utilities::StatisticalQuantity stat_momentum_iterations;
+  Utilities::StatisticalQuantity stat_momentum_iterations_cg;
+  Utilities::StatisticalQuantity stat_momentum_iterations_cheby;
+  Utilities::StatisticalQuantity stat_momentum_iterations_cg_help;
   Utilities::StatisticalQuantity stat_momentum_rhs_norm;
   Utilities::StatisticalQuantity stat_momentum_residual_start;
   Utilities::StatisticalQuantity stat_momentum_residual_stop;

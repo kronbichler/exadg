@@ -1753,6 +1753,10 @@ public:
       }
 
       Helper::print_time(timings[7] / timings[0], "Matrix-free loop", comm, total_time);
+      Helper::print_time_per_node(timings[7] / timings[0],
+                                  "Matrix-free loop, node avg",
+                                  comm,
+                                  total_time);
       if(Utilities::MPI::this_mpi_process(comm) == 0)
         std::cout << std::endl;
     }

@@ -340,7 +340,7 @@ TimerTree::print_own(dealii::ConditionalOStream const & pcout,
         dealii::Utilities::MPI::min_max_avg(ref_time, MPI_COMM_WORLD);
       double const ref_time_avg = ref_time_data.avg;
 
-      pcout << std::setprecision(precision) << std::fixed << std::setw(10) << std::right
+      pcout << std::setprecision(precision - 1) << std::fixed << std::setw(10) << std::right
             << time_avg / ref_time_avg * 100.0 << " %";
     }
   }

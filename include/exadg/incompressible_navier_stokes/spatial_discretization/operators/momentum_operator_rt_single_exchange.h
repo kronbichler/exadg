@@ -31,6 +31,7 @@
 
 #include <boost/serialization/vector.hpp>
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <ostream>
@@ -141,6 +142,16 @@ struct Partner
   unsigned int send_size   = 0;
   unsigned int recv_offset = 0;
   unsigned int recv_size   = 0;
+
+  // for partners in the same shared-memory domain: rank in the
+  // shared-memory communicator, else numbers::invalid_unsigned_int, and the
+  // start of the message to this process in the send buffer of the partner
+  unsigned int sm_rank            = numbers::invalid_unsigned_int;
+  unsigned int remote_send_offset = 0;
+
+  // whether the partner reads all cells of section F directly in shared
+  // memory, in which case the face data is not computed
+  bool faces_read_directly = false;
 };
 
 template<int dim, typename Number>
@@ -285,6 +296,8 @@ public:
     // the shared face, and for each such entity (face number on the sending
     // cell, global index of the first DoF, owner).
     std::map<unsigned int, std::vector<types::global_dof_index>> setup_send;
+    send_cell_entities.resize(n_send_faces);
+    first_owned_index = partitioner.local_range().first;
     for(const Partner & partner : partners)
     {
       std::vector<types::global_dof_index> & message = setup_send[partner.rank];
@@ -302,6 +315,19 @@ public:
                     ExcMessage("Cell-interior DoFs must always be locally owned"));
         AssertThrow(indices[face][lane] != numbers::invalid_unsigned_int,
                     ExcMessage("DoFs on face to remote process must not be constrained"));
+
+        // all entities of the sending cell, for reading them directly in
+        // shared memory, see setup_shared_memory()
+        for(unsigned int e = 0; e < 2 * dim + 1; ++e)
+        {
+          const unsigned int index = indices[e][lane];
+          if(index == numbers::invalid_unsigned_int)
+            send_cell_entities[c][e] = {
+              {numbers::invalid_dof_index, numbers::invalid_unsigned_int}};
+          else
+            send_cell_entities[c][e] = {
+              {partitioner.local_to_global(index), index < n_owned ? my_rank : ghost_owner(index)}};
+        }
 
         message.push_back(dcell->global_active_cell_index());
         message.push_back(neighbor->global_active_cell_index());
@@ -339,6 +365,8 @@ public:
             slot_info[slot] = {{cell, f, v}};
           }
         }
+    n_cell_batches = mpi_exchange_data_on_faces.size();
+    slot_location  = slot_info;
 
     const std::map<unsigned int, std::vector<types::global_dof_index>> setup_received =
       Utilities::MPI::some_to_some(comm, setup_send);
@@ -476,8 +504,6 @@ public:
     }
 
     compute_statistics(partitioner, remote_supplements, comm);
-
-    usable = true;
   }
 
   // Copy section G of the message to 'partner' from the locally owned
@@ -515,11 +541,13 @@ public:
   void
   start_receives(Number * recv_buffer, const MPI_Comm comm, MPI_Request * requests) const
   {
+    exchange_pending = true;
     for(unsigned int p = 0; p < partners.size(); ++p)
       if(partners[p].recv_size > 0)
       {
-        const int ierr = MPI_Irecv(recv_buffer + partners[p].recv_offset,
-                                   partners[p].recv_size * sizeof(Number),
+        const bool shared = partners[p].sm_rank != numbers::invalid_unsigned_int;
+        const int  ierr   = MPI_Irecv(recv_buffer + partners[p].recv_offset,
+                                   shared ? 0 : partners[p].recv_size * sizeof(Number),
                                    MPI_BYTE,
                                    partners[p].rank,
                                    mpi_tag,
@@ -540,8 +568,11 @@ public:
   {
     if(partners[p].send_size > 0)
     {
+      const bool shared = partners[p].sm_rank != numbers::invalid_unsigned_int;
+      if(shared)
+        std::atomic_thread_fence(std::memory_order_release);
       const int ierr = MPI_Isend(send_buffer + partners[p].send_offset,
-                                 partners[p].send_size * sizeof(Number),
+                                 shared ? 0 : partners[p].send_size * sizeof(Number),
                                  MPI_BYTE,
                                  partners[p].rank,
                                  mpi_tag,
@@ -565,6 +596,284 @@ public:
     });
   }
 
+  // Identify the partners in the same shared-memory domain as given by
+  // 'comm_sm' and look up the position of their messages to this process in
+  // their send buffers. For these partners, the messages are not sent but
+  // read directly from the send buffer of the partner, which must be
+  // allocated in shared memory and passed to set_buffers(). The MPI
+  // messages to these partners are empty and only signal that the send
+  // buffer is ready. Must be called by all processes of 'comm'.
+  void
+  setup_shared_memory(const MPI_Comm comm, const MPI_Comm comm_sm)
+  {
+    free_communication();
+    for(Partner & partner : partners)
+    {
+      partner.sm_rank             = numbers::invalid_unsigned_int;
+      partner.faces_read_directly = false;
+    }
+    slot_in_shared_memory.clear();
+    remote_cell_entities.clear();
+    remote_cell_global_indices.clear();
+    if(comm_sm == MPI_COMM_SELF)
+      return;
+
+    MPI_Group group, group_sm;
+    int       ierr = MPI_Comm_group(comm, &group);
+    AssertThrowMPI(ierr);
+    ierr = MPI_Comm_group(comm_sm, &group_sm);
+    AssertThrowMPI(ierr);
+    std::vector<int> ranks(partners.size()), ranks_sm(partners.size());
+    for(unsigned int p = 0; p < partners.size(); ++p)
+      ranks[p] = partners[p].rank;
+    ierr =
+      MPI_Group_translate_ranks(group, partners.size(), ranks.data(), group_sm, ranks_sm.data());
+    AssertThrowMPI(ierr);
+    MPI_Group_free(&group);
+    MPI_Group_free(&group_sm);
+    for(unsigned int p = 0; p < partners.size(); ++p)
+      if(ranks_sm[p] != MPI_UNDEFINED)
+        partners[p].sm_rank = ranks_sm[p];
+
+    // exchange the offsets of the messages in the send buffers
+    std::vector<MPI_Request> requests;
+    requests.reserve(2 * partners.size());
+    for(Partner & partner : partners)
+      if(partner.sm_rank != numbers::invalid_unsigned_int)
+      {
+        if(partner.recv_size > 0)
+        {
+          requests.emplace_back();
+          ierr = MPI_Irecv(&partner.remote_send_offset,
+                           1,
+                           MPI_UNSIGNED,
+                           partner.rank,
+                           mpi_tag + 1,
+                           comm,
+                           &requests.back());
+          AssertThrowMPI(ierr);
+        }
+        if(partner.send_size > 0)
+        {
+          requests.emplace_back();
+          ierr = MPI_Isend(&partner.send_offset,
+                           1,
+                           MPI_UNSIGNED,
+                           partner.rank,
+                           mpi_tag + 1,
+                           comm,
+                           &requests.back());
+          AssertThrowMPI(ierr);
+        }
+      }
+    ierr = MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    AssertThrowMPI(ierr);
+
+    setup_remote_cell_entities(comm, comm_sm);
+
+    // separate communicator for the signals that the messages have been
+    // read, which are still in flight when the operator returns and must not
+    // be confused with messages of other operators
+    ierr = MPI_Comm_dup(comm, &comm_done);
+    AssertThrowMPI(ierr);
+    done_requests.assign(2 * partners.size(), MPI_REQUEST_NULL);
+  }
+
+  // Set the location of the received data for all partners: the receive
+  // buffer for partners communicating via MPI messages and the send buffers
+  // of the partners in shared memory, given by the views into the send
+  // buffers of all processes in the shared-memory communicator. Face data
+  // from shared memory that must be completed by supplements is copied
+  // into the receive buffer in unpack_and_complete(). Fills
+  // remote_face_data, so the buffers must not be reallocated afterwards.
+  void
+  set_buffers(Number *                                     recv_buffer,
+              const std::vector<ArrayView<const Number>> & shared_send_buffers)
+  {
+    std::vector<bool> needs_completion(recv_face_offset.size(), false);
+    for(const Partner & partner : partners)
+      for(const SupplementRecv & s : partner.supplements_recv)
+        needs_completion[s.slot] = true;
+    for(const LocalSupplement & s : local_supplements)
+      needs_completion[s.slot] = true;
+
+    recv_data.resize(partners.size());
+    {
+      dealii::ndarray<const Number *, 2 * dim, n_lanes> no_remote_data;
+      for(unsigned int f = 0; f < 2 * dim; ++f)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          no_remote_data[f][v] = nullptr;
+      remote_face_data.assign(n_cell_batches, no_remote_data);
+      dealii::ndarray<const std::array<EntityLocation, 2 * dim + 1> *, 2 * dim, n_lanes>
+        no_remote_cell;
+      for(unsigned int f = 0; f < 2 * dim; ++f)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          no_remote_cell[f][v] = nullptr;
+      remote_cell_locations.assign(n_cell_batches, no_remote_cell);
+    }
+    copy_to_recv_buffer.clear();
+    for(unsigned int p = 0; p < partners.size(); ++p)
+    {
+      const Partner & partner = partners[p];
+      if(partner.sm_rank == numbers::invalid_unsigned_int)
+        recv_data[p] = recv_buffer + partner.recv_offset;
+      else
+      {
+        AssertIndexRange(partner.sm_rank, shared_send_buffers.size());
+        AssertIndexRange(partner.remote_send_offset + partner.recv_size,
+                         shared_send_buffers[partner.sm_rank].size() + 1);
+        recv_data[p] = shared_send_buffers[partner.sm_rank].data() + partner.remote_send_offset;
+      }
+      for(unsigned int slot = partner.first_face; slot < partner.first_face + partner.n_faces;
+          ++slot)
+      {
+        const Number * data =
+          recv_data[p] + partner.n_ghost_recv + (slot - partner.first_face) * data_per_face;
+        const auto [cell, f, v] = slot_location[slot];
+        if(slot < slot_in_shared_memory.size() && slot_in_shared_memory[slot])
+        {
+          // the remote cell is read directly in shared memory
+          remote_cell_locations[cell][f][v] = &remote_cell_entities[slot];
+          continue;
+        }
+        if(partner.sm_rank != numbers::invalid_unsigned_int && needs_completion[slot])
+        {
+          copy_to_recv_buffer.emplace_back(data, recv_face_offset[slot]);
+          remote_face_data[cell][f][v] = recv_buffer + recv_face_offset[slot];
+        }
+        else
+          remote_face_data[cell][f][v] = data;
+      }
+    }
+  }
+
+  // Wait until all partners in shared memory have signaled that they
+  // finished reading the messages in the send buffer and the entries of the
+  // source vector of the last exchange, which must be done before either is
+  // modified, i.e., before returning from an operation using the exchange
+  void
+  wait_until_partners_done_reading() const
+  {
+    if(!done_requests.empty())
+    {
+      const int ierr = MPI_Waitall(done_requests.size(), done_requests.data(), MPI_STATUSES_IGNORE);
+      AssertThrowMPI(ierr);
+      std::atomic_thread_fence(std::memory_order_acquire);
+    }
+  }
+
+  // After the last access to the received face data of an exchange: signal
+  // the partners in shared memory that their send buffer may be reused, and
+  // post the receives of the corresponding signals of the partners reading
+  // from this process. Does nothing if no exchange is pending.
+  void
+  signal_done_reading() const
+  {
+    if(!exchange_pending)
+      return;
+    exchange_pending = false;
+    if(done_requests.empty())
+      return;
+    std::atomic_thread_fence(std::memory_order_release);
+    const unsigned int n_partners = partners.size();
+    for(unsigned int p = 0; p < n_partners; ++p)
+      if(partners[p].sm_rank != numbers::invalid_unsigned_int)
+      {
+        int ierr;
+        if(partners[p].recv_size > 0)
+        {
+          ierr = MPI_Isend(
+            nullptr, 0, MPI_BYTE, partners[p].rank, mpi_tag, comm_done, &done_requests[p]);
+          AssertThrowMPI(ierr);
+        }
+        if(partners[p].send_size > 0)
+        {
+          ierr = MPI_Irecv(nullptr,
+                           0,
+                           MPI_BYTE,
+                           partners[p].rank,
+                           mpi_tag,
+                           comm_done,
+                           &done_requests[n_partners + p]);
+          AssertThrowMPI(ierr);
+        }
+      }
+  }
+
+  // Location of an entity (face or cell interior) of a cell on another
+  // process in the same shared-memory domain: rank in the shared-memory
+  // communicator of the owner of the entity, and index of its first DoF in
+  // the locally owned range of the owner; numbers::invalid_unsigned_int for
+  // constrained entities
+  struct EntityLocation
+  {
+    unsigned int sm_rank = numbers::invalid_unsigned_int;
+    unsigned int offset  = numbers::invalid_unsigned_int;
+  };
+
+  // per receive slot: whether all entities of the remote cell are owned by
+  // processes in the same shared-memory domain, and their locations in the
+  // order of the entities of dof_indices; see setup_shared_memory()
+  std::vector<bool>                                    slot_in_shared_memory;
+  std::vector<std::array<EntityLocation, 2 * dim + 1>> remote_cell_entities;
+
+  // Check the tables of remote_cell_entities with a vector in shared memory
+  // whose locally owned entries hold their global index: return the number
+  // of entities whose first entry, read through the table, does not match
+  // the global index sent by the process owning the cell
+  template<typename VectorType2>
+  unsigned int
+  count_wrong_remote_cell_entities(const VectorType2 & global_indices) const
+  {
+    const auto & shared_data = global_indices.shared_vector_data();
+    unsigned int n_wrong     = 0;
+    for(unsigned int slot = 0; slot < remote_cell_entities.size(); ++slot)
+      if(slot_in_shared_memory[slot])
+        for(unsigned int e = 0; e < 2 * dim + 1; ++e)
+        {
+          const EntityLocation & location = remote_cell_entities[slot][e];
+          if(location.sm_rank == numbers::invalid_unsigned_int)
+          {
+            if(remote_cell_global_indices[slot][e] != numbers::invalid_dof_index)
+              ++n_wrong;
+          }
+          else if(location.sm_rank >= shared_data.size() ||
+                  location.offset >= shared_data[location.sm_rank].size() ||
+                  static_cast<types::global_dof_index>(
+                    shared_data[location.sm_rank][location.offset]) !=
+                    remote_cell_global_indices[slot][e])
+            ++n_wrong;
+        }
+    return n_wrong;
+  }
+
+  // Number of receive slots whose remote cell can be read in shared memory
+  unsigned int
+  n_slots_in_shared_memory() const
+  {
+    unsigned int count = 0;
+    for(const bool in_shared_memory : slot_in_shared_memory)
+      if(in_shared_memory)
+        ++count;
+    return count;
+  }
+
+  // Number of partners in the same shared-memory domain
+  unsigned int
+  n_shared_memory_partners() const
+  {
+    unsigned int count = 0;
+    for(const Partner & partner : partners)
+      if(partner.sm_rank != numbers::invalid_unsigned_int)
+        ++count;
+    return count;
+  }
+
+  ~Data()
+  {
+    free_communication();
+  }
+
   // Global counts, summed over all processes
   struct Statistics
   {
@@ -583,8 +892,7 @@ public:
   void
   print_statistics(std::ostream & out) const
   {
-    out << "Single-exchange setup for RT operator: " << (usable ? "enabled" : "disabled")
-        << std::endl
+    out << "Single-exchange setup for RT operator:" << std::endl
         << "  remote faces (each side counted):   " << statistics.n_faces << std::endl
         << "  entries per face:                   " << data_per_face << std::endl
         << "  messages sent old | new:            " << statistics.n_messages_old << " | "
@@ -597,8 +905,6 @@ public:
         << "  remote supplements opposite | perp: " << statistics.remote_supplements_opposite
         << " | " << statistics.remote_supplements_perpendicular << std::endl;
   }
-
-  bool usable = false;
 
   // one message per pair of processes and direction in each vmult, so a
   // fixed tag is sufficient
@@ -625,9 +931,190 @@ public:
 
   std::vector<LocalSupplement> local_supplements;
 
+  // per cell batch, face and lane: pointer to the face data of the
+  // neighbor on a remote process in the layout described above, or nullptr
+  // if the neighbor is local, see set_buffers()
+  std::vector<dealii::ndarray<const Number *, 2 * dim, n_lanes>> remote_face_data;
+
+  // per cell batch, face and lane: locations of the entities of the
+  // neighbor on a remote process in the same shared-memory domain, which is
+  // read directly from the source vector, or nullptr; a lane has either
+  // remote_face_data or remote_cell_locations set if the neighbor is remote
+  std::vector<dealii::ndarray<const std::array<EntityLocation, 2 * dim + 1> *, 2 * dim, n_lanes>>
+    remote_cell_locations;
+
   Statistics statistics;
 
 private:
+  // per send face: global index of the first DoF and owner of the entities
+  // of the sending cell, and the first locally owned global index
+  std::vector<std::array<std::array<types::global_dof_index, 2>, 2 * dim + 1>> send_cell_entities;
+  types::global_dof_index first_owned_index = 0;
+
+  // per receive slot: global indices of the entities of the remote cell, for
+  // count_wrong_remote_cell_entities()
+  std::vector<std::array<types::global_dof_index, 2 * dim + 1>> remote_cell_global_indices;
+
+  // Send the entities of the cells next to partners in the same
+  // shared-memory domain to those partners, and translate the received
+  // entities to locations in the shared-memory domain
+  void
+  setup_remote_cell_entities(const MPI_Comm comm, const MPI_Comm comm_sm)
+  {
+    const unsigned int n_slots = recv_face_offset.size();
+    slot_in_shared_memory.assign(n_slots, false);
+    remote_cell_entities.assign(n_slots, std::array<EntityLocation, 2 * dim + 1>());
+    remote_cell_global_indices.assign(n_slots, std::array<types::global_dof_index, 2 * dim + 1>());
+
+    // ranks of all processes in the shared-memory communicator, and the
+    // locally owned ranges of the processes in the shared-memory domain
+    const unsigned int n_procs = Utilities::MPI::n_mpi_processes(comm);
+    std::vector<int>   ranks(n_procs), ranks_sm(n_procs);
+    for(unsigned int p = 0; p < n_procs; ++p)
+      ranks[p] = p;
+    {
+      MPI_Group group, group_sm;
+      int       ierr = MPI_Comm_group(comm, &group);
+      AssertThrowMPI(ierr);
+      ierr = MPI_Comm_group(comm_sm, &group_sm);
+      AssertThrowMPI(ierr);
+      ierr = MPI_Group_translate_ranks(group, n_procs, ranks.data(), group_sm, ranks_sm.data());
+      AssertThrowMPI(ierr);
+      MPI_Group_free(&group);
+      MPI_Group_free(&group_sm);
+    }
+    const std::vector<types::global_dof_index> first_owned_sm =
+      Utilities::MPI::all_gather(comm_sm, first_owned_index);
+    const std::vector<unsigned int> n_owned_sm =
+      Utilities::MPI::all_gather(comm_sm, n_locally_owned);
+
+    // per face: global index and owner of each entity
+    constexpr unsigned int   entries_per_face = 2 * (2 * dim + 1);
+    std::vector<MPI_Request> requests;
+    requests.reserve(2 * partners.size());
+    std::vector<std::vector<types::global_dof_index>> send_data(partners.size()),
+      recv_data_entities(partners.size());
+    for(unsigned int p = 0; p < partners.size(); ++p)
+    {
+      const Partner & partner = partners[p];
+      if(partner.sm_rank == numbers::invalid_unsigned_int || partner.n_faces == 0)
+        continue;
+      for(unsigned int c = partner.first_face; c < partner.first_face + partner.n_faces; ++c)
+        for(const auto & [index, owner] : send_cell_entities[c])
+        {
+          send_data[p].push_back(index);
+          send_data[p].push_back(owner);
+        }
+      recv_data_entities[p].resize(partner.n_faces * entries_per_face);
+      requests.emplace_back();
+      int ierr = MPI_Irecv(recv_data_entities[p].data(),
+                           recv_data_entities[p].size(),
+                           Utilities::MPI::mpi_type_id_for_type<types::global_dof_index>,
+                           partner.rank,
+                           mpi_tag + 2,
+                           comm,
+                           &requests.back());
+      AssertThrowMPI(ierr);
+      requests.emplace_back();
+      ierr = MPI_Isend(send_data[p].data(),
+                       send_data[p].size(),
+                       Utilities::MPI::mpi_type_id_for_type<types::global_dof_index>,
+                       partner.rank,
+                       mpi_tag + 2,
+                       comm,
+                       &requests.back());
+      AssertThrowMPI(ierr);
+    }
+    const int ierr = MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    AssertThrowMPI(ierr);
+
+    // Send side: the partner reads a cell directly if all its entities are
+    // owned by processes in the shared-memory domain, the same criterion as
+    // used on the receive side below
+    for(Partner & partner : partners)
+    {
+      if(partner.sm_rank == numbers::invalid_unsigned_int || partner.n_faces == 0)
+        continue;
+      partner.faces_read_directly = true;
+      for(unsigned int c = partner.first_face; c < partner.first_face + partner.n_faces; ++c)
+        for(const auto & [index, owner] : send_cell_entities[c])
+          if(index != numbers::invalid_dof_index && ranks_sm[owner] == MPI_UNDEFINED)
+            partner.faces_read_directly = false;
+    }
+
+    for(unsigned int p = 0; p < partners.size(); ++p)
+    {
+      const Partner & partner = partners[p];
+      if(partner.sm_rank == numbers::invalid_unsigned_int)
+        continue;
+      for(unsigned int f = 0; f < partner.n_faces; ++f)
+      {
+        const unsigned int slot     = partner.first_face + f;
+        bool               on_node  = true;
+        const auto *       entities = recv_data_entities[p].data() + f * entries_per_face;
+        for(unsigned int e = 0; e < 2 * dim + 1; ++e)
+        {
+          const types::global_dof_index index = entities[2 * e];
+          remote_cell_global_indices[slot][e] = index;
+          if(index == numbers::invalid_dof_index)
+            continue;
+          const int owner_sm = ranks_sm[entities[2 * e + 1]];
+          if(owner_sm == MPI_UNDEFINED)
+          {
+            on_node = false;
+            break;
+          }
+          AssertThrow(index >= first_owned_sm[owner_sm] &&
+                        index < first_owned_sm[owner_sm] + n_owned_sm[owner_sm],
+                      ExcMessage("Entity not in the locally owned range of its owner"));
+          remote_cell_entities[slot][e] =
+            EntityLocation{static_cast<unsigned int>(owner_sm),
+                           static_cast<unsigned int>(index - first_owned_sm[owner_sm])};
+        }
+        slot_in_shared_memory[slot] = on_node;
+        if(!on_node)
+          remote_cell_entities[slot] = std::array<EntityLocation, 2 * dim + 1>();
+      }
+    }
+  }
+
+  // per receive slot: cell batch, face and lane of the receiving cell
+  unsigned int                             n_cell_batches = 0;
+  std::vector<std::array<unsigned int, 3>> slot_location;
+
+  // per partner: start of the received message, in the receive buffer or
+  // in the send buffer of the partner in shared memory
+  std::vector<const Number *> recv_data;
+
+  // face data in shared memory to be copied to the given offset in the
+  // receive buffer before adding supplements
+  std::vector<std::pair<const Number *, unsigned int>> copy_to_recv_buffer;
+
+  // signals that messages in shared memory have been read, see
+  // signal_done_reading(): the first half holds the sends to the partners
+  // this process reads from, the second half the receives from the partners
+  // reading from this process
+  MPI_Comm                         comm_done = MPI_COMM_NULL;
+  mutable std::vector<MPI_Request> done_requests;
+  mutable bool                     exchange_pending = false;
+
+  void
+  free_communication()
+  {
+    if(!done_requests.empty())
+    {
+      const int ierr = MPI_Waitall(done_requests.size(), done_requests.data(), MPI_STATUSES_IGNORE);
+      AssertThrowMPI(ierr);
+      done_requests.clear();
+    }
+    if(comm_done != MPI_COMM_NULL)
+    {
+      const int ierr = MPI_Comm_free(&comm_done);
+      AssertThrowMPI(ierr);
+      comm_done = MPI_COMM_NULL;
+    }
+  }
+
   // 1D shape functions of the normal (index 0, n_t + 1 polynomials) and
   // tangential (index 1, n_t polynomials) direction, evaluated on the two
   // sides of the reference interval, copied from
@@ -829,19 +1316,24 @@ private:
   void
   unpack_and_complete_tensor(Number * recv_buffer, Number * vector_begin) const
   {
-    unpack_ghost_section(recv_buffer, vector_begin);
+    if(!copy_to_recv_buffer.empty() || !done_requests.empty())
+      std::atomic_thread_fence(std::memory_order_acquire);
+    unpack_ghost_section(vector_begin);
 
-    for(const Partner & partner : partners)
+    for(const auto & [data, offset] : copy_to_recv_buffer)
+      std::copy(data, data + data_per_face, recv_buffer + offset);
+
+    for(unsigned int p = 0; p < partners.size(); ++p)
     {
-      const Number * in =
-        recv_buffer + partner.recv_offset + partner.n_ghost_recv + partner.n_faces * data_per_face;
+      const Partner & partner = partners[p];
+      const Number *  in = recv_data[p] + partner.n_ghost_recv + partner.n_faces * data_per_face;
       for(const SupplementRecv & s : partner.supplements_recv)
       {
         const unsigned int face = recv_sender_face[s.slot];
         add_supplement<n_t>(face, s.entity, in, recv_buffer + recv_face_offset[s.slot]);
         in += supplement_size<n_t>(face, s.entity);
       }
-      AssertDimension(in - recv_buffer, partner.recv_offset + partner.recv_size);
+      AssertDimension(in - recv_data[p], partner.recv_size);
     }
 
     constexpr unsigned int n_free = Utilities::pow(n_t, dim - 2);
@@ -862,11 +1354,12 @@ private:
 
   // Write section G into the ghost range of the vector
   void
-  unpack_ghost_section(const Number * recv_buffer, Number * vector_begin) const
+  unpack_ghost_section(Number * vector_begin) const
   {
-    for(const Partner & partner : partners)
+    for(unsigned int p = 0; p < partners.size(); ++p)
     {
-      const Number * in = recv_buffer + partner.recv_offset;
+      const Partner & partner = partners[p];
+      const Number *  in      = recv_data[p];
       std::copy(in,
                 in + partner.n_ghost_recv,
                 vector_begin + n_locally_owned + partner.ghost_recv_start);

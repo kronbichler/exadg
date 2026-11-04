@@ -25,6 +25,10 @@
 #include <deal.II/fe/mapping.h>
 #include <deal.II/matrix_free/matrix_free.h>
 
+#ifdef __linux__
+#  include <sched.h>
+#endif
+
 
 namespace Helper
 {
@@ -47,6 +51,88 @@ print_time(const double        time,
       std::cout << " " << data.avg * 100. / total_time << "%";
     std::cout << std::endl;
   }
+}
+
+
+
+// Number of shared-memory domains (nodes) of the communicator
+inline unsigned int
+n_nodes(const MPI_Comm communicator)
+{
+  MPI_Comm  comm_node;
+  const int rank = dealii::Utilities::MPI::this_mpi_process(communicator);
+  int       ierr =
+    MPI_Comm_split_type(communicator, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &comm_node);
+  AssertThrowMPI(ierr);
+  const unsigned int n_nodes =
+    dealii::Utilities::MPI::sum(dealii::Utilities::MPI::this_mpi_process(comm_node) == 0 ? 1U : 0U,
+                                communicator);
+  ierr = MPI_Comm_free(&comm_node);
+  AssertThrowMPI(ierr);
+  return n_nodes;
+}
+
+
+
+// Like print_time(), but for the average of the time over the processes of
+// each shared-memory domain (node), i.e., minimum, average and maximum over
+// the nodes, with a process of the respective node in brackets. Nothing is
+// printed if there is only one node.
+inline void
+print_time_per_node(const double        time,
+                    const std::string & name,
+                    const MPI_Comm      communicator,
+                    const double        total_time = 0.)
+{
+  MPI_Comm  comm_node;
+  const int rank = dealii::Utilities::MPI::this_mpi_process(communicator);
+  int       ierr =
+    MPI_Comm_split_type(communicator, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &comm_node);
+  AssertThrowMPI(ierr);
+  const double node_average = dealii::Utilities::MPI::sum(time, comm_node) /
+                              dealii::Utilities::MPI::n_mpi_processes(comm_node);
+  ierr = MPI_Comm_free(&comm_node);
+  AssertThrowMPI(ierr);
+  if(n_nodes(communicator) > 1)
+    print_time(node_average, name, communicator, total_time);
+}
+
+
+
+// Print the distribution of the processes over the shared-memory domains
+// (nodes) and the number of CPUs each process may run on according to its
+// affinity mask, which shows how the processes are bound
+inline void
+print_parallel_layout(const MPI_Comm communicator, const std::string & note)
+{
+  MPI_Comm  comm_node;
+  const int rank = dealii::Utilities::MPI::this_mpi_process(communicator);
+  int       ierr =
+    MPI_Comm_split_type(communicator, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &comm_node);
+  AssertThrowMPI(ierr);
+  const auto ranks_per_node = dealii::Utilities::MPI::min_max_avg(
+    static_cast<double>(dealii::Utilities::MPI::n_mpi_processes(comm_node)), communicator);
+  ierr = MPI_Comm_free(&comm_node);
+  AssertThrowMPI(ierr);
+
+  double n_cpus = 0;
+#ifdef __linux__
+  cpu_set_t cpu_set;
+  CPU_ZERO(&cpu_set);
+  if(sched_getaffinity(0, sizeof(cpu_set), &cpu_set) == 0)
+    n_cpus = CPU_COUNT(&cpu_set);
+#endif
+  const auto cpus = dealii::Utilities::MPI::min_max_avg(n_cpus, communicator);
+
+  const unsigned int nodes = n_nodes(communicator);
+  if(rank == 0)
+    std::cout << "Parallel layout: " << dealii::Utilities::MPI::n_mpi_processes(communicator)
+              << " processes on " << nodes << " node(s), "
+              << static_cast<unsigned int>(ranks_per_node.min) << "-"
+              << static_cast<unsigned int>(ranks_per_node.max) << " per node, "
+              << static_cast<unsigned int>(cpus.min) << "-" << static_cast<unsigned int>(cpus.max)
+              << " CPUs in affinity mask per process; " << note << std::endl
+              << std::endl;
 }
 
 // function to convert from a map, with keys associated to the buckets by
