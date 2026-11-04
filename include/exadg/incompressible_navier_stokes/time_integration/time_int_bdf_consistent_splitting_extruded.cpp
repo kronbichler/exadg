@@ -189,12 +189,31 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   // do test for matrix-free operator of optimized kind
   const std::vector<unsigned int> cell_vectorization_category =
     Helper::compute_vectorization_category(pde_operator->get_dof_handler_u().get_triangulation());
+
+  // communicator of the processes in the same shared-memory domain, used by
+  // the RT operators to exchange face data via shared memory; only needed
+  // during setup. Setting the environment variable EXADG_RT_NO_SHARED_MEMORY
+  // selects the exchange via MPI messages for all processes, e.g. for
+  // comparisons.
+  MPI_Comm comm_sm = MPI_COMM_SELF;
+  if(std::getenv("EXADG_RT_NO_SHARED_MEMORY") == nullptr)
+  {
+    const MPI_Comm comm = pde_operator->get_dof_handler_u().get_mpi_communicator();
+    const int      ierr = MPI_Comm_split_type(comm,
+                                         MPI_COMM_TYPE_SHARED,
+                                         dealii::Utilities::MPI::this_mpi_process(comm),
+                                         MPI_INFO_NULL,
+                                         &comm_sm);
+    AssertThrowMPI(ierr);
+  }
+
   op_rt->reinit(*pde_operator->get_mapping(),
                 pde_operator->get_dof_handler_u(),
                 pde_operator->get_constraint_u(),
                 cell_vectorization_category,
                 dealii::QGauss<1>(pde_operator->get_dof_handler_u().get_fe().degree + 1),
-                this->is_test);
+                this->is_test,
+                comm_sm);
 
   op_rt->set_penalty_parameters(pde_operator->get_viscous_kernel_data().IP_factor);
   op_rt->initialize_dof_vector(solution_rt);
@@ -206,7 +225,21 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
                       pde_operator->get_constraint_u(),
                       cell_vectorization_category,
                       dealii::QGauss<1>(pde_operator->get_dof_handler_u().get_fe().degree + 1),
-                      this->is_test);
+                      this->is_test,
+                      comm_sm);
+  if(not this->is_test)
+  {
+    Helper::print_parallel_layout(pde_operator->get_dof_handler_u().get_mpi_communicator(),
+                                  comm_sm != MPI_COMM_SELF ?
+                                    "RT face data via shared memory within nodes" :
+                                    "RT face data via MPI messages only");
+    op_rt_float->print_exchange_statistics();
+  }
+  if(comm_sm != MPI_COMM_SELF)
+  {
+    const int ierr = MPI_Comm_free(&comm_sm);
+    AssertThrowMPI(ierr);
+  }
 
   op_rt_float->set_penalty_parameters(pde_operator->get_viscous_kernel_data().IP_factor);
   op_rt_float->set_parameters(1.0, 0.0);
@@ -947,6 +980,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       const double elapsed_time = timer2.wall_time();
       solve_time += elapsed_time;
       stat_momentum_time_solve_chebyshev.add_sample(elapsed_time);
+      stat_momentum_iterations_cheby.add_sample(n_iterations);
       timer2.restart();
     }
     else
@@ -973,7 +1007,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                                     absolute_residual_target);
 
       double                            min_eig = 0.0, max_eig = 0.0;
-      dealii::SolverCG<VectorTypeFloat> solver_cg(control);
+      dealii::SolverCG<VectorTypeFloat> solver_cg(control, vector_memory_momentum);
       if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
         solver_cg.connect_eigenvalues_slot(
           [&min_eig, &max_eig](const std::vector<double> & eigval) {
@@ -988,6 +1022,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                       velocity_red.back(),
                       velocity_matvec.back(),
                       preconditioner_viscous);
+      if(try_chebyshev_solver)
+        stat_momentum_iterations_cg_help.add_sample(control.last_step());
+      else
+        stat_momentum_iterations_cg.add_sample(control.last_step());
       n_iterations += control.last_step();
       reached_residual = control.last_value();
 
@@ -1156,7 +1194,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       this->pcout << "/" << t_residual << " s, solve " << solve_time + timer2.wall_time() << " s";
     }
 
-    stat_momentum_iterations.add_sample(n_iterations);
     stat_momentum_rhs_norm.add_sample(extrapolate_accuracy.first);
     stat_momentum_residual_start.add_sample(initial_residual);
     stat_momentum_residual_stop.add_sample(reached_residual);
@@ -1348,7 +1385,14 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
 
     iterations_avg.resize(2);
     iterations_avg[0] = stat_pressure_iterations.get_mean();
-    iterations_avg[1] = stat_momentum_iterations.get_mean();
+    iterations_avg[1] =
+      (stat_momentum_iterations_cg.get_mean() * stat_momentum_iterations_cg.get_n_samples() +
+       stat_momentum_iterations_cheby.get_mean() * stat_momentum_iterations_cheby.get_n_samples() +
+       stat_momentum_iterations_cg_help.get_mean() *
+         stat_momentum_iterations_cg_help.get_n_samples()) /
+      (stat_momentum_iterations_cg.get_n_samples() +
+       stat_momentum_iterations_cheby.get_n_samples() +
+       stat_momentum_iterations_cg_help.get_n_samples());
   }
 
   print_list_of_iterations(this->pcout, names, iterations_avg);
@@ -1368,7 +1412,11 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
                                                  &this->mpi_comm);
   stat_pressure_time_solve.print_statistics(this->pcout, "P time solve [s]", 25, &this->mpi_comm);
   this->pcout << std::endl;
-  stat_momentum_iterations.print_statistics(this->pcout, "Momentum iterations", 25);
+  stat_momentum_iterations_cg.print_statistics(this->pcout, "Momentum iterations CG", 25);
+  stat_momentum_iterations_cheby.print_statistics(this->pcout, "Momentum iterations Cheby", 25);
+  stat_momentum_iterations_cg_help.print_statistics(this->pcout,
+                                                    "Momentum iterations CG bk",
+                                                    25);
   stat_momentum_rhs_norm.print_statistics(this->pcout, "U rhs norm", 25);
   stat_momentum_residual_start.print_statistics(this->pcout, "U residual start solve", 25);
   stat_momentum_residual_stop.print_statistics(this->pcout, "U residual end solve", 25);

@@ -304,11 +304,16 @@ public:
          const bool                             is_test,
          const MPI_Comm                         communicator_shared = MPI_COMM_SELF)
   {
-    (void)communicator_shared; // TODO: not yet implemented
     this->is_test                 = is_test;
     this->mapping                 = &mapping;
     this->dof_handler             = &dof_handler;
     const FiniteElement<dim> & fe = dof_handler.get_fe();
+
+    // per cell batch, face and lane: index of the face among the faces
+    // whose data is received from remote processes, used to set up
+    // single_exchange
+    std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>> mpi_exchange_data_on_faces;
+
     AssertThrow(dynamic_cast<const FE_RaviartThomasNodal<dim> *>(&fe),
                 ExcMessage("This class only works for Raviart-Thomas elements. Set "
                            "spatial discretization to HDIV"));
@@ -684,40 +689,56 @@ public:
                            send_data_process,
                            send_data_cell_index,
                            send_data_face_index);
-    if(single_exchange.usable)
+
+    mpi_recv_buffer.clear();
+    mpi_send_buffer.clear();
     {
-      mpi_recv_buffer.clear();
       mpi_recv_buffer.resize_fast(single_exchange.recv_buffer_size);
-      mpi_send_buffer.clear();
-      mpi_send_buffer.resize_fast(single_exchange.send_buffer_size);
       mpi_requests.resize(2 * single_exchange.partners.size());
-    }
-    else
-    {
-      const unsigned int n_t = fe.degree;
-      const unsigned int n_n = n_t + 1;
-      // data: projected to face, values and derivatives of the tangential
-      // components, only derivatives of the normal component (the value is
-      // continuous and thus available on the cell itself)
-      const unsigned int data_per_face =
-        Utilities::pow(n_t, dim - 1) + 2 * n_n * Utilities::pow(n_t, dim - 2) * (dim - 1);
 
-      mpi_requests.resize(send_data_process.size() * 2);
-      mpi_recv_buffer.clear();
-      mpi_recv_buffer.resize_fast(send_data_cell_index.size() * data_per_face);
-      mpi_send_buffer.clear();
-      mpi_send_buffer.resize_fast(send_data_cell_index.size() * data_per_face);
+      // With a shared-memory communicator, the send buffer is allocated in
+      // shared memory, and the partners in the same shared-memory domain
+      // read their messages directly from it.
+      single_exchange.setup_shared_memory(dof_handler.get_mpi_communicator(), communicator_shared);
+      free_communicator_sm();
+      if(communicator_shared != MPI_COMM_SELF)
+      {
+        // keep a duplicate of the shared-memory communicator for the
+        // vectors created by initialize_dof_vector(), which store it
+        const int ierr = MPI_Comm_dup(communicator_shared, &communicator_sm);
+        AssertThrowMPI(ierr);
+      }
+      shared_send_buffer.values = Kokkos::View<Number *, Kokkos::HostSpace>();
+      shared_send_buffer.values_sm_ptr.reset();
+      shared_send_buffer.values_sm.clear();
+      if(communicator_shared != MPI_COMM_SELF)
+      {
+        mpi_shared_memory::allocate_shared_recv_data(shared_send_buffer,
+                                                     single_exchange.send_buffer_size,
+                                                     communicator_shared);
+        single_exchange.set_buffers(mpi_recv_buffer.data(), shared_send_buffer.values_sm);
+      }
+      else
+      {
+        mpi_send_buffer.resize_fast(single_exchange.send_buffer_size);
+        single_exchange.set_buffers(mpi_recv_buffer.data(), {});
+      }
     }
 
-    set_parameters(0., 1.0);
+    set_parameters(0.0, 1.0);
 
     for(double & t : timings)
       t = 0.0;
+    product_timings   = {};
+    time_wait_readers = 0;
   }
 
   ~RaviartThomasOperator()
   {
-    // Nothing to report if reinit() was never called
+    free_communicator_sm();
+
+    // Nothing to report if reinit() was never called, otherwise print
+    // the timing information.
     if(dof_handler == nullptr)
       return;
     const MPI_Comm comm = dof_handler->get_mpi_communicator();
@@ -731,23 +752,37 @@ public:
                   << (std::is_same_v<Number, double> ? "double" : "float") << "> in "
                   << static_cast<unsigned long>(timings[0])
                   << " evaluations [t_total=" << total_time * timings[0] << "s]" << std::endl;
-      Helper::print_time(timings[1] / timings[0],
-                         single_exchange.usable ? "Pack all ghosts and send" :
-                                                  "Update cell ghost values",
-                         comm,
-                         total_time);
+      Helper::print_time(timings[1] / timings[0], "Pack all ghosts and send", comm, total_time);
       if(Utilities::MPI::n_mpi_processes(comm) > 1)
       {
-        Helper::print_time(timings[3] / timings[0],
-                           single_exchange.usable ? "Wait and unpack ghosts" :
-                                                    "Exchange data face ghosts",
-                           comm,
-                           total_time);
+        Helper::print_time(timings[3] / timings[0], "Wait and unpack ghosts", comm, total_time);
         Helper::print_time(timings[4] / timings[0], "Pre-loop before ghosts", comm, total_time);
       }
 
       Helper::print_time(timings[7] / timings[0], "Matrix-free loop", comm, total_time);
-      Helper::print_time(timings[8] / timings[0], "Compress cell ghost values", comm, total_time);
+      Helper::print_time_per_node(timings[7] / timings[0],
+                                  "Matrix-free loop, node avg",
+                                  comm,
+                                  total_time);
+      Helper::print_time((timings[8] - time_wait_readers) / timings[0],
+                         "Compress cell ghost values",
+                         comm,
+                         total_time);
+      if(Utilities::MPI::sum(single_exchange.n_shared_memory_partners(), comm) > 0)
+        Helper::print_time(time_wait_readers / timings[0],
+                           "Wait for readers (shm)",
+                           comm,
+                           total_time);
+
+      // time of the whole product per call, for each variant
+      const std::array<std::string, 3> names = {{"vmult with functions", "vmult", "vmult_scratch"}};
+      for(unsigned int k = 0; k < 3; ++k)
+        if(product_timings[k][0] > 0)
+          Helper::print_time(product_timings[k][1] / product_timings[k][0],
+                             names[k] + " (" +
+                               std::to_string(static_cast<unsigned long>(product_timings[k][0])) +
+                               "x)",
+                             comm);
       if(Utilities::MPI::this_mpi_process(comm) == 0)
         std::cout << std::endl;
     }
@@ -778,7 +813,10 @@ public:
   void
   initialize_dof_vector(VectorType & vec) const
   {
-    vec.reinit(partitioner);
+    // With a shared-memory communicator, the vectors are allocated in
+    // shared memory, so that the processes of the same shared-memory domain
+    // can read each other's locally owned entries
+    vec.reinit(partitioner, communicator_sm);
   }
 
   template<typename VectorType1, typename VectorType2>
@@ -850,9 +888,7 @@ public:
   {
     const unsigned int n_cell_batches = dof_indices.size();
 
-    src.update_ghost_values();
-
-    exchange_data_for_face_integrals<false>(src);
+    exchange_ghosts_and_face_data(src);
 
     // since we just zero out the dst vector, can use the mass list
     for(unsigned int range = cell_loop_pre_list_index[n_cell_batches];
@@ -894,9 +930,11 @@ public:
         AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
     }
 
+    single_exchange.signal_done_reading();
     dst.compress_start(0, VectorOperation::add);
     src.zero_out_ghost_values();
     dst.compress_finish(VectorOperation::add);
+    single_exchange.wait_until_partners_done_reading();
   }
 
   Number
@@ -907,55 +945,7 @@ public:
   {
     const unsigned int n_cell_batches = dof_indices.size();
 
-    if(single_exchange.usable)
-    {
-      // Single communication algorithm: the messages only contain data
-      // computed from locally owned entries, so we can pack them as soon as
-      // the entries touched by the packing have passed through before_loop,
-      // without previously calling 'src.update_ghost_values'.
-      const unsigned int n_partners = single_exchange.partners.size();
-      single_exchange.start_receives(mpi_recv_buffer.data(),
-                                     src.get_mpi_communicator(),
-                                     mpi_requests.data());
-
-      // ghost entities must not contribute to the packed face data
-      Assert(src.has_ghost_elements() == false, ExcInternalError());
-
-      const unsigned int n_t = shape_info.data[0].fe_degree;
-      if(n_t == 2)
-        single_exchange_pack_and_send<2>(src);
-      else if(n_t == 3)
-        single_exchange_pack_and_send<3>(src);
-      else if(n_t == 4)
-        single_exchange_pack_and_send<4>(src);
-#ifndef DEBUG
-      else if(n_t == 5)
-        single_exchange_pack_and_send<5>(src);
-      else if(n_t == 6)
-        single_exchange_pack_and_send<6>(src);
-      else if(n_t == 7)
-        single_exchange_pack_and_send<7>(src);
-      else if(n_t == 8)
-        single_exchange_pack_and_send<8>(src);
-      else if(n_t == 9)
-        single_exchange_pack_and_send<9>(src);
-#endif
-      else
-        AssertThrow(false, ExcNotImplemented());
-
-      if(n_partners > 0)
-      {
-        const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
-        AssertThrowMPI(ierr);
-      }
-      single_exchange.unpack_and_complete(mpi_recv_buffer.data(),
-                                          const_cast<Number *>(src.begin()));
-    }
-    else
-    {
-      src.update_ghost_values();
-      exchange_data_for_face_integrals<true>(src);
-    }
+    exchange_ghosts_and_face_data(src);
 
     // since we just zero out the dst vector, can use the mass list
     for(unsigned int range = cell_loop_pre_list_index[n_cell_batches];
@@ -1010,9 +1000,11 @@ public:
         cfl_factor = std::max(cfl_factor, convective_cfl[v]);
     }
 
+    single_exchange.signal_done_reading();
     velocity_dst.compress_start(0, VectorOperation::add);
     src.zero_out_ghost_values();
     velocity_dst.compress_finish(VectorOperation::add);
+    single_exchange.wait_until_partners_done_reading();
 
     return Utilities::MPI::max(cfl_factor, divergence.get_mpi_communicator());
   }
@@ -1121,13 +1113,14 @@ public:
         ++range)
       before_loop(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
 
-    if(factor_laplace != 0. && single_exchange.usable)
+    if(factor_laplace != 0.)
     {
       // Single communication algorithm: the messages only contain data
       // computed from locally owned entries, so we can pack them as soon as
       // the entries touched by the packing have passed through before_loop,
       // without previously calling 'src.update_ghost_values'.
       const unsigned int n_partners = single_exchange.partners.size();
+      check_source_vector_is_shared(src);
       single_exchange.start_receives(mpi_recv_buffer.data(),
                                      src.get_mpi_communicator(),
                                      mpi_requests.data());
@@ -1154,29 +1147,6 @@ public:
       }
       single_exchange.unpack_and_complete(mpi_recv_buffer.data(),
                                           const_cast<Number *>(src.begin()));
-      timings[3] += time.wall_time();
-    }
-    else if(factor_laplace != 0.)
-    {
-      // Two-step data communication for the Laplacian, first filling all cell
-      // values that then get sent as compressed face data to the other
-      // process
-      src.update_ghost_values_start();
-      timings[1] += time.wall_time();
-      time.restart();
-
-      for(unsigned int range = cell_loop_pre_list_index[n_cell_batches + 1];
-          range < cell_loop_pre_list_index[n_cell_batches + 2];
-          ++range)
-        before_loop(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
-
-      timings[4] += time.wall_time();
-      time.restart();
-      src.update_ghost_values_finish();
-      timings[1] += time.wall_time();
-
-      time.restart();
-      exchange_data_for_face_integrals<true>(src);
       timings[3] += time.wall_time();
     }
     else
@@ -1214,9 +1184,11 @@ public:
       timings[12] += time.wall_time();
 
     time.restart();
+    single_exchange.signal_done_reading();
     dst.compress_start(0, VectorOperation::add);
     src.zero_out_ghost_values();
     dst.compress_finish(VectorOperation::add);
+    wait_for_readers();
 
     for(unsigned int range = cell_loop_post_list_index[n_cell_batches];
         range < cell_loop_post_list_index[n_cell_batches + 1];
@@ -1227,6 +1199,8 @@ public:
     {
       timings[8] += time.wall_time();
       timings[9] += total_timer.wall_time();
+      product_timings[0][0] += 1;
+      product_timings[0][1] += total_timer.wall_time();
     }
     else
     {
@@ -1293,9 +1267,11 @@ public:
       timings[12] += time.wall_time();
 
     time.restart();
+    single_exchange.signal_done_reading();
     dst.compress_start(0, VectorOperation::add);
     src.zero_out_ghost_values();
     dst.compress_finish(VectorOperation::add);
+    wait_for_readers();
 
     for(unsigned int range = cell_loop_post_list_index[n_cell_batches];
         range < cell_loop_post_list_index[n_cell_batches + 1];
@@ -1306,6 +1282,8 @@ public:
     {
       timings[8] += time.wall_time();
       timings[9] += total_timer.wall_time();
+      product_timings[1][0] += 1;
+      product_timings[1][1] += total_timer.wall_time();
     }
     else
     {
@@ -1344,18 +1322,82 @@ public:
       timings[12] += time.wall_time();
 
     time.restart();
+    single_exchange.signal_done_reading();
     scratch.finish_loop(after_loop, [&]() { src.zero_out_ghost_values(); });
+    wait_for_readers();
 
     if(factor_laplace != 0)
     {
       timings[8] += time.wall_time();
       timings[9] += total_timer.wall_time();
+      product_timings[2][0] += 1;
+      product_timings[2][1] += total_timer.wall_time();
     }
     else
     {
       timings[13] += time.wall_time();
       timings[14] += total_timer.wall_time();
     }
+  }
+
+  // Print the setup of the data exchange: the number of neighboring
+  // processes in the same and in other shared-memory domains, the share of
+  // the faces to cells on other processes whose cell is read directly in
+  // shared memory, and the size of the messages sent per product to the
+  // other shared-memory domains
+  void
+  print_exchange_statistics() const
+  {
+    const MPI_Comm comm         = dof_handler->get_mpi_communicator();
+    unsigned int   n_on_node    = 0;
+    double         bytes_remote = 0;
+    for(const auto & partner : single_exchange.partners)
+      if(partner.sm_rank != numbers::invalid_unsigned_int)
+        ++n_on_node;
+      else
+        bytes_remote += partner.send_size * sizeof(Number);
+    const auto [n_faces, n_faces_shared] = n_remote_faces();
+
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << "Data exchange of RT operator <"
+                << (std::is_same_v<Number, double> ? "double" : "float")
+                << "> per process:" << std::endl;
+    Helper::print_time(n_on_node, "Neighbors on same node", comm);
+    Helper::print_time(single_exchange.partners.size() - n_on_node,
+                       "Neighbors on other nodes",
+                       comm);
+    Helper::print_time(n_faces, "Faces to remote cells", comm);
+    Helper::print_time(n_faces > 0 ? double(n_faces_shared) / n_faces : 1.,
+                       "Share read in shared memory",
+                       comm);
+    Helper::print_time(bytes_remote / 1024., "Sent to other nodes [KiB]", comm);
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << std::endl;
+  }
+
+  // Number of faces to cells on other processes, and the number of those
+  // whose cell can be read directly in shared memory
+  std::pair<unsigned int, unsigned int>
+  n_remote_faces() const
+  {
+    return {single_exchange.recv_face_offset.size(), single_exchange.n_slots_in_shared_memory()};
+  }
+
+  // Check the locations of the entities of remote cells in shared memory
+  // with a vector created by initialize_dof_vector() whose locally owned
+  // entries hold their global index, returning the number of mismatches
+  unsigned int
+  count_wrong_remote_cell_entities(const VectorType & global_indices) const
+  {
+    return single_exchange.count_wrong_remote_cell_entities(global_indices);
+  }
+
+  // Number of neighboring processes whose face data is read directly from
+  // shared memory, see reinit()
+  unsigned int
+  n_shared_memory_partners() const
+  {
+    return single_exchange.n_shared_memory_partners();
   }
 
   void
@@ -1399,7 +1441,7 @@ public:
   {
     return MemoryConsumption::memory_consumption(dof_indices) +
            MemoryConsumption::memory_consumption(neighbor_cells) +
-           MemoryConsumption::memory_consumption(mpi_exchange_data_on_faces) +
+           MemoryConsumption::memory_consumption(single_exchange.remote_face_data) +
            MemoryConsumption::memory_consumption(mpi_recv_buffer) +
            MemoryConsumption::memory_consumption(mpi_send_buffer) +
            MemoryConsumption::memory_consumption(all_owned_faces) +
@@ -1804,11 +1846,50 @@ private:
   ObserverPointer<const DoFHandler<dim>>                           dof_handler;
   std::vector<dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes>> dof_indices;
   std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>>     neighbor_cells;
-  std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>>     mpi_exchange_data_on_faces;
   mutable std::vector<MPI_Request>                                 mpi_requests;
   mutable AlignedVector<Number>                                    mpi_recv_buffer;
   mutable AlignedVector<Number>                                    mpi_send_buffer;
-  Table<2, unsigned char>                                          all_owned_faces;
+
+  // duplicate of the shared-memory communicator passed to reinit(), or
+  // MPI_COMM_SELF, used to allocate the vectors in shared memory
+  MPI_Comm communicator_sm = MPI_COMM_SELF;
+
+  void
+  free_communicator_sm()
+  {
+    if(communicator_sm != MPI_COMM_SELF)
+    {
+      const int ierr = MPI_Comm_free(&communicator_sm);
+      AssertThrowMPI(ierr);
+      communicator_sm = MPI_COMM_SELF;
+    }
+  }
+
+  // Check that the source vector of a product with face integrals is
+  // allocated in shared memory if a shared-memory communicator was given,
+  // i.e., created by initialize_dof_vector() or with reinit() from such a
+  // vector
+  void
+  check_source_vector_is_shared(const VectorType & src) const
+  {
+    if(communicator_sm != MPI_COMM_SELF)
+      AssertThrow(src.shared_vector_data().size() ==
+                    Utilities::MPI::n_mpi_processes(communicator_sm),
+                  ExcMessage("The source vector is not allocated in shared memory; create it "
+                             "with initialize_dof_vector() of this operator"));
+  }
+
+  // send buffer of the single exchange in shared memory, see reinit()
+  MemorySpace::MemorySpaceData<Number, MemorySpace::Host> shared_send_buffer;
+
+  Number *
+  single_exchange_send_buffer() const
+  {
+    return shared_send_buffer.values.size() > 0 ?
+             const_cast<Number *>(shared_send_buffer.values.data()) :
+             mpi_send_buffer.data();
+  }
+  Table<2, unsigned char> all_owned_faces;
 
   std::vector<std::pair<unsigned int, std::array<unsigned int, n_lanes>>>
     cells_at_dirichlet_boundary;
@@ -1816,6 +1897,22 @@ private:
   std::shared_ptr<const Utilities::MPI::Partitioner> partitioner;
 
   mutable std::array<double, 15> timings;
+
+  // number of calls and accumulated time of the products with the Laplace
+  // part for the variants vmult() with functions, vmult_before_on_dst() and
+  // vmult_scratch(), and the time waiting for the processes reading the
+  // source vector in shared memory at the end of these products
+  mutable std::array<std::array<double, 2>, 3> product_timings   = {};
+  mutable double                               time_wait_readers = 0;
+
+  void
+  wait_for_readers() const
+  {
+    Timer time;
+    single_exchange.wait_until_partners_done_reading();
+    if(factor_laplace != 0.)
+      time_wait_readers += time.wall_time();
+  }
 
   Number factor_mass;
   Number factor_laplace;
@@ -1871,9 +1968,10 @@ private:
   exchange_ghosts_overlapped(const VectorType & src, const std::function<void()> & work) const
   {
     Timer time;
-    if(factor_laplace != 0. && single_exchange.usable)
+    if(factor_laplace != 0.)
     {
       const unsigned int n_partners = single_exchange.partners.size();
+      check_source_vector_is_shared(src);
       single_exchange.start_receives(mpi_recv_buffer.data(),
                                      src.get_mpi_communicator(),
                                      mpi_requests.data());
@@ -1898,23 +1996,6 @@ private:
                                           const_cast<Number *>(src.begin()));
       timings[3] += time.wall_time();
     }
-    else if(factor_laplace != 0.)
-    {
-      src.update_ghost_values_start();
-      timings[1] += time.wall_time();
-      time.restart();
-
-      work();
-      timings[4] += time.wall_time();
-      time.restart();
-
-      src.update_ghost_values_finish();
-      timings[1] += time.wall_time();
-      time.restart();
-
-      exchange_data_for_face_integrals<true>(src);
-      timings[3] += time.wall_time();
-    }
     else
     {
       src.update_ghost_values_start();
@@ -1922,6 +2003,35 @@ private:
       src.update_ghost_values_finish();
       timings[11] += time.wall_time();
     }
+  }
+
+  // Exchange the ghost values of src and the face data of the cells next to
+  // remote processes with the single exchange, for the loops in which src
+  // is final upon entry
+  void
+  exchange_ghosts_and_face_data(const VectorType & src) const
+  {
+    const unsigned int n_partners = single_exchange.partners.size();
+    check_source_vector_is_shared(src);
+    single_exchange.start_receives(mpi_recv_buffer.data(),
+                                   src.get_mpi_communicator(),
+                                   mpi_requests.data());
+
+    // ghost entities must not contribute to the packed face data
+    Assert(src.has_ghost_elements() == false, ExcInternalError());
+
+    dispatch_single_exchange_pack_and_send(src);
+
+    if(n_partners > 0)
+    {
+      const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+      AssertThrowMPI(ierr);
+    }
+    single_exchange.unpack_and_complete(mpi_recv_buffer.data(), const_cast<Number *>(src.begin()));
+
+    // the ghost range now holds the ghost values, reset by the caller with
+    // zero_out_ghost_values()
+    src.set_ghost_state(true);
   }
 
   void
@@ -1987,22 +2097,24 @@ private:
 
   // Pack the messages of the single exchange from locally owned entries of
   // src and send them; the face data is evaluated with the regular indices
-  // while the ghost range of src is zero, in the same format as in
-  // vmult_pack_and_send_data()
+  // while the ghost range of src is zero, in the layout described in
+  // SingleExchange::Data
   template<int n_t>
   void
   single_exchange_pack_and_send(const VectorType & src) const
   {
+    single_exchange.wait_until_partners_done_reading();
     const auto & partners    = single_exchange.partners;
-    Number *     send_buffer = mpi_send_buffer.data();
+    Number *     send_buffer = single_exchange_send_buffer();
     for(unsigned int p = 0; p < partners.size(); ++p)
     {
       const auto & partner = partners[p];
       single_exchange.pack_ghost_section(partner, src.begin(), send_buffer);
-      pack_face_data<n_t>(src.begin(),
-                          partner.first_face,
-                          partner.first_face + partner.n_faces,
-                          single_exchange.face_section(partner, send_buffer));
+      if(!partner.faces_read_directly)
+        pack_face_data<n_t>(src.begin(),
+                            partner.first_face,
+                            partner.first_face + partner.n_faces,
+                            single_exchange.face_section(partner, send_buffer));
       single_exchange.pack_supplement_section(partner, src.begin(), send_buffer);
       single_exchange.start_send(p,
                                  send_buffer,
@@ -2835,12 +2947,61 @@ private:
       }
   }
 
+  // Pointers to the first entry of the entities (faces and cell interior)
+  // of the cells in all lanes, given by their indices into the vector
+  // starting at 'src', with nullptr for constrained entities. The face
+  // reading functions take the entities as pointers, so that they can also
+  // read cells of other processes directly in shared memory.
+  dealii::ndarray<const Number *, 2 * dim + 1, n_lanes>
+  entity_pointers(const Number *                                              src,
+                  const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & indices) const
+  {
+    dealii::ndarray<const Number *, 2 * dim + 1, n_lanes> entities;
+    for(unsigned int e = 0; e < 2 * dim + 1; ++e)
+      for(unsigned int v = 0; v < n_lanes; ++v)
+        entities[e][v] =
+          indices[e][v] == numbers::invalid_unsigned_int ? nullptr : src + indices[e][v];
+    return entities;
+  }
+
+  // Replace the entities of the lanes whose neighbor across 'face' is a
+  // cell of another process in the same shared-memory domain by pointers
+  // into the source vector of the processes owning the entities
+  void
+  set_remote_cell_entities(const VectorType &                                      src,
+                           const unsigned int                                      cell,
+                           const unsigned int                                      face,
+                           dealii::ndarray<const Number *, 2 * dim + 1, n_lanes> & entities) const
+  {
+    const auto & locations   = single_exchange.remote_cell_locations[cell][face];
+    const auto & shared_data = src.shared_vector_data();
+    for(unsigned int v = 0; v < n_lanes; ++v)
+      if(const auto * location = locations[v])
+        for(unsigned int e = 0; e < 2 * dim + 1; ++e)
+          entities[e][v] = (*location)[e].sm_rank == numbers::invalid_unsigned_int ?
+                             nullptr :
+                             shared_data[(*location)[e].sm_rank].data() + (*location)[e].offset;
+  }
+
+  // Load 'n_entries' entries starting 'shift' entries after the start of
+  // the entity in each lane and transpose them into 'out'
+  static void
+  load_and_transpose(const unsigned int                          n_entries,
+                     const std::array<const Number *, n_lanes> & entity,
+                     const unsigned int                          shift,
+                     VectorizedArray<Number> *                   out)
+  {
+    std::array<const Number *, n_lanes> pointers;
+    for(unsigned int v = 0; v < n_lanes; ++v)
+      pointers[v] = entity[v] + shift;
+    vectorized_load_and_transpose(n_entries, pointers, out);
+  }
+
   template<int n_t>
   void
-  read_face_values(const Number *                                              src_vector,
-                   const unsigned int                                          face,
-                   const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dof_indices,
-                   VectorizedArray<Number> *                                   out) const
+  read_face_values(const dealii::ndarray<const Number *, 2 * dim + 1, n_lanes> & entities,
+                   const unsigned int                                            face,
+                   VectorizedArray<Number> *                                     out) const
   {
     const unsigned int face_direction = face / 2;
     const unsigned int side           = face % 2;
@@ -2876,24 +3037,24 @@ private:
 
       // check if indices unconstrained
       bool all_indices_unconstrained = true;
-      for(const unsigned int i : dof_indices[f])
-        if(i == numbers::invalid_unsigned_int)
+      for(const Number * ptr : entities[f])
+        if(ptr == nullptr)
         {
           all_indices_unconstrained = false;
           break;
         }
       if(all_indices_unconstrained)
-        vectorized_load_and_transpose(dofs_per_face, src_vector, dof_indices[f].data(), data_f[f]);
+        load_and_transpose(dofs_per_face, entities[f], 0, data_f[f]);
       else
       {
         for(unsigned int i = 0; i < dofs_per_face; ++i)
           data_f[f][i] = 0;
         for(unsigned int v = 0; v < n_lanes; ++v)
         {
-          const unsigned int idx = dof_indices[f][v];
-          if(idx != numbers::invalid_unsigned_int)
+          const Number * ptr = entities[f][v];
+          if(ptr != nullptr)
             for(unsigned int i = 0; i < dofs_per_face; ++i)
-              data_f[f][i][v] = src_vector[idx + i];
+              data_f[f][i][v] = ptr[i];
         }
       }
     }
@@ -2901,10 +3062,7 @@ private:
     {
       for(unsigned int i2 = 0; i2 < (dim > 2 ? n_t : 1); ++i2)
       {
-        vectorized_load_and_transpose(dofs_per_plane,
-                                      src_vector + i2 * dofs_per_plane,
-                                      dof_indices[2 * dim].data(),
-                                      data_cell);
+        load_and_transpose(dofs_per_plane, entities[2 * dim], i2 * dofs_per_plane, data_cell);
         if(face_direction == 0)
         {
           VectorizedArray<Number> * out_grad = out + i2 * n_t;
@@ -2979,7 +3137,7 @@ private:
         {
           const unsigned int      i = std::min(i2, dofs_per_plane - 4);
           VectorizedArray<Number> entries[4];
-          vectorized_load_and_transpose(4, src_vector + i, dof_indices[2 * dim].data(), entries);
+          load_and_transpose(4, entities[2 * dim], i, entries);
           std::array<VectorizedArray<Number>, 4> sum_v, sum_g;
           for(unsigned int e = 0; e < 4; ++e)
           {
@@ -2988,10 +3146,7 @@ private:
           }
           for(unsigned int i1 = 1; i1 < n_t; ++i1)
           {
-            vectorized_load_and_transpose(4,
-                                          src_vector + i + i1 * dofs_per_plane,
-                                          dof_indices[2 * dim].data(),
-                                          entries);
+            load_and_transpose(4, entities[2 * dim], i + i1 * dofs_per_plane, entries);
             for(unsigned int e = 0; e < 4; ++e)
             {
               sum_v[e] += entries[e] * shape_data_t[i1];
@@ -3007,10 +3162,7 @@ private:
       else
       {
         VectorizedArray<Number> tmp[cell_dofs_per_comp];
-        vectorized_load_and_transpose(cell_dofs_per_comp,
-                                      src_vector,
-                                      dof_indices[2 * dim].data(),
-                                      tmp);
+        load_and_transpose(cell_dofs_per_comp, entities[2 * dim], 0, tmp);
         for(unsigned int i2 = 0; i2 < dofs_per_plane; ++i2)
         {
           VectorizedArray<Number> sum_v = tmp[i2] * shape_data_t[0];
@@ -3036,27 +3188,24 @@ private:
 
       // check if indices unconstrained
       bool all_indices_unconstrained = true;
-      for(const unsigned int i : dof_indices[2 + f])
-        if(i == numbers::invalid_unsigned_int)
+      for(const Number * ptr : entities[2 + f])
+        if(ptr == nullptr)
         {
           all_indices_unconstrained = false;
           break;
         }
       if(all_indices_unconstrained)
-        vectorized_load_and_transpose(dofs_per_face,
-                                      src_vector,
-                                      dof_indices[f + 2].data(),
-                                      data_f[f]);
+        load_and_transpose(dofs_per_face, entities[f + 2], 0, data_f[f]);
       else
       {
         for(unsigned int i = 0; i < dofs_per_face; ++i)
           data_f[f][i] = 0;
         for(unsigned int v = 0; v < n_lanes; ++v)
         {
-          const unsigned int idx = dof_indices[f + 2][v];
-          if(idx != numbers::invalid_unsigned_int)
+          const Number * ptr = entities[f + 2][v];
+          if(ptr != nullptr)
             for(unsigned int i = 0; i < dofs_per_face; ++i)
-              data_f[f][i][v] = src_vector[idx + i];
+              data_f[f][i][v] = ptr[i];
         }
       }
     }
@@ -3064,10 +3213,10 @@ private:
     {
       for(unsigned int i2 = 0; i2 < (dim > 2 ? n_t : 1); ++i2)
       {
-        vectorized_load_and_transpose(dofs_per_plane,
-                                      src_vector + cell_dofs_per_comp + i2 * dofs_per_plane,
-                                      dof_indices[2 * dim].data(),
-                                      data_cell);
+        load_and_transpose(dofs_per_plane,
+                           entities[2 * dim],
+                           cell_dofs_per_comp + i2 * dofs_per_plane,
+                           data_cell);
         if(face_direction == 0)
         {
           VectorizedArray<Number> * out_val  = out + i2 * n_n;
@@ -3142,10 +3291,7 @@ private:
         {
           const unsigned int      i = std::min(i2, dofs_per_plane - 4);
           VectorizedArray<Number> entries[4];
-          vectorized_load_and_transpose(4,
-                                        src_vector + cell_dofs_per_comp + i,
-                                        dof_indices[2 * dim].data(),
-                                        entries);
+          load_and_transpose(4, entities[2 * dim], cell_dofs_per_comp + i, entries);
           std::array<VectorizedArray<Number>, 4> sum_v, sum_g;
           for(unsigned int e = 0; e < 4; ++e)
           {
@@ -3154,10 +3300,10 @@ private:
           }
           for(unsigned int i1 = 1; i1 < n_t; ++i1)
           {
-            vectorized_load_and_transpose(4,
-                                          src_vector + cell_dofs_per_comp + i + i1 * dofs_per_plane,
-                                          dof_indices[2 * dim].data(),
-                                          entries);
+            load_and_transpose(4,
+                               entities[2 * dim],
+                               cell_dofs_per_comp + i + i1 * dofs_per_plane,
+                               entries);
             for(unsigned int e = 0; e < 4; ++e)
             {
               sum_v[e] += entries[e] * shape_data_t[i1];
@@ -3173,10 +3319,7 @@ private:
       else
       {
         VectorizedArray<Number> tmp[cell_dofs_per_comp];
-        vectorized_load_and_transpose(cell_dofs_per_comp,
-                                      src_vector + cell_dofs_per_comp,
-                                      dof_indices[2 * dim].data(),
-                                      tmp);
+        load_and_transpose(cell_dofs_per_comp, entities[2 * dim], cell_dofs_per_comp, tmp);
         for(unsigned int i2 = 0; i2 < dofs_per_plane; ++i2)
         {
           VectorizedArray<Number> sum_v = tmp[i2] * shape_data_t[0];
@@ -3202,27 +3345,24 @@ private:
         {
           // check if indices unconstrained
           bool all_indices_unconstrained = true;
-          for(const unsigned int i : dof_indices[4 + f])
-            if(i == numbers::invalid_unsigned_int)
+          for(const Number * ptr : entities[4 + f])
+            if(ptr == nullptr)
             {
               all_indices_unconstrained = false;
               break;
             }
           if(all_indices_unconstrained)
-            vectorized_load_and_transpose(dofs_per_face,
-                                          src_vector,
-                                          dof_indices[f + 4].data(),
-                                          data_cell);
+            load_and_transpose(dofs_per_face, entities[f + 4], 0, data_cell);
           else
           {
             for(unsigned int i = 0; i < dofs_per_face; ++i)
               data_cell[i] = 0;
             for(unsigned int v = 0; v < n_lanes; ++v)
             {
-              const unsigned int idx = dof_indices[f + 4][v];
-              if(idx != numbers::invalid_unsigned_int)
+              const Number * ptr = entities[f + 4][v];
+              if(ptr != nullptr)
                 for(unsigned int i = 0; i < dofs_per_face; ++i)
-                  data_cell[i][v] = src_vector[idx + i];
+                  data_cell[i][v] = ptr[i];
             }
           }
           if(face_direction == 0)
@@ -3254,10 +3394,10 @@ private:
         }
         for(unsigned int i2 = 0; i2 < n_t - 1; ++i2)
         {
-          vectorized_load_and_transpose(dofs_per_face,
-                                        src_vector + 2 * cell_dofs_per_comp + i2 * dofs_per_face,
-                                        dof_indices[2 * dim].data(),
-                                        data_cell);
+          load_and_transpose(dofs_per_face,
+                             entities[2 * dim],
+                             2 * cell_dofs_per_comp + i2 * dofs_per_face,
+                             data_cell);
           if(face_direction == 0)
             for(unsigned int i1 = 0; i1 < n_t; ++i1)
             {
@@ -3293,27 +3433,24 @@ private:
         {
           // check if indices unconstrained
           bool all_indices_unconstrained = true;
-          for(const unsigned int i : dof_indices[4 + f])
-            if(i == numbers::invalid_unsigned_int)
+          for(const Number * ptr : entities[4 + f])
+            if(ptr == nullptr)
             {
               all_indices_unconstrained = false;
               break;
             }
           if(all_indices_unconstrained)
-            vectorized_load_and_transpose(dofs_per_face,
-                                          src_vector,
-                                          dof_indices[f + 4].data(),
-                                          data_f[f]);
+            load_and_transpose(dofs_per_face, entities[f + 4], 0, data_f[f]);
           else
           {
             for(unsigned int i = 0; i < dofs_per_face; ++i)
               data_f[f][i] = 0;
             for(unsigned int v = 0; v < n_lanes; ++v)
             {
-              const unsigned int idx = dof_indices[f + 4][v];
-              if(idx != numbers::invalid_unsigned_int)
+              const Number * ptr = entities[f + 4][v];
+              if(ptr != nullptr)
                 for(unsigned int i = 0; i < dofs_per_face; ++i)
-                  data_f[f][i][v] = src_vector[idx + i];
+                  data_f[f][i][v] = ptr[i];
             }
           }
         }
@@ -3327,11 +3464,10 @@ private:
           for(unsigned int i1 = 0; i1 < n_t - 1; ++i1)
           {
             VectorizedArray<Number> entries[4];
-            vectorized_load_and_transpose(4,
-                                          src_vector + 2 * cell_dofs_per_comp + i +
-                                            i1 * dofs_per_face,
-                                          dof_indices[2 * dim].data(),
-                                          entries);
+            load_and_transpose(4,
+                               entities[2 * dim],
+                               2 * cell_dofs_per_comp + i + i1 * dofs_per_face,
+                               entries);
             for(unsigned int e = 0; e < 4; ++e)
               sum_g[e] += entries[e] * shape_data_n[n_n + i1 + 1];
           }
@@ -3359,11 +3495,10 @@ private:
 
   template<int n_t, typename Number2>
   void
-  read_face_values_only(const VectorType &                                          src,
-                        const unsigned int                                          face,
-                        const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dof_indices,
-                        const unsigned int                                          lane,
-                        Number2 *                                                   out) const
+  read_face_values_only(const dealii::ndarray<const Number *, 2 * dim + 1, n_lanes> & entities,
+                        const unsigned int                                            face,
+                        const unsigned int                                            lane,
+                        Number2 *                                                     out) const
   {
     constexpr unsigned int n_n               = n_t + 1;
     constexpr unsigned int hex_dofs_per_comp = Utilities::pow(n_t, dim - 1) * (n_t - 1);
@@ -3375,48 +3510,54 @@ private:
     if(face / 2 == 0)
     {
       const unsigned int start = (face % 2) * (n_t - 1);
-      unsigned int       idx   = dof_indices[2][lane] + start;
-      if(dof_indices[2][lane] != numbers::invalid_unsigned_int)
+      const Number *     ptr   = entities[2][lane];
+      unsigned int       idx   = start;
+      if(ptr != nullptr)
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
-          write_vectorized_value(src.local_element(idx + i * n_t), lane, out[i * n_n]);
+          write_vectorized_value(ptr[idx + i * n_t], lane, out[i * n_n]);
       else
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
           write_vectorized_value(0.0, lane, out[i * n_n]);
-      idx = dof_indices[3][lane] + start;
-      if(dof_indices[3][lane] != numbers::invalid_unsigned_int)
+      ptr = entities[3][lane];
+      idx = start;
+      if(ptr != nullptr)
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
-          write_vectorized_value(src.local_element(idx + i * n_t), lane, out[i * n_n + n_t]);
+          write_vectorized_value(ptr[idx + i * n_t], lane, out[i * n_n + n_t]);
       else
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
           write_vectorized_value(0.0, lane, out[i * n_n + n_t]);
-      idx = dof_indices[2 * dim][lane] + hex_dofs_per_comp + start;
+      ptr = entities[2 * dim][lane];
+      idx = hex_dofs_per_comp + start;
       for(unsigned int i1 = 0; i1 < (dim == 3 ? n_t : 1); ++i1)
         for(unsigned int i0 = 0; i0 < n_t - 1; ++i0)
-          write_vectorized_value(src.local_element(idx + (i1 * (n_t - 1) + i0) * n_t),
+          write_vectorized_value(ptr[idx + (i1 * (n_t - 1) + i0) * n_t],
                                  lane,
                                  out[i1 * n_n + i0 + 1]);
       out += Utilities::pow(n_t, dim - 2) * n_n;
 
       if constexpr(dim == 3)
       {
-        idx = dof_indices[4][lane] + start;
-        if(dof_indices[4][lane] != numbers::invalid_unsigned_int)
+        ptr = entities[4][lane];
+        idx = start;
+        if(ptr != nullptr)
           for(unsigned int i = 0; i < n_t; ++i)
-            write_vectorized_value(src.local_element(idx + i * n_t), lane, out[i]);
+            write_vectorized_value(ptr[idx + i * n_t], lane, out[i]);
         else
           for(unsigned int i = 0; i < n_t; ++i)
             write_vectorized_value(0.0, lane, out[i]);
-        idx = dof_indices[5][lane] + start;
-        if(dof_indices[5][lane] != numbers::invalid_unsigned_int)
+        ptr = entities[5][lane];
+        idx = start;
+        if(ptr != nullptr)
           for(unsigned int i = 0; i < n_t; ++i)
-            write_vectorized_value(src.local_element(idx + i * n_t), lane, out[n_t * n_t + i]);
+            write_vectorized_value(ptr[idx + i * n_t], lane, out[n_t * n_t + i]);
         else
           for(unsigned int i = 0; i < n_t; ++i)
             write_vectorized_value(0.0, lane, out[n_t * n_t + i]);
-        idx = dof_indices[2 * dim][lane] + 2 * hex_dofs_per_comp + start;
+        ptr = entities[2 * dim][lane];
+        idx = 2 * hex_dofs_per_comp + start;
         for(unsigned int i1 = 0; i1 < n_t - 1; ++i1)
           for(unsigned int i0 = 0; i0 < n_t; ++i0)
-            write_vectorized_value(src.local_element(idx + (i1 * n_t + i0) * n_t),
+            write_vectorized_value(ptr[idx + (i1 * n_t + i0) * n_t],
                                    lane,
                                    out[(i1 + 1) * n_t + i0]);
       }
@@ -3424,157 +3565,105 @@ private:
     else if(face / 2 == 1)
     {
       const unsigned int start = (face % 2) * (n_t - 1);
-      unsigned int       idx   = dof_indices[0][lane] + start;
-      if(dof_indices[0][lane] != numbers::invalid_unsigned_int)
+      const Number *     ptr   = entities[0][lane];
+      unsigned int       idx   = start;
+      if(ptr != nullptr)
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
-          write_vectorized_value(src.local_element(idx + i * n_t), lane, out[i * n_n]);
+          write_vectorized_value(ptr[idx + i * n_t], lane, out[i * n_n]);
       else
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
           write_vectorized_value(0.0, lane, out[i * n_n]);
-      idx = dof_indices[1][lane] + start;
-      if(dof_indices[1][lane] != numbers::invalid_unsigned_int)
+      ptr = entities[1][lane];
+      idx = start;
+      if(ptr != nullptr)
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
-          write_vectorized_value(src.local_element(idx + i * n_t), lane, out[i * n_n + n_t]);
+          write_vectorized_value(ptr[idx + i * n_t], lane, out[i * n_n + n_t]);
       else
         for(unsigned int i = 0; i < (dim == 3 ? n_t : 1); ++i)
           write_vectorized_value(0.0, lane, out[i * n_n + n_t]);
-      idx = dof_indices[2 * dim][lane] + start * (n_t - 1);
+      ptr = entities[2 * dim][lane];
+      idx = start * (n_t - 1);
       for(unsigned int i1 = 0; i1 < (dim == 3 ? n_t : 1); ++i1)
         for(unsigned int i0 = 0; i0 < n_t - 1; ++i0)
-          write_vectorized_value(src.local_element(idx + i1 * (n_t - 1) * n_t + i0),
+          write_vectorized_value(ptr[idx + i1 * (n_t - 1) * n_t + i0],
                                  lane,
                                  out[i1 * n_n + i0 + 1]);
       out += Utilities::pow(n_t, dim - 2) * n_n;
 
       if constexpr(dim == 3)
       {
-        idx = dof_indices[4][lane] + start * n_t;
-        if(dof_indices[4][lane] != numbers::invalid_unsigned_int)
+        ptr = entities[4][lane];
+        idx = start * n_t;
+        if(ptr != nullptr)
           for(unsigned int i = 0; i < n_t; ++i)
-            write_vectorized_value(src.local_element(idx + i), lane, out[i]);
+            write_vectorized_value(ptr[idx + i], lane, out[i]);
         else
           for(unsigned int i = 0; i < n_t; ++i)
             write_vectorized_value(0.0, lane, out[i]);
-        idx = dof_indices[5][lane] + start * n_t;
-        if(dof_indices[5][lane] != numbers::invalid_unsigned_int)
+        ptr = entities[5][lane];
+        idx = start * n_t;
+        if(ptr != nullptr)
           for(unsigned int i = 0; i < n_t; ++i)
-            write_vectorized_value(src.local_element(idx + i), lane, out[n_t * n_t + i]);
+            write_vectorized_value(ptr[idx + i], lane, out[n_t * n_t + i]);
         else
           for(unsigned int i = 0; i < n_t; ++i)
             write_vectorized_value(0.0, lane, out[n_t * n_t + i]);
-        idx = dof_indices[2 * dim][lane] + 2 * hex_dofs_per_comp + start * n_t;
+        ptr = entities[2 * dim][lane];
+        idx = 2 * hex_dofs_per_comp + start * n_t;
         for(unsigned int i1 = 0; i1 < n_t - 1; ++i1)
           for(unsigned int i0 = 0; i0 < n_t; ++i0)
-            write_vectorized_value(src.local_element(idx + i1 * n_t * n_t + i0),
-                                   lane,
-                                   out[(i1 + 1) * n_t + i0]);
+            write_vectorized_value(ptr[idx + i1 * n_t * n_t + i0], lane, out[(i1 + 1) * n_t + i0]);
       }
     }
     else
     {
       AssertDimension(dim, 3);
       const unsigned int start = (face % 2) * (n_t - 1) * n_t;
-      unsigned int       idx   = dof_indices[0][lane] + start;
-      if(dof_indices[0][lane] != numbers::invalid_unsigned_int)
+      const Number *     ptr   = entities[0][lane];
+      unsigned int       idx   = start;
+      if(ptr != nullptr)
         for(unsigned int i = 0; i < n_t; ++i)
-          write_vectorized_value(src.local_element(idx + i), lane, out[i * n_n]);
+          write_vectorized_value(ptr[idx + i], lane, out[i * n_n]);
       else
         for(unsigned int i = 0; i < n_t; ++i)
           write_vectorized_value(0.0, lane, out[i * n_n]);
-      idx = dof_indices[1][lane] + start;
-      if(dof_indices[1][lane] != numbers::invalid_unsigned_int)
+      ptr = entities[1][lane];
+      idx = start;
+      if(ptr != nullptr)
         for(unsigned int i = 0; i < n_t; ++i)
-          write_vectorized_value(src.local_element(idx + i), lane, out[i * n_n + n_t]);
+          write_vectorized_value(ptr[idx + i], lane, out[i * n_n + n_t]);
       else
         for(unsigned int i = 0; i < n_t; ++i)
           write_vectorized_value(0.0, lane, out[i * n_n + n_t]);
-      idx = dof_indices[2 * dim][lane] + start * (n_t - 1);
+      ptr = entities[2 * dim][lane];
+      idx = start * (n_t - 1);
       for(unsigned int i1 = 0; i1 < n_t; ++i1)
         for(unsigned int i0 = 0; i0 < n_t - 1; ++i0)
-          write_vectorized_value(src.local_element(idx + i1 * (n_t - 1) + i0),
-                                 lane,
-                                 out[i1 * n_n + i0 + 1]);
+          write_vectorized_value(ptr[idx + i1 * (n_t - 1) + i0], lane, out[i1 * n_n + i0 + 1]);
       out += Utilities::pow(n_t, dim - 2) * n_n;
 
-      idx = dof_indices[2][lane] + start;
-      if(dof_indices[2][lane] != numbers::invalid_unsigned_int)
+      ptr = entities[2][lane];
+
+      idx = start;
+      if(ptr != nullptr)
         for(unsigned int i = 0; i < n_t; ++i)
-          write_vectorized_value(src.local_element(idx + i), lane, out[i]);
+          write_vectorized_value(ptr[idx + i], lane, out[i]);
       else
         for(unsigned int i = 0; i < n_t; ++i)
           write_vectorized_value(0.0, lane, out[i]);
-      idx = dof_indices[3][lane] + start;
-      if(dof_indices[3][lane] != numbers::invalid_unsigned_int)
+      ptr = entities[3][lane];
+      idx = start;
+      if(ptr != nullptr)
         for(unsigned int i = 0; i < n_t; ++i)
-          write_vectorized_value(src.local_element(idx + i), lane, out[i + n_t * n_t]);
+          write_vectorized_value(ptr[idx + i], lane, out[i + n_t * n_t]);
       else
         for(unsigned int i = 0; i < n_t; ++i)
           write_vectorized_value(0.0, lane, out[i + n_t * n_t]);
-      idx = dof_indices[2 * dim][lane] + hex_dofs_per_comp + start * (n_t - 1);
+      ptr = entities[2 * dim][lane];
+      idx = hex_dofs_per_comp + start * (n_t - 1);
       for(unsigned int i1 = 0; i1 < n_t - 1; ++i1)
         for(unsigned int i0 = 0; i0 < n_t; ++i0)
-          write_vectorized_value(src.local_element(idx + i1 * n_t + i0),
-                                 lane,
-                                 out[(i1 + 1) * n_t + i0]);
-    }
-  }
-
-  template<bool exchange_derivatives>
-  void
-  exchange_data_for_face_integrals(const VectorType & src) const
-  {
-    if(Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) > 1)
-    {
-      const int n_t = shape_info.data[0].fe_degree;
-      const int n_n = n_t + 1;
-
-      // data: values on face for the tangential components (the normal
-      // component is continuous), if derivatives are requested, add
-      // derivatives of tangential components and the normal derivative of
-      // the normal component
-      const int data_per_face =
-        exchange_derivatives ?
-          Utilities::pow(n_t, dim - 1) + 2 * n_n * Utilities::pow(n_t, dim - 2) * (dim - 1) :
-          n_n * Utilities::pow(n_t, dim - 2) * (dim - 1);
-
-      AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
-      unsigned int offset = 0;
-      for(unsigned int p = 0; p < send_data_process.size(); ++p)
-      {
-        MPI_Irecv(&mpi_recv_buffer[offset * data_per_face],
-                  send_data_process[p].second * data_per_face * sizeof(Number),
-                  MPI_BYTE,
-                  send_data_process[p].first,
-                  send_data_process[p].first + 47,
-                  src.get_mpi_communicator(),
-                  &mpi_requests[p]);
-        offset += send_data_process[p].second;
-      }
-      AssertIndexRange(offset * data_per_face, mpi_recv_buffer.size() + 1);
-
-      if(n_t == 2)
-        vmult_pack_and_send_data<2, exchange_derivatives>(src);
-      else if(n_t == 3)
-        vmult_pack_and_send_data<3, exchange_derivatives>(src);
-      else if(n_t == 4)
-        vmult_pack_and_send_data<4, exchange_derivatives>(src);
-#ifndef DEBUG
-      else if(n_t == 5)
-        vmult_pack_and_send_data<5, exchange_derivatives>(src);
-      else if(n_t == 6)
-        vmult_pack_and_send_data<6, exchange_derivatives>(src);
-      else if(n_t == 7)
-        vmult_pack_and_send_data<7, exchange_derivatives>(src);
-      else if(n_t == 8)
-        vmult_pack_and_send_data<8, exchange_derivatives>(src);
-      else if(n_t == 9)
-        vmult_pack_and_send_data<9, exchange_derivatives>(src);
-#endif
-      else
-        AssertThrow(false, ExcNotImplemented());
-
-      if(!mpi_requests.empty())
-        MPI_Waitall(mpi_requests.size(), &mpi_requests[0], MPI_STATUSES_IGNORE);
+          write_vectorized_value(ptr[idx + i1 * n_t + i0], lane, out[(i1 + 1) * n_t + i0]);
     }
   }
 
@@ -3623,7 +3712,7 @@ private:
       for(unsigned int v = n_faces; v < n_lanes; ++v)
         for(unsigned int f = 0; f < 2 * dim + 1; ++f)
           dof_indices_vec[f][v] = dof_indices_vec[f][0];
-      read_face_values<n_t>(src, face, dof_indices_vec, tmp_vec.data());
+      read_face_values<n_t>(entity_pointers(src, dof_indices_vec), face, tmp_vec.data());
 
       // copy to dedicated data field
       if(n_faces == n_lanes)
@@ -3633,52 +3722,6 @@ private:
           for(unsigned int i = 0; i < data_per_face; ++i)
             out[indices[v] + i] = tmp_vec[i][v];
     }
-  }
-
-  template<int n_t, bool include_face_derivative = true>
-  void
-  vmult_pack_and_send_data(const VectorType & src) const
-  {
-    constexpr int n_n = n_t + 1;
-    constexpr int data_per_face =
-      (include_face_derivative ? Utilities::pow(n_t, dim - 1) : 0) +
-      (include_face_derivative ? 2 : 1) * n_n * Utilities::pow(n_t, dim - 2) * (dim - 1);
-
-    AssertDimension(mpi_requests.size(), 2 * send_data_process.size());
-    unsigned int offset = 0;
-    for(unsigned int p = 0; p < send_data_process.size(); ++p)
-    {
-      const unsigned int my_faces = send_data_process[p].second;
-      if(include_face_derivative)
-        pack_face_data<n_t>(src.begin(),
-                            offset,
-                            offset + my_faces,
-                            mpi_send_buffer.data() + offset * data_per_face);
-      else
-        for(unsigned int count = offset; count < offset + my_faces; ++count)
-        {
-          const unsigned int cell = send_data_cell_index[count] / n_lanes;
-          const unsigned int lane = send_data_cell_index[count] % n_lanes;
-          read_face_values_only<n_t>(src,
-                                     send_data_face_index[count],
-                                     dof_indices[cell],
-                                     lane,
-                                     mpi_send_buffer.data() + count * data_per_face);
-        }
-
-      MPI_Isend(&mpi_send_buffer[offset * data_per_face],
-                my_faces * data_per_face * sizeof(Number),
-                MPI_BYTE,
-                send_data_process[p].first,
-                src.get_partitioner()->this_mpi_process() + 47,
-                src.get_mpi_communicator(),
-                &mpi_requests[send_data_process.size() + p]);
-      offset += my_faces;
-    }
-    if(include_face_derivative)
-      AssertDimension(offset * data_per_face, mpi_send_buffer.size());
-    else
-      AssertIndexRange(offset * data_per_face, mpi_send_buffer.size() + 1);
   }
 
   void
@@ -4692,22 +4735,17 @@ private:
 
     if constexpr(compute_exterior)
     {
-      read_face_values<degree>(src.begin(), f + (f % 2 ? -1 : 1), dof_indices_neighbor, face_array);
+      auto neighbor_entities = entity_pointers(src.begin(), dof_indices_neighbor);
+      set_remote_cell_entities(src, cell, f, neighbor_entities);
+      read_face_values<degree>(neighbor_entities, f + (f % 2 ? -1 : 1), face_array);
 
       // For faces located on MPI-remote processes, we replace the dummy
       // data read out above by the data sent to us
       constexpr unsigned int data_per_face = n_t * n_t + 2 * 2 * n_t * n_n;
       for(unsigned int v = 0; v < n_lanes; ++v)
-        if(mpi_exchange_data_on_faces[cell][f][v] != numbers::invalid_unsigned_int)
-        {
-          const unsigned int slot = mpi_exchange_data_on_faces[cell][f][v];
-          const Number *     imported_data_ptr =
-            mpi_recv_buffer.data() + (single_exchange.usable ?
-                                        single_exchange.recv_face_offset[slot] :
-                                        slot * data_per_face);
+        if(const Number * remote_data = single_exchange.remote_face_data[cell][f][v])
           for(unsigned int i = 0; i < data_per_face; ++i)
-            face_array[i][v] = imported_data_ptr[i];
-        }
+            face_array[i][v] = remote_data[i];
 
       // Only the normal derivative of the normal component is read from
       // the neighbor, the value and the contribution of the value to the
@@ -5312,29 +5350,39 @@ private:
     VectorizedArray<Number> values_face[2][dim][n_q_points_face + 1];
     VectorizedArray<Number> grads_face[2][dim][n_q_points_face * dim + 1];
 
+    auto neighbor_entities = entity_pointers(src.begin(), dof_indices_neighbor);
+    set_remote_cell_entities(src, cell, f, neighbor_entities);
     if(include_convective_divergence)
-      read_face_values<degree>(src.begin(), f + (f % 2 ? -1 : 1), dof_indices_neighbor, face_array);
+      read_face_values<degree>(neighbor_entities, f + (f % 2 ? -1 : 1), face_array);
     else
       for(unsigned int lane = 0; lane < n_lanes; ++lane)
-        read_face_values_only<degree>(
-          src, f + (f % 2 ? -1 : 1), dof_indices_neighbor, lane, face_array);
+        read_face_values_only<degree>(neighbor_entities, f + (f % 2 ? -1 : 1), lane, face_array);
 
     // For faces located on MPI-remote processes, we replace the dummy
-    // data read out above by the data sent to us. For the convective term
-    // without divergence, we use only values of the tangential components,
-    // otherwise values and derivatives of the tangential components and the
-    // normal derivative of the normal component
-    constexpr unsigned int data_per_face =
-      include_convective_divergence ? n_t * n_t + 2 * 2 * n_t * n_n : 2 * n_t * n_n;
+    // data read out above by the data sent to us, which contains the values
+    // and derivatives of the tangential components and the normal
+    // derivative of the normal component. For the convective term without
+    // divergence, we only use the values of the tangential components,
+    // which are stored for each tangential component before its derivatives
+    // and after the normal derivative of the normal component if that comes
+    // first.
+    constexpr unsigned int data_per_face = n_t * n_t + 2 * 2 * n_t * n_n;
+    constexpr unsigned int n_values      = n_t * n_n;
+    const unsigned int     first_values  = face_direction == 0 ? n_t * n_t : 0;
+    const unsigned int     second_values =
+      face_direction == 2 ? 2 * n_values : n_t * n_t + 2 * n_values;
     for(unsigned int v = 0; v < n_lanes; ++v)
-      if(mpi_exchange_data_on_faces[cell][f][v] != numbers::invalid_unsigned_int)
+      if(const Number * remote_data = single_exchange.remote_face_data[cell][f][v])
       {
-        const unsigned int slot = mpi_exchange_data_on_faces[cell][f][v];
-        const Number *     imported_data_ptr =
-          mpi_recv_buffer.data() +
-          (single_exchange.usable ? single_exchange.recv_face_offset[slot] : slot * data_per_face);
-        for(unsigned int i = 0; i < data_per_face; ++i)
-          face_array[i][v] = imported_data_ptr[i];
+        if(include_convective_divergence)
+          for(unsigned int i = 0; i < data_per_face; ++i)
+            face_array[i][v] = remote_data[i];
+        else
+          for(unsigned int i = 0; i < n_values; ++i)
+          {
+            face_array[i][v]            = remote_data[first_values + i];
+            face_array[n_values + i][v] = remote_data[second_values + i];
+          }
       }
 
     if(include_convective_divergence)

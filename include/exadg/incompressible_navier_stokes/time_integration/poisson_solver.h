@@ -1344,6 +1344,26 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
 
   ~PoissonPreconditionerMG()
   {
+    if(not this->is_test)
+    {
+      // maximum over the processes of each entry, as the processes wait for
+      // the slowest one in the communication of each level
+      std::vector<double> local_times;
+      for(const auto & array : timings)
+        for(const auto time : array)
+          local_times.push_back(time);
+      std::vector<double> max_times(local_times.size());
+      const int           ierr = MPI_Allreduce(local_times.data(),
+                                     max_times.data(),
+                                     local_times.size(),
+                                     MPI_DOUBLE,
+                                     MPI_MAX,
+                                     MPI_COMM_WORLD);
+      AssertThrowMPI(ierr);
+      for(unsigned int i = 0, c = 0; i < timings.size(); ++i)
+        for(unsigned int j = 0; j < timings[i].size(); ++j, ++c)
+          timings[i][j] = max_times[c];
+    }
     if(not this->is_test and Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
     {
       double all_time = 0;
@@ -1351,7 +1371,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         for(const auto time : array)
           all_time += time;
       std::cout << "Collected multigrid timings in " << count_times
-                << " evaluations [t_total=" << all_time << "s]" << std::endl;
+                << " evaluations [t_total=" << all_time << "s, max over processes]" << std::endl;
       std::cout << "Level   smooth      residual    restrict    prolongate   [rel. share]"
                 << std::endl;
       for(unsigned int i = 0; i < timings.size(); ++i)

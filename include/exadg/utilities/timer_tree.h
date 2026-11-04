@@ -194,7 +194,7 @@ private:
   std::vector<std::shared_ptr<TimerTree>> sub_trees;
 
   static unsigned int const offset_per_level = 2;
-  static unsigned int const precision        = 2;
+  static unsigned int const precision        = 3;
 };
 } // namespace ExaDG
 
