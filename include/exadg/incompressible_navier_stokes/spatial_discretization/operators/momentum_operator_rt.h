@@ -729,8 +729,9 @@ public:
 
     for(double & t : timings)
       t = 0.0;
-    product_timings   = {};
-    time_wait_readers = 0;
+    product_timings            = {};
+    time_wait_readers          = 0;
+    time_wait_readers_deferred = 0;
   }
 
   ~RaviartThomasOperator()
@@ -769,7 +770,7 @@ public:
                          comm,
                          total_time);
       if(Utilities::MPI::sum(single_exchange.n_shared_memory_partners(), comm) > 0)
-        Helper::print_time(time_wait_readers / timings[0],
+        Helper::print_time((time_wait_readers + time_wait_readers_deferred) / timings[0],
                            "Wait for readers (shm)",
                            comm,
                            total_time);
@@ -934,7 +935,7 @@ public:
     dst.compress_start(0, VectorOperation::add);
     src.zero_out_ghost_values();
     dst.compress_finish(VectorOperation::add);
-    single_exchange.wait_until_partners_done_reading();
+    single_exchange.wait_until_source_vector_free();
   }
 
   Number
@@ -1004,7 +1005,7 @@ public:
     velocity_dst.compress_start(0, VectorOperation::add);
     src.zero_out_ghost_values();
     velocity_dst.compress_finish(VectorOperation::add);
-    single_exchange.wait_until_partners_done_reading();
+    single_exchange.wait_until_source_vector_free();
 
     return Utilities::MPI::max(cfl_factor, divergence.get_mpi_communicator());
   }
@@ -1297,6 +1298,13 @@ public:
   // ExaDG::ScratchMatrixVectorProduct for the format of the ranges passed
   // to 'after_loop'. Like for vmult_before_on_dst(), the vector src must be
   // final upon entry.
+  //
+  // With shared memory, other processes may still read src after this
+  // function returns, so src must not be modified before the next call of
+  // vmult_scratch(), which waits for them before its cell loop. This avoids
+  // waiting for the slowest reader at the end of each product and suits the
+  // Chebyshev iteration in PreconditionChebyshevScratch, which writes the
+  // source vector of one product only in the 'after_loop' of the next one.
   template<typename AfterLoop>
   void
   vmult_scratch(const VectorType & src, const AfterLoop & after_loop) const
@@ -1308,6 +1316,10 @@ public:
       timings[10] += 1;
 
     exchange_ghosts_overlapped(src, [&]() { scratch.prepare_loop(); });
+
+    // the processes reading the source vector of the previous product, which
+    // may be written in 'after_loop', have finished by now in most cases
+    wait_for_readers(false);
 
     Timer time;
     scratch.cell_loop(
@@ -1324,7 +1336,6 @@ public:
     time.restart();
     single_exchange.signal_done_reading();
     scratch.finish_loop(after_loop, [&]() { src.zero_out_ghost_values(); });
-    wait_for_readers();
 
     if(factor_laplace != 0)
     {
@@ -1390,6 +1401,14 @@ public:
   count_wrong_remote_cell_entities(const VectorType & global_indices) const
   {
     return single_exchange.count_wrong_remote_cell_entities(global_indices);
+  }
+
+  // Wait until the other processes have finished reading the source vector
+  // of the last call of vmult_scratch(), see there
+  void
+  wait_until_source_vector_free() const
+  {
+    single_exchange.wait_until_source_vector_free();
   }
 
   // Number of neighboring processes whose face data is read directly from
@@ -1901,17 +1920,19 @@ private:
   // number of calls and accumulated time of the products with the Laplace
   // part for the variants vmult() with functions, vmult_before_on_dst() and
   // vmult_scratch(), and the time waiting for the processes reading the
-  // source vector in shared memory at the end of these products
-  mutable std::array<std::array<double, 2>, 3> product_timings   = {};
-  mutable double                               time_wait_readers = 0;
+  // source vector in shared memory, at the end of the products (part of the
+  // compress timer) and before the cell loop of vmult_scratch()
+  mutable std::array<std::array<double, 2>, 3> product_timings            = {};
+  mutable double                               time_wait_readers          = 0;
+  mutable double                               time_wait_readers_deferred = 0;
 
   void
-  wait_for_readers() const
+  wait_for_readers(const bool at_end_of_product = true) const
   {
     Timer time;
-    single_exchange.wait_until_partners_done_reading();
+    single_exchange.wait_until_source_vector_free();
     if(factor_laplace != 0.)
-      time_wait_readers += time.wall_time();
+      (at_end_of_product ? time_wait_readers : time_wait_readers_deferred) += time.wall_time();
   }
 
   Number factor_mass;
@@ -2103,7 +2124,7 @@ private:
   void
   single_exchange_pack_and_send(const VectorType & src) const
   {
-    single_exchange.wait_until_partners_done_reading();
+    single_exchange.wait_until_send_buffer_free();
     const auto & partners    = single_exchange.partners;
     Number *     send_buffer = single_exchange_send_buffer();
     for(unsigned int p = 0; p < partners.size(); ++p)
