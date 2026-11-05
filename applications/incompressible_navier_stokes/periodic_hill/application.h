@@ -507,6 +507,15 @@ public:
       prm.add_parameter("CoarseMeshRefinements",
                         coarse_mesh_refinements,
                         "Number of elements in coarse mesh in x,y,z-direction.");
+      prm.add_parameter("SemiCoarseningCoarsenCoreSteps",
+                        semi_coarsening_coarsen_core_steps,
+                        "Number of multigrid levels with semi-coarsening in y direction "
+                        "close to the walls on which the cells in the core of the channel "
+                        "are additionally coarsened in all directions, giving meshes with "
+                        "hanging nodes. At most 2, the number of semi-coarsened levels. "
+                        "Needs at least 4 global refinements, otherwise the cells in the "
+                        "core are kept.",
+                        dealii::Patterns::Integer(0));
     }
     prm.leave_subsection();
   }
@@ -861,6 +870,36 @@ private:
     const unsigned int global_refinements = grid.triangulation->n_global_levels() - 1;
     if(coarse_mesh_refinements[1] == 3 && global_refinements >= 3)
     {
+      // Coarsening the core of the channel on top of the semi-coarsening
+      // gives meshes with hanging nodes, which needs at least 4 global
+      // refinements to place the interface between the two regions at
+      // element faces on all levels. The core can be coarsened on each of
+      // the two semi-coarsened levels created below, which gives the number
+      // of times the core is coarsened compared to the fine mesh on the
+      // coarser of the two levels.
+      const unsigned int n_semi_coarsened_levels = 2;
+      AssertThrow(semi_coarsening_coarsen_core_steps <= n_semi_coarsened_levels,
+                  dealii::ExcMessage("SemiCoarseningCoarsenCoreSteps = " +
+                                     std::to_string(semi_coarsening_coarsen_core_steps) +
+                                     " exceeds the number of semi-coarsened levels, " +
+                                     std::to_string(n_semi_coarsened_levels)));
+      const unsigned int coarsen_core_steps =
+        global_refinements >= 4 ? semi_coarsening_coarsen_core_steps : 0;
+
+      // Refine the cells in the region within the given fraction of the
+      // channel height from the walls, where the semi-coarsening is
+      // applied. The criterion only depends on the y coordinate, such that
+      // the refinement is the same on both sides of the periodic boundaries.
+      const auto refine_wall_region = [&](dealii::Triangulation<dim> & tria,
+                                          const double                 fraction) {
+        const double y_low  = p_1[1] + fraction * (p_2[1] - p_1[1]);
+        const double y_high = p_2[1] - fraction * (p_2[1] - p_1[1]);
+        for(const auto & cell : tria.active_cell_iterators())
+          if(cell->is_locally_owned() && (cell->center()[1] < y_low || cell->center()[1] > y_high))
+            cell->set_refine_flag();
+        tria.execute_coarsening_and_refinement();
+      };
+
       auto tria2 =
         std::make_shared<dealii::parallel::distributed::Triangulation<dim>>(MPI_COMM_WORLD);
 
@@ -934,8 +973,21 @@ private:
 
       // Apply the remaining refinements and then append this triangulation to
       // the coarse triangulations stored with the grid, which will be used
-      // for the multigrid setup.
-      tria2->refine_global(global_refinements - 2);
+      // for the multigrid setup. In case the core of the channel should be
+      // coarsened, we apply one global refinement less, which coarsens the
+      // core by a factor of 2 in all directions compared to the fine mesh,
+      // and then refine the cells in the region close to the walls once
+      // more, where this gives the cells coarsened only in y direction as
+      // described above. The interface between the two regions is at the
+      // position 3/18 and 15/18 of the base mesh in y direction, which is a
+      // vertex for at least one refinement of the base mesh.
+      if(coarsen_core_steps > 0)
+      {
+        tria2->refine_global(global_refinements - 3);
+        refine_wall_region(*tria2, 0.25);
+      }
+      else
+        tria2->refine_global(global_refinements - 2);
       auto mapping2 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
       mapping2->initialize(*tria2, mapping_function_fine);
       grid.coarse_triangulations.push_back(tria2);
@@ -999,7 +1051,29 @@ private:
         tria3->set_manifold(1, manifold_3);
       }
 
-      tria3->refine_global(global_refinements);
+      // In case the core should be coarsened, we apply one global
+      // refinement less per coarsening step and then refine the cells close
+      // to the walls once more per step. Only the layer of cells closest to
+      // the wall, below 4/24 of the channel height, is coarsened in y
+      // direction compared to the next finer level, so the last refinement
+      // is restricted to that layer, whereas the next layer up to 6/24 of
+      // the channel height is coarsened in all directions like the core.
+      // With one step, the core then exactly matches the one of the next
+      // finer level. With two steps, the core and the second layer are
+      // coarsened by a factor of 2 in all directions compared to the next
+      // finer level, with the second layer refined once from the cells of
+      // the core. The positions 2/16 and 14/16 of the base mesh in y
+      // direction are vertices for at least 2 refinements of the base mesh,
+      // and the positions 1/16 and 15/16 for 3 refinements.
+      if(coarsen_core_steps > 0)
+      {
+        tria3->refine_global(global_refinements - coarsen_core_steps);
+        for(unsigned int step = 1; step < coarsen_core_steps; ++step)
+          refine_wall_region(*tria3, 0.25);
+        refine_wall_region(*tria3, 4. / 24.);
+      }
+      else
+        tria3->refine_global(global_refinements);
       auto mapping3 = std::make_shared<dealii::MappingQCache<dim>>(this->param.mapping_degree);
       mapping3->initialize(*tria3, mapping_function_fine);
       grid.coarse_triangulations.push_back(tria3);
@@ -1518,6 +1592,10 @@ private:
   bool consider_mapping     = true;  // map the box to give the classic periodic hill geometry
   GridDeformationType grid_deformation_type = GridDeformationType::GradedMeshUniform;
   double              grid_stretch_factor   = 1.6;
+
+  // number of semi-coarsened multigrid levels on which the core of the
+  // channel is coarsened
+  unsigned int semi_coarsening_coarsen_core_steps = 1;
 
   // discretization
   TemporalDiscretization temporal_discretization = TemporalDiscretization::Undefined;

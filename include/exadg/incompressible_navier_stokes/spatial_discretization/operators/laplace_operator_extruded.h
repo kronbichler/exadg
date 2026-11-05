@@ -31,6 +31,9 @@
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/matrix_free/evaluation_kernels.h>
+#include <deal.II/matrix_free/evaluation_kernels_hanging_nodes.h>
+#include <deal.II/matrix_free/evaluation_template_factory.h>
+#include <deal.II/matrix_free/hanging_nodes_internal.h>
 #include <deal.II/matrix_free/matrix_free.h>
 #include <deal.II/matrix_free/tensor_product_kernels.h>
 #include <deal.II/matrix_free/vector_access_internal.h>
@@ -65,8 +68,17 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
   for(unsigned int v = 0; v < n_lanes; ++v)
     shifted_data_indices[v] = mapping_info.mapping_data_index[cell][v] * 4;
 
-  const Number h_z         = mapping_info.h_z;
-  const Number h_z_inverse = mapping_info.h_z_inverse;
+  // the extent in z direction can differ between cells on adaptively refined
+  // meshes, so load it per lane
+  [[maybe_unused]] VectorizedArray<Number> h_z, h_z_inverse;
+  if constexpr(dim == 3)
+  {
+    std::array<unsigned int, n_lanes> geometry_indices;
+    for(unsigned int v = 0; v < n_lanes; ++v)
+      geometry_indices[v] = mapping_info.mapping_data_index[cell][v] / n_q_points_2d;
+    h_z.gather(mapping_info.h_z_values.data(), geometry_indices.data());
+    h_z_inverse = Number(1) / h_z;
+  }
 
   constexpr unsigned int nn = n_q_points_1d;
 
@@ -146,6 +158,7 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
                                               true,
                                               false>(shape_grad, quad_values + q1, grad_z);
 
+        const VectorizedArray<Number> JxW_h_z = JxW_xy * h_z;
         for(unsigned int qz = 0, q = q1; qz < nn; ++qz, q += n_q_points_2d)
         {
           const VectorizedArray<Number> val     = quad_values[q];
@@ -158,9 +171,9 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
             grad_real[d] = inv_jac_xy[d][0] * grad[0] + inv_jac_xy[d][1] * grad[1];
           grad_real[2] = h_z_inverse * grad[2];
 
-          const Number                  weight_h_z   = mapping_info.quad_weights_z[qz] * h_z;
-          const VectorizedArray<Number> factor_deriv = (JxW_xy * factor_lapl) * weight_h_z;
-          const VectorizedArray<Number> factor_ma    = (JxW_xy * factor_mass) * weight_h_z;
+          const Number                  weight_z     = mapping_info.quad_weights_z[qz];
+          const VectorizedArray<Number> factor_deriv = (JxW_h_z * factor_lapl) * weight_z;
+          const VectorizedArray<Number> factor_ma    = (JxW_h_z * factor_mass) * weight_z;
 
           out_values[q] = val * factor_ma;
           for(unsigned int e = 0; e < dim; ++e)
@@ -262,133 +275,226 @@ public:
     const unsigned int fe_degree = fe.degree;
     compressed_dof_indices.clear();
     const unsigned int stored_dofs_per_direction = fe_degree == 1 ? 2 : 3;
-    compressed_dof_indices.resize(Utilities::pow(stored_dofs_per_direction, dim) * n_lanes *
-                                    matrix_free.n_cell_batches(),
+    const unsigned int n_stored_dofs             = Utilities::pow(stored_dofs_per_direction, dim);
+    compressed_dof_indices.resize(n_stored_dofs * n_lanes * matrix_free.n_cell_batches(),
                                   numbers::invalid_unsigned_int);
     all_indices_unconstrained.clear();
-    all_indices_unconstrained.resize(Utilities::pow(stored_dofs_per_direction, dim) *
-                                       matrix_free.n_cell_batches(),
-                                     1);
+    all_indices_unconstrained.resize(n_stored_dofs * matrix_free.n_cell_batches(), 1);
 
-    std::vector<types::global_dof_index> dof_indices(fe.dofs_per_cell);
-    std::vector<unsigned int> renumber_lex = FETools::hierarchic_to_lexicographic_numbering<dim>(2);
-    for(auto & i : renumber_lex)
-      i *= n_lanes;
+    const unsigned int                  n_components = fe.n_components();
+    const Utilities::MPI::Partitioner & part = *matrix_free.get_dof_info().vector_partitioner;
 
-    for(unsigned int c = 0; c < matrix_free.n_cell_batches(); ++c)
-    {
-      for(unsigned int l = 0; l < matrix_free.n_active_entries_per_cell_batch(c); ++l)
+    const std::vector<unsigned int> renumber_lex =
+      FETools::hierarchic_to_lexicographic_numbering<dim>(2);
+
+    // Write the compressed indices of one cell, given by the dof indices in
+    // hierarchic order, to the positions 'out[i * n_lanes]' for the
+    // 'n_stored_dofs' entities of the cell
+    const auto compress_indices = [&](const std::vector<types::global_dof_index> & dof_indices,
+                                      unsigned int *                               out) {
+      // Low degree -> just pick the stored dofs
+      if(fe_degree == 1)
       {
-        matrix_free.get_cell_iterator(c, l)->get_dof_indices(dof_indices);
-        const unsigned int n_components = matrix_free.get_dof_handler().get_fe().n_components();
-        const Utilities::MPI::Partitioner & part = *matrix_free.get_dof_info().vector_partitioner;
+        for(unsigned int i = 0; i < GeometryInfo<dim>::vertices_per_cell; ++i)
+        {
+          for(unsigned int c = 0; c < n_components; ++c)
+            AssertThrow(dof_indices[i * n_components + c] == dof_indices[i * n_components] + c,
+                        ExcMessage("Expected contiguous numbering"));
+          out[i * n_lanes] = constraints.is_constrained(dof_indices[i * n_components]) ?
+                               numbers::invalid_unsigned_int :
+                               part.global_to_local(dof_indices[i * n_components]);
+        }
+        return;
+      }
+
+      // Else store the compressed form with 3^dim dofs per cell
+      unsigned int cc = 0, cf = 0;
+      for(unsigned int i = 0; i < GeometryInfo<dim>::vertices_per_cell;
+          ++i, ++cc, cf += n_components)
+      {
+        if(!constraints.is_constrained(dof_indices[cf]))
+          out[renumber_lex[cc] * n_lanes] = part.global_to_local(dof_indices[cf]);
+        for(unsigned int c = 0; c < n_components; ++c)
+          AssertThrow(dof_indices[cf + c] == dof_indices[cf] + c,
+                      ExcMessage("Expected contiguous numbering"));
+      }
+
+      for(unsigned int line = 0; line < GeometryInfo<dim>::lines_per_cell; ++line)
+      {
+        const unsigned int size = fe_degree - 1;
+        if(!constraints.is_constrained(dof_indices[cf]))
+        {
+          for(unsigned int i = 0; i < size; ++i)
+            for(unsigned int c = 0; c < n_components; ++c)
+              AssertThrow(dof_indices[cf + c * size + i] == dof_indices[cf] + i * n_components + c,
+                          ExcMessage("Expected contiguous numbering"));
+          out[renumber_lex[cc] * n_lanes] = part.global_to_local(dof_indices[cf]);
+        }
+        ++cc;
+        cf += size * n_components;
+      }
+      for(unsigned int quad = 0; quad < GeometryInfo<dim>::quads_per_cell; ++quad)
+      {
+        const unsigned int size = (fe_degree - 1) * (fe_degree - 1);
+        if(!constraints.is_constrained(dof_indices[cf]))
+        {
+          // switch order x-z for y faces in 3D to lexicographic layout
+          if(dim == 3 && (quad == 2 || quad == 3))
+            for(unsigned int i1 = 0, i = 0; i1 < fe_degree - 1; ++i1)
+              for(unsigned int i0 = 0; i0 < fe_degree - 1; ++i0, ++i)
+                for(unsigned int c = 0; c < n_components; ++c)
+                {
+                  AssertThrow(dof_indices[cf + c * size + i0 * (fe_degree - 1) + i1] ==
+                                dof_indices[cf] + i * n_components + c,
+                              ExcMessage("Expected contiguous numbering"));
+                }
+          else
+            for(unsigned int i = 0; i < size; ++i)
+              for(unsigned int c = 0; c < n_components; ++c)
+                AssertThrow(dof_indices[cf + c * size + i] ==
+                              dof_indices[cf] + i * n_components + c,
+                            ExcMessage("Expected contiguous numbering"));
+          out[renumber_lex[cc] * n_lanes] = part.global_to_local(dof_indices[cf]);
+        }
+        ++cc;
+        cf += size * n_components;
+      }
+      for(unsigned int hex = 0; hex < GeometryInfo<dim>::hexes_per_cell; ++hex)
+      {
+        const unsigned int size = (fe_degree - 1) * (fe_degree - 1) * (fe_degree - 1);
+        if(!constraints.is_constrained(dof_indices[cf]))
+        {
+          for(unsigned int i = 0; i < size; ++i)
+            for(unsigned int c = 0; c < n_components; ++c)
+              AssertThrow(dof_indices[cf + c * size + i] == dof_indices[cf] + i * n_components + c,
+                          ExcMessage("Expected contiguous numbering"));
+          out[renumber_lex[cc] * n_lanes] = part.global_to_local(dof_indices[cf]);
+        }
+        ++cc;
+        cf += size * n_components;
+      }
+      AssertThrow(cc == Utilities::pow(3, dim),
+                  ExcMessage("Expected 3^dim dofs, got " + std::to_string(cc)));
+      AssertThrow(cf == dof_indices.size(),
+                  ExcMessage("Expected (fe_degree+1)^dim dofs, got " + std::to_string(cf)));
+    };
+
+    // Replace the indices of DoFs constrained to a single other DoF with
+    // weight 1 (periodicity) by the index of that DoF
+    const auto resolve_identity_constraints =
+      [&](std::vector<types::global_dof_index> & dof_indices) {
         for(types::global_dof_index & i : dof_indices)
         {
           const auto line = constraints.get_constraint_entries(i);
           if(line != nullptr && line->size() == 1 && (*line)[0].second == Number(1.0))
             i = (*line)[0].first;
         }
-        // Low degree -> just pick the stored dofs
-        if(fe_degree == 1)
+      };
+
+    // Hanging nodes: MatrixFree has detected the cells with hanging nodes,
+    // whose constraint kind we store per cell batch. On those cells, the
+    // indices of the constrained DoFs on the refined side get replaced by the
+    // ones of the coarse side via the same algorithm as in MatrixFree, such
+    // that the cell kernel can apply the interpolation of
+    // FEEvaluationHangingNodesFactory to the values read from those indices.
+    const auto & hn_masks = matrix_free.get_dof_info().hanging_node_constraint_masks;
+    hanging_node_masks.clear();
+    batch_has_hanging_nodes.clear();
+    positions_replaced_by_hanging_nodes.clear();
+    if(std::any_of(hn_masks.begin(), hn_masks.end(), [](const auto mask) {
+         return mask != internal::MatrixFreeFunctions::unconstrained_compressed_constraint_kind;
+       }))
+    {
+      AssertThrow(n_components == 1,
+                  ExcNotImplemented("Hanging nodes only implemented for scalar elements"));
+      AssertDimension(hn_masks.size(), matrix_free.n_cell_batches() * n_lanes);
+      hanging_node_masks.resize(matrix_free.n_cell_batches());
+      batch_has_hanging_nodes.resize(matrix_free.n_cell_batches(), 0);
+      for(unsigned int c = 0; c < matrix_free.n_cell_batches(); ++c)
+        for(unsigned int v = 0; v < n_lanes; ++v)
         {
-          const std::size_t offset = Utilities::pow(2, dim) * (n_lanes * c) + l;
-          for(unsigned int i = 0; i < GeometryInfo<dim>::vertices_per_cell; ++i)
-          {
-            for(unsigned int c = 0; c < n_components; ++c)
-              AssertThrow(dof_indices[i * n_components + c] == dof_indices[i * n_components] + c,
-                          ExcMessage("Expected contiguous numbering"));
-            compressed_dof_indices[offset + i * n_lanes] =
-              part.global_to_local(dof_indices[i * n_components]);
-          }
+          hanging_node_masks[c][v] = hn_masks[c * n_lanes + v];
+          if(hn_masks[c * n_lanes + v] !=
+             internal::MatrixFreeFunctions::unconstrained_compressed_constraint_kind)
+            batch_has_hanging_nodes[c] = 1;
+        }
+    }
+    std::unique_ptr<internal::MatrixFreeFunctions::HangingNodes<dim>> hanging_nodes;
+    if(!hanging_node_masks.empty())
+      hanging_nodes = std::make_unique<internal::MatrixFreeFunctions::HangingNodes<dim>>(
+        dof_handler.get_triangulation());
+    const std::vector<std::vector<unsigned int>> lexicographic_numbering{
+      {matrix_free.get_shape_info().lexicographic_numbering}};
+    const std::vector<std::vector<bool>> hn_component_mask{{true}};
+
+    std::vector<types::global_dof_index> dof_indices(fe.dofs_per_cell);
+    std::vector<types::global_dof_index> dof_indices_lex(fe.dofs_per_cell);
+    std::vector<types::global_dof_index> own_dof_indices(fe.dofs_per_cell);
+    std::vector<unsigned int>            own_indices(n_stored_dofs * n_lanes);
+    for(unsigned int c = 0; c < matrix_free.n_cell_batches(); ++c)
+    {
+      for(unsigned int l = 0; l < matrix_free.n_active_entries_per_cell_batch(c); ++l)
+      {
+        const auto cell = matrix_free.get_cell_iterator(c, l);
+        cell->get_dof_indices(dof_indices);
+        unsigned int * out = compressed_dof_indices.data() + n_stored_dofs * n_lanes * c + l;
+
+        if(!hanging_node_masks.empty() &&
+           hanging_node_masks[c][l] !=
+             internal::MatrixFreeFunctions::unconstrained_compressed_constraint_kind)
+        {
+          // indices without the hanging-node replacement, to identify the
+          // entities that are not owned by the cell
+          own_dof_indices = dof_indices;
+          resolve_identity_constraints(own_dof_indices);
+          std::fill(own_indices.begin(), own_indices.end(), numbers::invalid_unsigned_int);
+          compress_indices(own_dof_indices, own_indices.data());
+
+          const internal::MatrixFreeFunctions::ConstraintKinds refinement_configuration =
+            hanging_nodes->compute_refinement_configuration(cell);
+          AssertThrow(internal::MatrixFreeFunctions::compress(refinement_configuration, dim) ==
+                        hanging_node_masks[c][l],
+                      ExcInternalError("Hanging-node configuration does not match MatrixFree"));
+          const std::vector<unsigned int> & lex = lexicographic_numbering[0];
+          for(unsigned int i = 0; i < dof_indices.size(); ++i)
+            dof_indices_lex[i] = dof_indices[lex[i]];
+          hanging_nodes->update_dof_indices(cell,
+                                            {},
+                                            lexicographic_numbering,
+                                            hn_component_mask,
+                                            refinement_configuration,
+                                            dof_indices_lex);
+          for(unsigned int i = 0; i < dof_indices.size(); ++i)
+            dof_indices[lex[i]] = dof_indices_lex[i];
+
+          resolve_identity_constraints(dof_indices);
+          compress_indices(dof_indices, out);
+
+          // Record the positions that have been replaced. Note that the
+          // own index of a hanging DoF can be valid, namely when the
+          // hanging-node constraint is an identity to a single DoF of the
+          // coarse side (e.g. the midpoint of a coarse edge for even
+          // degrees), which gets resolved like the periodicity constraints.
+          // Dropping such a position is still correct for the transfer
+          // operators, because that DoF is also visited by the cell on the
+          // coarse side that actually owns it.
+          for(unsigned int i = 0; i < n_stored_dofs; ++i)
+            if(own_indices[i * n_lanes] != out[i * n_lanes])
+              positions_replaced_by_hanging_nodes.push_back(n_stored_dofs * n_lanes * c +
+                                                            i * n_lanes + l);
         }
         else
         {
-          // Else store the compressed form with 3^dim dofs per cell
-          const std::size_t offset = Utilities::pow(3, dim) * (n_lanes * c) + l;
-          unsigned int      cc = 0, cf = 0;
-          for(unsigned int i = 0; i < GeometryInfo<dim>::vertices_per_cell;
-              ++i, ++cc, cf += n_components)
-          {
-            if(!constraints.is_constrained(dof_indices[cf]))
-              compressed_dof_indices[offset + renumber_lex[cc]] =
-                part.global_to_local(dof_indices[cf]);
-            for(unsigned int c = 0; c < n_components; ++c)
-              AssertThrow(dof_indices[cf + c] == dof_indices[cf] + c,
-                          ExcMessage("Expected contiguous numbering"));
-          }
-
-          for(unsigned int line = 0; line < GeometryInfo<dim>::lines_per_cell; ++line)
-          {
-            const unsigned int size = fe_degree - 1;
-            if(!constraints.is_constrained(dof_indices[cf]))
-            {
-              for(unsigned int i = 0; i < size; ++i)
-                for(unsigned int c = 0; c < n_components; ++c)
-                  AssertThrow(dof_indices[cf + c * size + i] ==
-                                dof_indices[cf] + i * n_components + c,
-                              ExcMessage("Expected contiguous numbering"));
-              compressed_dof_indices[offset + renumber_lex[cc]] =
-                part.global_to_local(dof_indices[cf]);
-            }
-            ++cc;
-            cf += size * n_components;
-          }
-          for(unsigned int quad = 0; quad < GeometryInfo<dim>::quads_per_cell; ++quad)
-          {
-            const unsigned int size = (fe_degree - 1) * (fe_degree - 1);
-            if(!constraints.is_constrained(dof_indices[cf]))
-            {
-              // switch order x-z for y faces in 3D to lexicographic layout
-              if(dim == 3 && (quad == 2 || quad == 3))
-                for(unsigned int i1 = 0, i = 0; i1 < fe_degree - 1; ++i1)
-                  for(unsigned int i0 = 0; i0 < fe_degree - 1; ++i0, ++i)
-                    for(unsigned int c = 0; c < n_components; ++c)
-                    {
-                      AssertThrow(dof_indices[cf + c * size + i0 * (fe_degree - 1) + i1] ==
-                                    dof_indices[cf] + i * n_components + c,
-                                  ExcMessage("Expected contiguous numbering"));
-                    }
-              else
-                for(unsigned int i = 0; i < size; ++i)
-                  for(unsigned int c = 0; c < n_components; ++c)
-                    AssertThrow(dof_indices[cf + c * size + i] ==
-                                  dof_indices[cf] + i * n_components + c,
-                                ExcMessage("Expected contiguous numbering"));
-              compressed_dof_indices[offset + renumber_lex[cc]] =
-                part.global_to_local(dof_indices[cf]);
-            }
-            ++cc;
-            cf += size * n_components;
-          }
-          for(unsigned int hex = 0; hex < GeometryInfo<dim>::hexes_per_cell; ++hex)
-          {
-            const unsigned int size = (fe_degree - 1) * (fe_degree - 1) * (fe_degree - 1);
-            if(!constraints.is_constrained(dof_indices[cf]))
-            {
-              for(unsigned int i = 0; i < size; ++i)
-                for(unsigned int c = 0; c < n_components; ++c)
-                  AssertThrow(dof_indices[cf + c * size + i] ==
-                                dof_indices[cf] + i * n_components + c,
-                              ExcMessage("Expected contiguous numbering"));
-              compressed_dof_indices[offset + renumber_lex[cc]] =
-                part.global_to_local(dof_indices[cf]);
-            }
-            ++cc;
-            cf += size * n_components;
-          }
-          AssertThrow(cc == Utilities::pow(3, dim),
-                      ExcMessage("Expected 3^dim dofs, got " + std::to_string(cc)));
-          AssertThrow(cf == dof_indices.size(),
-                      ExcMessage("Expected (fe_degree+1)^dim dofs, got " + std::to_string(cf)));
+          resolve_identity_constraints(dof_indices);
+          compress_indices(dof_indices, out);
         }
       }
 
-      for(unsigned int i = 0; i < Utilities::pow<unsigned int>(stored_dofs_per_direction, dim); ++i)
+      for(unsigned int i = 0; i < n_stored_dofs; ++i)
         for(unsigned int v = 0; v < n_lanes; ++v)
-          if(compressed_dof_indices[Utilities::pow<unsigned int>(stored_dofs_per_direction, dim) *
-                                      (n_lanes * c) +
-                                    i * n_lanes + v] == numbers::invalid_unsigned_int)
-            all_indices_unconstrained[Utilities::pow(stored_dofs_per_direction, dim) * c + i] = 0;
+          if(compressed_dof_indices[n_stored_dofs * (n_lanes * c) + i * n_lanes + v] ==
+             numbers::invalid_unsigned_int)
+            all_indices_unconstrained[n_stored_dofs * c + i] = 0;
     }
 
     cell_level_index.resize(matrix_free.n_cell_batches());
@@ -533,34 +639,25 @@ public:
     }
   }
 
-  template<int degree>
+  // Add the cell-local values of the given cell batch into dst. On cells
+  // with hanging nodes, the cell-local values are first multiplied by the
+  // transpose of the hanging-node interpolation, unless apply_hanging_nodes
+  // is false (e.g. for the diagonal). Note that dof_values get overwritten
+  // in that case.
+  template<int degree, bool apply_hanging_nodes = true>
   void
   distribute_local_to_global(const unsigned int        cell,
                              VectorizedArray<Number> * dof_values,
                              VectorType &              dst) const
   {
-    if constexpr(degree <= 2)
-    {
-      constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
-      const unsigned int *   dof_indices =
-        compressed_dof_indices.data() + cell * dofs_per_cell * n_lanes;
-      const unsigned char * unconstrained = all_indices_unconstrained.data() + cell * dofs_per_cell;
-      for(unsigned int i = 0; i < dofs_per_cell; ++i)
-        if(unconstrained[i])
-          for(unsigned int v = 0; v < n_lanes; ++v)
-            dst.local_element(dof_indices[i * n_lanes + v]) += dof_values[i][v];
-        else
-        {
-          for(unsigned int v = 0; v < n_lanes; ++v)
-            if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
-              dst.local_element(dof_indices[i * n_lanes + v]) += dof_values[i][v];
-        }
-    }
-    else
-      distribute_local_to_global_compressed<degree, degree + 1, 1>(
-        dst, compressed_dof_indices, all_indices_unconstrained, cell, {}, true, dof_values);
+    if constexpr(apply_hanging_nodes)
+      apply_hanging_node_constraints<degree>(cell, true, dof_values);
+    scatter_dof_values<degree>(cell, compressed_dof_indices, dof_values, dst);
   }
 
+  // Read the cell-local values of the given cell batch from src, i.e., the
+  // values including the hanging-node interpolation on cells with hanging
+  // nodes
   template<int degree>
   void
   read_dof_values(const unsigned int        cell,
@@ -588,6 +685,8 @@ public:
     else
       read_dof_values_compressed<degree, degree + 1, 1>(
         src, compressed_dof_indices, all_indices_unconstrained, cell, {}, true, dof_values);
+
+    apply_hanging_node_constraints<degree>(cell, false, dof_values);
   }
 
   const std::vector<unsigned int> &
@@ -596,7 +695,138 @@ public:
     return compressed_dof_indices;
   }
 
+  // Return the compressed indices where the entities that are replaced by
+  // the coarse side of a hanging-node constraint are set to invalid, i.e.,
+  // only those DoFs that are actually owned by the cell (in the sense of the
+  // unconstrained finite element space) are kept. This is the index set
+  // needed for the fine side of transfer operators.
+  std::vector<unsigned int>
+  get_compressed_dof_indices_without_hanging_nodes() const
+  {
+    std::vector<unsigned int> indices = compressed_dof_indices;
+    for(const unsigned int i : positions_replaced_by_hanging_nodes)
+      indices[i] = numbers::invalid_unsigned_int;
+    return indices;
+  }
+
+  bool
+  has_hanging_nodes() const
+  {
+    return !hanging_node_masks.empty();
+  }
+
+  // Return the hanging-node constraint kind of all lanes of the cell batches,
+  // empty if the mesh does not have hanging nodes
+  const std::vector<
+    std::array<internal::MatrixFreeFunctions::compressed_constraint_kind, n_lanes>> &
+  get_hanging_node_masks() const
+  {
+    return hanging_node_masks;
+  }
+
 private:
+  // Apply the hanging-node interpolation (transpose = false) or its
+  // transpose to the cell-local values of a cell batch, doing nothing on
+  // batches without hanging nodes
+  template<int degree>
+  void
+  apply_hanging_node_constraints(const unsigned int        cell,
+                                 const bool                transpose,
+                                 VectorizedArray<Number> * dof_values) const
+  {
+    if(!batch_has_hanging_nodes.empty() && batch_has_hanging_nodes[cell])
+      internal::FEEvaluationImplHangingNodes<dim, VectorizedArray<Number>>::template run<degree,
+                                                                                         Number>(
+        1, matrix_free.get_shape_info(), transpose, hanging_node_masks[cell], dof_values);
+  }
+
+  // Same as above for a single lane of a cell batch with values of type
+  // Number, used by the transfer operators
+  template<int degree>
+  void
+  apply_hanging_node_constraints(const unsigned int cell,
+                                 const unsigned int lane,
+                                 const bool         transpose,
+                                 Number *           dof_values) const
+  {
+    if(batch_has_hanging_nodes.empty() ||
+       hanging_node_masks[cell][lane] ==
+         internal::MatrixFreeFunctions::unconstrained_compressed_constraint_kind)
+      return;
+
+    // broadcast the values to all lanes with the same mask, as the kernel
+    // works on full cell batches
+    const unsigned int dofs_per_cell = matrix_free.get_shape_info().dofs_per_component_on_cell;
+    AlignedVector<VectorizedArray<Number>> values(dofs_per_cell);
+    for(unsigned int i = 0; i < dofs_per_cell; ++i)
+      values[i] = dof_values[i];
+    std::array<internal::MatrixFreeFunctions::compressed_constraint_kind, n_lanes> mask;
+    mask.fill(hanging_node_masks[cell][lane]);
+    internal::FEEvaluationImplHangingNodes<dim, VectorizedArray<Number>>::template run<degree,
+                                                                                       Number>(
+      1, matrix_free.get_shape_info(), transpose, mask, values.data());
+    for(unsigned int i = 0; i < dofs_per_cell; ++i)
+      dof_values[i] = values[i][0];
+  }
+
+  // Add the values of a cell batch into dst at the positions given by
+  // dst_indices, in the format of compressed_dof_indices
+  template<int degree, typename DstVectorType>
+  void
+  scatter_dof_values(const unsigned int                cell,
+                     const std::vector<unsigned int> & dst_indices,
+                     VectorizedArray<Number> *         dof_values,
+                     DstVectorType &                   dst) const
+  {
+    if constexpr(degree <= 2)
+    {
+      constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
+      const unsigned int *   dof_indices   = dst_indices.data() + cell * dofs_per_cell * n_lanes;
+      const unsigned char * unconstrained = all_indices_unconstrained.data() + cell * dofs_per_cell;
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        if(unconstrained[i])
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            dst.local_element(dof_indices[i * n_lanes + v]) += dof_values[i][v];
+        else
+        {
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            if(dof_indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+              dst.local_element(dof_indices[i * n_lanes + v]) += dof_values[i][v];
+        }
+    }
+    else
+      distribute_local_to_global_compressed<degree, degree + 1, 1>(
+        dst, dst_indices, all_indices_unconstrained, cell, {}, true, dof_values);
+  }
+
+  // Apply the operator on the cell-local values of a cell batch, given and
+  // returned in the nodal basis in values
+  template<int degree>
+  void
+  apply_cell_operation_local(const unsigned int cell_index, VectorizedArray<Number> * values) const
+  {
+    const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data =
+      matrix_free.get_shape_info().data[0];
+    dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_evenodd,
+                                                  dealii::internal::EvaluatorQuantity::value,
+                                                  dim,
+                                                  degree + 1,
+                                                  degree + 1>::do_forward(1,
+                                                                          shape_data
+                                                                            .shape_values_eo,
+                                                                          values,
+                                                                          values);
+    AssertThrow(factor_laplace != 0, ExcNotImplemented());
+    compute_cell_lapl<degree + 1>(
+      shape_data, mapping_info, cell_index, factor_mass, factor_laplace, values, values);
+    dealii::internal::FEEvaluationImplBasisChange<
+      dealii::internal::evaluate_evenodd,
+      dealii::internal::EvaluatorQuantity::value,
+      dim,
+      degree + 1,
+      degree + 1>::do_backward(1, shape_data.shape_values_eo, false, values, values);
+  }
+
   // Set up the scratch array of vmult_scratch() with the vertices, lines,
   // quads and hexes of the element as entities
   void
@@ -709,6 +939,18 @@ private:
     constexpr unsigned int  n_q_points    = Utilities::pow(n_q_points_1d, dim);
     VectorizedArray<Number> quad_values[n_q_points];
 
+    // Cell batches with hanging nodes: the hanging-node interpolation acts
+    // on the nodal values, so read the values without interleaving the
+    // first step of sum factorization as done in the fast path below
+    if(!batch_has_hanging_nodes.empty() && batch_has_hanging_nodes[cell_index])
+    {
+      read_dof_values<degree>(cell_index, src, quad_values);
+      apply_cell_operation_local<degree>(cell_index, quad_values);
+      apply_hanging_node_constraints<degree>(cell_index, true, quad_values);
+      scatter_dof_values<degree>(cell_index, dst_indices, quad_values, dst);
+      return;
+    }
+
     const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data =
       matrix_free.get_shape_info().data[0];
     if(degree <= 2)
@@ -804,6 +1046,23 @@ private:
       matrix_free.get_shape_info().data[0];
     if(evaluate_operator)
       apply_cell_operation<degree>(cell_index, src, compressed_dof_indices, dst);
+    else if(!batch_has_hanging_nodes.empty() && batch_has_hanging_nodes[cell_index])
+    {
+      // On cells with hanging nodes, compute the diagonal of C^T A C, with
+      // C the hanging-node interpolation, column by column
+      VectorizedArray<Number> diag_values[n_q_points];
+      for(unsigned int i = 0; i < n_q_points; ++i)
+      {
+        for(unsigned int j = 0; j < n_q_points; ++j)
+          quad_values[j] = VectorizedArray<Number>();
+        quad_values[i] = Number(1.);
+        apply_hanging_node_constraints<degree>(cell_index, false, quad_values);
+        apply_cell_operation_local<degree>(cell_index, quad_values);
+        apply_hanging_node_constraints<degree>(cell_index, true, quad_values);
+        diag_values[i] = quad_values[i];
+      }
+      distribute_local_to_global<degree, false>(cell_index, diag_values, dst);
+    }
     else
     {
       VectorizedArray<Number> diag_values[n_q_points];
@@ -854,7 +1113,7 @@ private:
         // write diagonal entry to global vector
         diag_values[i] = sum;
       }
-      distribute_local_to_global<degree>(cell_index, diag_values, dst);
+      distribute_local_to_global<degree, false>(cell_index, diag_values, dst);
     }
   }
 
@@ -1336,12 +1595,59 @@ public:
     }
   }
 
+  // Read the cell-local values of a single lane of a cell batch, i.e., the
+  // values including the hanging-node interpolation on cells with hanging
+  // nodes
   template<int fe_degree_templ = -1>
   void
   read_dof_values_compressed(const VectorType & vec,
                              const unsigned int cell_no,
                              const unsigned int simd_lane,
                              Number *           dof_values) const
+  {
+    read_dof_values_compressed_raw<fe_degree_templ>(vec, cell_no, simd_lane, dof_values);
+    apply_hanging_node_constraints<fe_degree_templ>(cell_no, simd_lane, false, dof_values);
+  }
+
+  // Add the cell-local values of a single lane of a cell batch into vec,
+  // multiplied by the transpose of the hanging-node interpolation on cells
+  // with hanging nodes
+  template<int fe_degree_templ = -1>
+  void
+  distribute_local_to_global_compressed(VectorType &       vec,
+                                        const unsigned int cell_no,
+                                        const unsigned int simd_lane,
+                                        const Number *     dof_values) const
+  {
+    if(!batch_has_hanging_nodes.empty() &&
+       hanging_node_masks[cell_no][simd_lane] !=
+         internal::MatrixFreeFunctions::unconstrained_compressed_constraint_kind)
+    {
+      std::vector<Number> values(dof_values,
+                                 dof_values +
+                                   matrix_free.get_shape_info().dofs_per_component_on_cell);
+      apply_hanging_node_constraints<fe_degree_templ>(cell_no, simd_lane, true, values.data());
+      distribute_local_to_global_compressed_raw<fe_degree_templ>(vec,
+                                                                 cell_no,
+                                                                 simd_lane,
+                                                                 values.data());
+    }
+    else
+      distribute_local_to_global_compressed_raw<fe_degree_templ>(vec,
+                                                                 cell_no,
+                                                                 simd_lane,
+                                                                 dof_values);
+  }
+
+private:
+  // Read the values at the positions of the compressed indices of a single
+  // lane of a cell batch, without hanging-node interpolation
+  template<int fe_degree_templ = -1>
+  void
+  read_dof_values_compressed_raw(const VectorType & vec,
+                                 const unsigned int cell_no,
+                                 const unsigned int simd_lane,
+                                 Number *           dof_values) const
   {
     const unsigned int fe_degree =
       fe_degree_templ > 0 ? fe_degree_templ : matrix_free.get_dof_handler().get_fe().degree;
@@ -1424,12 +1730,14 @@ public:
     }
   }
 
+  // Add values into the positions of the compressed indices of a single
+  // lane of a cell batch, without hanging-node interpolation
   template<int fe_degree_templ = -1>
   void
-  distribute_local_to_global_compressed(VectorType &       vec,
-                                        const unsigned int cell_no,
-                                        const unsigned int simd_lane,
-                                        const Number *     dof_values) const
+  distribute_local_to_global_compressed_raw(VectorType &       vec,
+                                            const unsigned int cell_no,
+                                            const unsigned int simd_lane,
+                                            const Number *     dof_values) const
   {
     const unsigned int fe_degree =
       fe_degree_templ > 0 ? fe_degree_templ : matrix_free.get_dof_handler().get_fe().degree;
@@ -1508,6 +1816,16 @@ private:
   MatrixFree<dim, Number>                matrix_free;
   std::vector<unsigned int>              compressed_dof_indices;
   std::vector<unsigned char>             all_indices_unconstrained;
+
+  // hanging-node data: the constraint kind of all lanes of a cell batch and
+  // a flag whether a batch contains any hanging node, both empty if the mesh
+  // does not have hanging nodes, as well as the positions in
+  // compressed_dof_indices that have been replaced by the indices of the
+  // coarse side
+  std::vector<std::array<internal::MatrixFreeFunctions::compressed_constraint_kind, n_lanes>>
+                             hanging_node_masks;
+  std::vector<unsigned char> batch_has_hanging_nodes;
+  std::vector<unsigned int>  positions_replaced_by_hanging_nodes;
 
   // scratch array of vmult_scratch() and the indices into it, in the
   // format of compressed_dof_indices
@@ -1700,6 +2018,11 @@ public:
         }
 
     mapping_info.reinit(mapping, quadrature, dof_handler.get_triangulation(), cell_level_index);
+    AssertThrow(mapping_info.has_uniform_h_z,
+                ExcNotImplemented("The DG Laplace operator requires all cells to have the "
+                                  "same extent in z direction"));
+    AssertThrow(!dof_handler.get_triangulation().has_hanging_nodes(),
+                ExcNotImplemented("The DG Laplace operator does not support hanging nodes"));
 
     compute_vector_access_pattern();
 

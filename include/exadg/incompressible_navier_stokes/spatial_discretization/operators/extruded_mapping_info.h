@@ -401,8 +401,21 @@ struct MappingInfo
     underlying_quadrature = quadrature_1d;
 
     FloatingPointComparator<double> comparator(triangulation.begin()->diameter() * 1e-10);
-    std::map<Point<2>, std::array<int, 3>, FloatingPointComparator<double>> unique_cells(
-      comparator);
+    std::map<std::array<double, 5>, std::array<int, 3>, FloatingPointComparator<double>>
+      unique_cells(comparator);
+
+    // The geometry of a cell is identified by the xy positions of vertex 0
+    // and the opposite vertex 3 in the xy plane, together with the extent in
+    // z direction. All three are needed on adaptively refined meshes, where
+    // cells of different size can share vertex 0.
+    const auto get_key = [&](const typename Triangulation<dim>::cell_iterator & cell) {
+      const auto vertices = mapping.get_vertices(cell);
+      return std::array<double, 5>{{vertices[0][0],
+                                    vertices[0][1],
+                                    vertices[3][0],
+                                    vertices[3][1],
+                                    dim == 3 ? vertices[4][dim - 1] - vertices[0][dim - 1] : 0.}};
+    };
 
     std::vector<unsigned int> geometry_index(triangulation.n_active_cells(),
                                              numbers::invalid_unsigned_int);
@@ -419,9 +432,8 @@ struct MappingInfo
         const typename Triangulation<dim>::active_cell_iterator cell(&triangulation,
                                                                      cell_level_index[c][v][0],
                                                                      cell_level_index[c][v][1]);
-        const auto vertices = mapping.get_vertices(cell);
-        Point<2>   p(vertices[0][0], vertices[0][1]);
-        const auto position = unique_cells.find(p);
+        const auto                                              p        = get_key(cell);
+        const auto                                              position = unique_cells.find(p);
         if(position == unique_cells.end())
         {
           geometry_index[cell->active_cell_index()] = unique_cells.size();
@@ -434,8 +446,7 @@ struct MappingInfo
     for(const auto & cell : triangulation.active_cell_iterators())
       if(cell->is_ghost())
       {
-        const auto vertices = mapping.get_vertices(cell);
-        Point<2>   p(vertices[0][0], vertices[0][1]);
+        const auto p        = get_key(cell);
         const auto position = unique_cells.find(p);
         if(position == unique_cells.end())
         {
@@ -471,7 +482,13 @@ struct MappingInfo
             (geometry_index[dcell->active_cell_index()] * 4 + f) * n_q_points_1d;
           const bool at_boundary           = dcell->at_boundary(f);
           const bool has_periodic_neighbor = at_boundary && dcell->has_periodic_neighbor(f);
-          if(at_boundary == false || has_periodic_neighbor)
+          // Across faces with hanging nodes, the neighbor can be refined and
+          // the face data of the neighbor does not match the present face.
+          // The face data is only used by face integrals of DG operators,
+          // which do not support hanging nodes, so we simply point to the
+          // data of the present cell.
+          if((at_boundary == false && !dcell->neighbor(f)->has_children()) ||
+             (has_periodic_neighbor && !dcell->periodic_neighbor(f)->has_children()))
           {
             const auto neighbor =
               has_periodic_neighbor ? dcell->periodic_neighbor(f) : dcell->neighbor(f);
@@ -528,6 +545,7 @@ struct MappingInfo
     face_JxW_xy.resize(4 * n_q_points_1d * unique_cells.size());
 
     ip_penalty_factors.resize(unique_cells.size());
+    h_z_values.resize(unique_cells.size());
     for(const auto & [_, index] : unique_cells)
     {
       const typename Triangulation<dim>::cell_iterator cell(&triangulation, index[1], index[2]);
@@ -544,10 +562,7 @@ struct MappingInfo
           (jacobian[0][0] * jacobian[1][1] - jacobian[0][1] * jacobian[1][0]) *
           face_quadrature.weight(q);
         if(dim == 3)
-        {
-          h_z         = jacobian[2][2];
-          h_z_inverse = 1. / h_z;
-        }
+          h_z_values[index[0]] = jacobian[2][2];
         for(unsigned int d = 0; d < 2; ++d)
           for(unsigned int e = 0; e < 2; ++e)
           {
@@ -606,9 +621,31 @@ struct MappingInfo
       // take the two faces in z direction into account; they are always in
       // periodic direction so do not check for boundary
       if(dim == 3)
-        surface_area += 2 * 0.5 * cell_volume / h_z;
+        surface_area += 2 * 0.5 * cell_volume / h_z_values[index[0]];
 
       ip_penalty_factors[index[0]] = surface_area / cell_volume;
+    }
+
+    // The scalar h_z is only meaningful if all cells have the same extent in
+    // z direction, which the operators that use it need to check via
+    // has_uniform_h_z
+    h_z             = dim == 3 ? 1. : 0.;
+    h_z_inverse     = h_z;
+    has_uniform_h_z = true;
+    double min_h_z  = std::numeric_limits<double>::max();
+    double max_h_z  = 0;
+    for(const Number h : h_z_values)
+    {
+      min_h_z = std::min<double>(min_h_z, h);
+      max_h_z = std::max<double>(max_h_z, h);
+    }
+    min_h_z = -Utilities::MPI::max(-min_h_z, triangulation.get_mpi_communicator());
+    max_h_z = Utilities::MPI::max(max_h_z, triangulation.get_mpi_communicator());
+    if(dim == 3 && max_h_z > 0)
+    {
+      has_uniform_h_z = (max_h_z - min_h_z) <= 1e-12 * max_h_z;
+      h_z             = max_h_z;
+      h_z_inverse     = 1. / h_z;
     }
   }
 
@@ -630,11 +667,19 @@ struct MappingInfo
            MemoryConsumption::memory_consumption(face_JxW_xy) +
            MemoryConsumption::memory_consumption(quad_weights_xy) +
            MemoryConsumption::memory_consumption(quad_weights_z) +
-           MemoryConsumption::memory_consumption(ip_penalty_factors) + sizeof(this);
+           MemoryConsumption::memory_consumption(ip_penalty_factors) +
+           MemoryConsumption::memory_consumption(h_z_values) + sizeof(this);
   }
 
-  Number                                            h_z;
-  Number                                            h_z_inverse;
+  // extent of the cells in z direction and its inverse, valid for all cells
+  // only if has_uniform_h_z is true
+  Number h_z;
+  Number h_z_inverse;
+  bool   has_uniform_h_z;
+
+  // extent of the cells in z direction, indexed by the geometry index,
+  // i.e., mapping_data_index / n_q_points_2d
+  std::vector<Number>                               h_z_values;
   std::vector<std::array<unsigned int, n_lanes>>    mapping_data_index;
   AlignedVector<Point<2, Number>>                   quadrature_points;
   AlignedVector<Tensor<2, 2, Number>>               jacobians_xy;

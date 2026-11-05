@@ -144,8 +144,11 @@ public:
       }
     }
 
-    // find unique indices of prolongation to identify the actual read pattern
-    fine_dof_indices = operator_fine.get_compressed_dof_indices();
+    // find unique indices of prolongation to identify the actual read
+    // pattern; on cells with hanging nodes, only the DoFs actually owned by
+    // the cell are considered, because the indices of the coarse side of
+    // hanging-node constraints do not belong to the position within the cell
+    fine_dof_indices = operator_fine.get_compressed_dof_indices_without_hanging_nodes();
     const unsigned int degree_fine =
       operator_fine.get_matrix_free().get_dof_handler().get_fe().degree;
     const unsigned int degree_coarse =
@@ -357,8 +360,11 @@ public:
     const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_coarse)
     : operator_fine(operator_fine), operator_coarse(operator_coarse)
   {
-    // find unique indices of prolongation to identify the actual read pattern
-    fine_dof_indices = operator_fine.get_compressed_dof_indices();
+    // find unique indices of prolongation to identify the actual read
+    // pattern; on cells with hanging nodes, only the DoFs actually owned by
+    // the cell are considered, because the indices of the coarse side of
+    // hanging-node constraints do not belong to the position within the cell
+    fine_dof_indices = operator_fine.get_compressed_dof_indices_without_hanging_nodes();
     const unsigned int degree_fine =
       operator_fine.get_matrix_free().get_dof_handler().get_fe().degree;
     const unsigned int n_owned_dofs =
@@ -794,8 +800,18 @@ private:
       evaluator.template apply<2, true, false>(interpolation_matrix, tmp, tmp);
     }
 
-    operator_fine.template distribute_local_to_global_compressed<size_fine - 1, size_fine, 1>(
-      dst, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
+    if constexpr(size_fine == 2)
+    {
+      // degree 1 stores the 2^dim vertex indices of the cell
+      const unsigned int * indices = fine_dof_indices.data() + cell * dofs_per_cell * n_lanes;
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          if(indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+            dst.local_element(indices[i * n_lanes + v]) += tmp[i][v];
+    }
+    else
+      operator_fine.template distribute_local_to_global_compressed<size_fine - 1, size_fine, 1>(
+        dst, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
   }
 
   template<int size_fine>
@@ -812,8 +828,19 @@ private:
     Number                  tmp2[dofs_per_cell];
     VectorizedArray<Number> interpolation_matrix[size_coarse * size_fine];
 
-    operator_fine.template read_dof_values_compressed<size_fine - 1, size_fine, 1>(
-      src, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
+    if constexpr(size_fine == 2)
+    {
+      // degree 1 stores the 2^dim vertex indices of the cell
+      const unsigned int * indices = fine_dof_indices.data() + cell * dofs_per_cell * n_lanes;
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          tmp[i][v] = indices[i * n_lanes + v] != numbers::invalid_unsigned_int ?
+                        src.local_element(indices[i * n_lanes + v]) :
+                        Number(0);
+    }
+    else
+      operator_fine.template read_dof_values_compressed<size_fine - 1, size_fine, 1>(
+        src, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
     std::array<unsigned int, n_lanes> indices_interpolation;
     dealii::internal::EvaluatorTensorProduct<dealii::internal::evaluate_general,
                                              dim,
@@ -1195,6 +1222,13 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     level_constraints.reinit(dof_h.locally_owned_dofs(),
                              dealii::DoFTools::extract_locally_relevant_dofs(dof_h));
 
+    // hanging nodes need to be added before the periodicity constraints;
+    // since the latter skip already constrained DoFs, hanging DoFs on
+    // periodic faces stay hanging-node constrained on both sides
+    const bool has_hanging_nodes = dof_h.get_triangulation().has_hanging_nodes();
+    if(has_hanging_nodes)
+      dealii::DoFTools::make_hanging_node_constraints(dof_h, level_constraints);
+
     dealii::ndarray<unsigned int, dim, 2> periodic_ids;
     for(unsigned int d = 0; d < dim; ++d)
       for(unsigned int e = 0; e < 2; ++e)
@@ -1229,6 +1263,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     dealii::DoFRenumbering::matrix_free_data_locality(dof_h, level_constraints, mf_data);
     level_constraints.reinit(dof_h.locally_owned_dofs(),
                              dealii::DoFTools::extract_locally_relevant_dofs(dof_h));
+    if(has_hanging_nodes)
+      dealii::DoFTools::make_hanging_node_constraints(dof_h, level_constraints);
     for(const auto & face_pair : periodic_faces)
       ExaDG::Periodicity::make_periodicity_constraints_recursively(
         face_pair.cell[0]->face(face_pair.face_idx[0]),
@@ -1340,6 +1376,27 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     timings.clear();
     timings.resize(max_level + 2);
     count_times = 0;
+
+    // record the size of each level for the statistics printed with the
+    // timings, the last entry is the DG level
+    const auto describe_level = [](const dealii::DoFHandler<dim> & dof_h) {
+      const Triangulation<dim> &            tria = dof_h.get_triangulation();
+      std::vector<types::global_cell_index> n_cells(tria.n_global_levels());
+      for(const auto & cell : tria.active_cell_iterators())
+        if(cell->is_locally_owned())
+          ++n_cells[cell->level()];
+      dealii::Utilities::MPI::sum(n_cells, tria.get_mpi_communicator(), n_cells);
+      std::string cells;
+      for(unsigned int l = 0; l < n_cells.size(); ++l)
+        if(n_cells[l] > 0)
+          cells +=
+            (cells.empty() ? "L" : ", L") + std::to_string(l) + ": " + std::to_string(n_cells[l]);
+      return LevelDescription{dof_h.get_fe().degree, dof_h.n_dofs(), cells};
+    };
+    level_descriptions.clear();
+    for(unsigned int level = min_level; level <= max_level; ++level)
+      level_descriptions.push_back(describe_level(dof_handler_hierarchy[level]));
+    level_descriptions.push_back(describe_level(dof_handler));
   }
 
   ~PoissonPreconditionerMG()
@@ -1372,14 +1429,20 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
           all_time += time;
       std::cout << "Collected multigrid timings in " << count_times
                 << " evaluations [t_total=" << all_time << "s, max over processes]" << std::endl;
-      std::cout << "Level   smooth      residual    restrict    prolongate   [rel. share]"
-                << std::endl;
+      std::size_t cells_width = 6;
+      for(const auto & description : level_descriptions)
+        cells_width = std::max(cells_width, description.cells.size() + 2);
+      std::cout << "Level   degree  dofs        " << std::left << std::setw(cells_width) << "cells"
+                << "smooth      residual    restrict    prolongate   [rel. share]" << std::endl;
       for(unsigned int i = 0; i < timings.size(); ++i)
       {
-        std::cout << std::left << std::scientific << std::setw(8) << i << std::setw(12)
-                  << std::setprecision(3) << timings[i][1] << std::setw(12) << timings[i][2]
-                  << std::setw(12) << timings[i][0] << std::setw(13) << timings[i][3]
-                  << std::defaultfloat
+        const LevelDescription & description = level_descriptions[i];
+        std::cout << std::left << std::setw(8) << i << std::setw(8)
+                  << (std::to_string(description.degree) + (i + 1 < timings.size() ? "" : "DG"))
+                  << std::setw(12) << description.n_dofs << std::setw(cells_width)
+                  << description.cells << std::scientific << std::setw(12) << std::setprecision(3)
+                  << timings[i][1] << std::setw(12) << timings[i][2] << std::setw(12)
+                  << timings[i][0] << std::setw(13) << timings[i][3] << std::defaultfloat
                   << (timings[i][0] + timings[i][1] + timings[i][2] + timings[i][3]) / all_time *
                        100
                   << "%" << std::endl;
@@ -1555,6 +1618,16 @@ private:
 
   mutable std::size_t                        count_times;
   mutable std::vector<std::array<double, 4>> timings;
+
+  // polynomial degree, number of DoFs, and number of active cells per
+  // refinement level of the triangulation for each multigrid level
+  struct LevelDescription
+  {
+    unsigned int                    degree;
+    dealii::types::global_dof_index n_dofs;
+    std::string                     cells;
+  };
+  std::vector<LevelDescription> level_descriptions;
 
   mutable VectorType rhs_dg;
   mutable VectorType solution_update_dg;
