@@ -230,7 +230,11 @@ private:
                          bool const   force_write) const
   {
     const double vec_norm =
-      (consistent_splitting_operator && time_step_number != dealii::numbers::invalid_unsigned_int) ?
+      (consistent_splitting_operator && time_step_number != dealii::numbers::invalid_unsigned_int &&
+       (time_step_number < 20 || force_write ||
+        dealii::Utilities::MPI::broadcast(this->mpi_comm, accumulated_flow_rate_results.size(), 0) >
+          my_pp_data.line_plot_data.time_control_data_statistics
+            .write_preliminary_results_every_nth_time_step)) ?
         consistent_splitting_operator->velocity_vector->l2_norm() :
         0.;
     // write output file
