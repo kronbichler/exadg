@@ -29,9 +29,29 @@
 #include <cmath>
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 namespace ExaDG
 {
+namespace internal
+{
+// Detect operators that let other processes read the source vector of
+// vmult_scratch() until the next call, see
+// RTOperator::RaviartThomasOperator::vmult_scratch()
+template<typename OperatorType, typename = void>
+struct has_pending_source_reads : std::false_type
+{
+};
+
+template<typename OperatorType>
+struct has_pending_source_reads<
+  OperatorType,
+  std::void_t<decltype(std::declval<const OperatorType &>().wait_until_source_vector_free())>>
+  : std::true_type
+{
+};
+} // namespace internal
+
 /**
  * Chebyshev iteration of the first kind with a point-Jacobi preconditioner,
  * with the same coefficients as dealii::PreconditionChebyshev for given
@@ -76,6 +96,11 @@ public:
   {
     AssertThrow(additional_data.preconditioner.get() != nullptr,
                 dealii::ExcMessage("Chebyshev iteration needs a preconditioner"));
+    // solution_old may hold the source vector of the last product, which
+    // other processes may still read
+    if constexpr(internal::has_pending_source_reads<OperatorType>::value)
+      if(this->matrix != nullptr)
+        this->matrix->wait_until_source_vector_free();
     this->matrix = &matrix;
     data         = additional_data;
 

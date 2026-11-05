@@ -594,6 +594,7 @@ public:
     dispatch_degree([&](auto n_t_constant) {
       unpack_and_complete_tensor<decltype(n_t_constant)::value>(recv_buffer, vector_begin);
     });
+    signal_send_buffer_read();
   }
 
   // Identify the partners in the same shared-memory domain as given by
@@ -676,7 +677,8 @@ public:
     // be confused with messages of other operators
     ierr = MPI_Comm_dup(comm, &comm_done);
     AssertThrowMPI(ierr);
-    done_requests.assign(2 * partners.size(), MPI_REQUEST_NULL);
+    buffer_requests.assign(2 * partners.size(), MPI_REQUEST_NULL);
+    source_requests.assign(2 * partners.size(), MPI_REQUEST_NULL);
   }
 
   // Set the location of the received data for all partners: the receive
@@ -698,6 +700,7 @@ public:
       needs_completion[s.slot] = true;
 
     recv_data.resize(partners.size());
+    reads_send_buffer_in_loop.assign(partners.size(), false);
     {
       dealii::ndarray<const Number *, 2 * dim, n_lanes> no_remote_data;
       for(unsigned int f = 0; f < 2 * dim; ++f)
@@ -742,38 +745,72 @@ public:
           remote_face_data[cell][f][v] = recv_buffer + recv_face_offset[slot];
         }
         else
+        {
           remote_face_data[cell][f][v] = data;
+          if(partner.sm_rank != numbers::invalid_unsigned_int)
+            reads_send_buffer_in_loop[p] = true;
+        }
       }
     }
   }
 
-  // Wait until all partners in shared memory have signaled that they
-  // finished reading the messages in the send buffer and the entries of the
-  // source vector of the last exchange, which must be done before either is
-  // modified, i.e., before returning from an operation using the exchange
+  // The partners in shared memory read two kinds of data of this process:
+  // the messages in its send buffer (ghost values, supplements, and face
+  // data of cells not read directly), when unpacking and, for face data,
+  // during the cell loop, and the entries of the source vector of the cells
+  // they read directly, during the cell loop. They signal the end of both
+  // separately, so that the send buffer can be reused as soon as the
+  // messages have been unpacked, while the source vector stays protected
+  // until the end of their cell loop.
+
+  // Wait until all partners in shared memory have finished reading the
+  // messages of the last exchange in the send buffer, before packing the
+  // next messages
   void
-  wait_until_partners_done_reading() const
+  wait_until_send_buffer_free() const
   {
-    if(!done_requests.empty())
+    if(!buffer_requests.empty())
     {
-      const int ierr = MPI_Waitall(done_requests.size(), done_requests.data(), MPI_STATUSES_IGNORE);
+      const int ierr =
+        MPI_Waitall(buffer_requests.size(), buffer_requests.data(), MPI_STATUSES_IGNORE);
       AssertThrowMPI(ierr);
       std::atomic_thread_fence(std::memory_order_acquire);
     }
   }
 
-  // After the last access to the received face data of an exchange: signal
-  // the partners in shared memory that their send buffer may be reused, and
-  // post the receives of the corresponding signals of the partners reading
-  // from this process. Does nothing if no exchange is pending.
+  // Wait until all partners in shared memory have finished reading the
+  // source vector of the last exchange, which must be done before the
+  // source vector is modified
+  void
+  wait_until_source_vector_free() const
+  {
+    if(!source_requests.empty())
+    {
+      const int ierr =
+        MPI_Waitall(source_requests.size(), source_requests.data(), MPI_STATUSES_IGNORE);
+      AssertThrowMPI(ierr);
+      std::atomic_thread_fence(std::memory_order_acquire);
+    }
+  }
+
+  // After the last access to data of other processes in the cell loop of an
+  // exchange: signal the partners in shared memory that their source vector
+  // (and their send buffer, if face data was read from it in the loop) may
+  // be modified, and post the receives of the corresponding signals of the
+  // partners reading from this process. Does nothing if no exchange is
+  // pending.
   void
   signal_done_reading() const
   {
     if(!exchange_pending)
       return;
     exchange_pending = false;
-    if(done_requests.empty())
+    if(source_requests.empty())
       return;
+    // the requests of the previous exchange must be completed before their
+    // slots are reused; this does not wait in practice, as the partners
+    // signaled before sending the messages of the current exchange
+    wait_until_source_vector_free();
     std::atomic_thread_fence(std::memory_order_release);
     const unsigned int n_partners = partners.size();
     for(unsigned int p = 0; p < n_partners; ++p)
@@ -782,8 +819,14 @@ public:
         int ierr;
         if(partners[p].recv_size > 0)
         {
+          if(reads_send_buffer_in_loop[p])
+          {
+            ierr = MPI_Isend(
+              nullptr, 0, MPI_BYTE, partners[p].rank, mpi_tag, comm_done, &buffer_requests[p]);
+            AssertThrowMPI(ierr);
+          }
           ierr = MPI_Isend(
-            nullptr, 0, MPI_BYTE, partners[p].rank, mpi_tag, comm_done, &done_requests[p]);
+            nullptr, 0, MPI_BYTE, partners[p].rank, mpi_tag + 1, comm_done, &source_requests[p]);
           AssertThrowMPI(ierr);
         }
         if(partners[p].send_size > 0)
@@ -792,9 +835,9 @@ public:
                            0,
                            MPI_BYTE,
                            partners[p].rank,
-                           mpi_tag,
+                           mpi_tag + 1,
                            comm_done,
-                           &done_requests[n_partners + p]);
+                           &source_requests[n_partners + p]);
           AssertThrowMPI(ierr);
         }
       }
@@ -1095,18 +1138,60 @@ private:
   // this process reads from, the second half the receives from the partners
   // reading from this process
   MPI_Comm                         comm_done = MPI_COMM_NULL;
-  mutable std::vector<MPI_Request> done_requests;
+  mutable std::vector<MPI_Request> buffer_requests;
+  mutable std::vector<MPI_Request> source_requests;
   mutable bool                     exchange_pending = false;
+
+  // per partner: whether face data in the send buffer of the partner is read
+  // during the cell loop, so that the end of reading the send buffer is only
+  // signaled after the loop
+  std::vector<bool> reads_send_buffer_in_loop;
+
+  // After unpacking the messages: signal the partners in shared memory whose
+  // send buffer is not read anymore in the cell loop that it may be reused,
+  // and post the receives of the corresponding signals of the partners
+  // reading from this process
+  void
+  signal_send_buffer_read() const
+  {
+    if(buffer_requests.empty())
+      return;
+    std::atomic_thread_fence(std::memory_order_release);
+    const unsigned int n_partners = partners.size();
+    for(unsigned int p = 0; p < n_partners; ++p)
+      if(partners[p].sm_rank != numbers::invalid_unsigned_int)
+      {
+        int ierr;
+        if(partners[p].recv_size > 0 && !reads_send_buffer_in_loop[p])
+        {
+          ierr = MPI_Isend(
+            nullptr, 0, MPI_BYTE, partners[p].rank, mpi_tag, comm_done, &buffer_requests[p]);
+          AssertThrowMPI(ierr);
+        }
+        if(partners[p].send_size > 0)
+        {
+          ierr = MPI_Irecv(nullptr,
+                           0,
+                           MPI_BYTE,
+                           partners[p].rank,
+                           mpi_tag,
+                           comm_done,
+                           &buffer_requests[n_partners + p]);
+          AssertThrowMPI(ierr);
+        }
+      }
+  }
 
   void
   free_communication()
   {
-    if(!done_requests.empty())
-    {
-      const int ierr = MPI_Waitall(done_requests.size(), done_requests.data(), MPI_STATUSES_IGNORE);
-      AssertThrowMPI(ierr);
-      done_requests.clear();
-    }
+    for(std::vector<MPI_Request> * requests : {&buffer_requests, &source_requests})
+      if(!requests->empty())
+      {
+        const int ierr = MPI_Waitall(requests->size(), requests->data(), MPI_STATUSES_IGNORE);
+        AssertThrowMPI(ierr);
+        requests->clear();
+      }
     if(comm_done != MPI_COMM_NULL)
     {
       const int ierr = MPI_Comm_free(&comm_done);
@@ -1316,7 +1401,7 @@ private:
   void
   unpack_and_complete_tensor(Number * recv_buffer, Number * vector_begin) const
   {
-    if(!copy_to_recv_buffer.empty() || !done_requests.empty())
+    if(!copy_to_recv_buffer.empty() || !buffer_requests.empty())
       std::atomic_thread_fence(std::memory_order_acquire);
     unpack_ghost_section(vector_begin);
 
