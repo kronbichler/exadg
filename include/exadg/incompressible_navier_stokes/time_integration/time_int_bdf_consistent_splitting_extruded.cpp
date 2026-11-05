@@ -61,8 +61,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
     pressure_nbc_rhs(this->param.order_extrapolation_pressure_nbc),
     factors_time_step_mass{},
     momentum_sliding_max_eigenvalue(0),
-    momentum_sliding_min_eigenvalue(0),
-    momentum_sliding_iteration_count(0),
+    momentum_min_eigenvalue_factor(0),
+    momentum_chebyshev_offset_mean{{0.35, 0.35}},
+    momentum_chebyshev_offset_variance{{0.04, 0.04}},
     factor_cfl(-1.0),
     extra_pressure_nbc(this->param.order_extrapolation_pressure_nbc,
                        this->param.start_with_low_order),
@@ -990,39 +991,68 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       this->get_time_step_number() > 10 && this->get_time_step_number() % 32 != 0 &&
       momentum_solver_chebyshev != nullptr;
 
-    // The clamped reduction is also used to update the iteration count after
-    // a successful Chebyshev solve further down, where an unclamped target
-    // reduction above 2 (very good initial guess) would make the count
-    // negative.
+    // An unclamped target reduction above 2 (very good initial guess) would
+    // make the iteration count negative.
     const double target_reduction    = absolute_residual_target / initial_residual;
     const double requested_reduction = std::clamp(target_reduction, max_reduction_float, 1.9999);
 
-    double solve_time = 0;
+    // Parameters for the selection of the Chebyshev interval and iteration
+    // count: The lower end of the interval is adapted such that a fraction of
+    // 'chebyshev_target_failure_rate' of the Chebyshev solves fails or shows
+    // signs of eigenvalues below the interval, as the CG fallback is cheap
+    // compared to the saved iterations in the other solves. The offset of the reduction model is
+    // tracked by an exponential average with weight 'chebyshev_offset_weight', and we subtract
+    // 'chebyshev_offset_margin' standard deviations as safety.
+    constexpr double chebyshev_target_failure_rate = 0.1;
+    constexpr double chebyshev_controller_gain     = 0.05;
+    constexpr double chebyshev_offset_weight       = 0.1;
+    constexpr double chebyshev_offset_margin       = 0.5;
+    constexpr double chebyshev_min_offset          = 0.;
+    constexpr double chebyshev_max_offset          = 1.;
+
+    double chebyshev_rate   = 0;
+    double lower_eigenvalue = 0;
+    double solve_time       = 0;
     if(try_chebyshev_solver)
     {
-      // This is a convergence formula for the Chebyshev solver, based on the
-      // book by Varga, Matrix Iterative Analysis. Their Chapter 5, page 156,
-      // formula (5.27) provides an error formula, which is then solved for
-      // the iteration number 'm'.
-      const double iteration_count_guess =
-        std::log(2. / requested_reduction) * 0.5 *
-        std::sqrt(std::max(momentum_sliding_max_eigenvalue / momentum_sliding_min_eigenvalue, 1.0));
+      // The lower end of the interval is the analytical lower bound of the
+      // eigenvalues times an adaptive factor, which is at least one (the
+      // analytical bound is safe) and keeps the interval reasonably wide.
+      const double upper_eigenvalue = momentum_sliding_max_eigenvalue;
+      lower_eigenvalue = std::min(std::max(momentum_min_eigenvalue_factor, 1.) * min_eig_estimate,
+                                  0.5 * upper_eigenvalue);
+      momentum_solver_chebyshev->set_eigenvalue_range(lower_eigenvalue, upper_eigenvalue);
 
-      // In case we have past solutions with Chebyshev, we might have found
-      // out that the estimation with the Varga formula is too pessimistic (as
-      // not all eigenvalues are presented in the present right-hand side). We
-      // thus use an exponential sliding average with the worst-case estimate
-      // 'iteration_count_guess' and previous experience.
-      if(momentum_sliding_iteration_count == 0)
-        momentum_sliding_iteration_count = iteration_count_guess;
-      else
-        momentum_sliding_iteration_count =
-          0.8 * momentum_sliding_iteration_count + 0.2 * iteration_count_guess;
-
-      n_iterations =
-        std::clamp(static_cast<unsigned int>(std::ceil(momentum_sliding_iteration_count)),
-                   1u,
-                   this->param.solver_data_momentum.max_iter);
+      // The error formula for the Chebyshev iteration from the book by Varga,
+      // Matrix Iterative Analysis, Chapter 5, page 156, formula (5.27), gives
+      // a residual reduction of 2 sigma^m / (1 + sigma^{2m}) ~ 2 sigma^m
+      // after m iterations with sigma = (sqrt(kappa) - 1) / (sqrt(kappa) + 1)
+      // and kappa = upper / lower. As long as the interval contains the
+      // spectrum, the achieved reduction follows
+      //   log(2 / reduction) = m * rate + c,  rate = -log(sigma),
+      // where the offset c is approximately constant (around log(sqrt(2))
+      // for residuals spread over the spectrum), because the Chebyshev
+      // polynomial equioscillates in the interval. In practice, c differs
+      // between even and odd degrees, as the polynomials take different
+      // values where the eigenvalues of the residual cluster, so we track c
+      // separately for both parities from previous solves. We select the
+      // smallest count such that the final residual after 'n_iterations'
+      // iterations reaches the target.
+      const double sqrt_kappa = std::sqrt(upper_eigenvalue / lower_eigenvalue);
+      chebyshev_rate          = std::log((sqrt_kappa + 1.) / (sqrt_kappa - 1.));
+      std::array<double, 2> offset;
+      for(unsigned int p = 0; p < 2; ++p)
+        offset[p] = momentum_chebyshev_offset_mean[p] -
+                    chebyshev_offset_margin * std::sqrt(momentum_chebyshev_offset_variance[p]);
+      const double required_log_reduction = std::log(2. / requested_reduction);
+      const double max_iter = static_cast<double>(this->param.solver_data_momentum.max_iter);
+      n_iterations          = static_cast<unsigned int>(std::clamp(
+        std::ceil((required_log_reduction - std::max(offset[0], offset[1])) / chebyshev_rate),
+        2.,
+        max_iter));
+      while(n_iterations < max_iter &&
+            n_iterations * chebyshev_rate + offset[n_iterations % 2] < required_log_reduction)
+        ++n_iterations;
       momentum_solver_chebyshev->set_degree(n_iterations);
 
       reached_residual =
@@ -1043,14 +1073,68 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     // enough, we intentionally choose a rather big failure factor of 2.5
     // because the Chebyshev solver actually does one more iteration after the
     // one where the residual is gathered.
-    const double chebyshev_failure_factor        = 2.5;
-    const double chebyshev_severe_failure_factor = 6.0;
+    const double chebyshev_failure_factor = 2.5;
     const bool   need_cg_solver =
       !try_chebyshev_solver ||
       reached_residual > chebyshev_failure_factor * absolute_residual_target;
-    const bool had_severe_chebyshev_failure =
-      try_chebyshev_solver &&
-      reached_residual > chebyshev_severe_failure_factor * absolute_residual_target;
+
+    // If Chebyshev did not reduce the residual at all, the upper end of the
+    // interval is probably too small and the iteration diverges, so we
+    // switch to CG in the next time step to get a new estimate.
+    const bool chebyshev_diverged = try_chebyshev_solver && !(reached_residual < initial_residual);
+
+    if(try_chebyshev_solver)
+    {
+      // Observed offset of the reduction model. The returned residual is the
+      // one before the last iteration, i.e., after n_iterations - 1 steps.
+      const double achieved_reduction = reached_residual / initial_residual;
+      double       observed_offset    = std::numeric_limits<double>::quiet_NaN();
+      if(achieved_reduction > 0 && achieved_reduction < 1.)
+        observed_offset = std::log(2. / achieved_reduction) - (n_iterations - 1) * chebyshev_rate;
+
+      // An offset below 'chebyshev_min_offset' cannot be explained by the
+      // distribution of the residual over the interval (where the offset is
+      // positive for an equioscillating polynomial), but indicates
+      // eigenvalues below the interval, where the residual is damped more
+      // slowly than the rate of the interval suggests. Such solves count as
+      // evidence for a too high lower end of the interval like failures, and
+      // they are not used for the offset, because otherwise the offset would
+      // absorb a too narrow interval by more iterations.
+      const bool interval_too_narrow = need_cg_solver || !(observed_offset >= chebyshev_min_offset);
+
+      // Adapt the lower end of the interval such that the rate of solves with
+      // the above evidence approaches the target rate: increase the factor
+      // slightly after every good solve, decrease it more strongly otherwise.
+      // The upper limit avoids that the factor grows beyond the cap of the
+      // interval above, from where it would take many steps to come back.
+      momentum_min_eigenvalue_factor =
+        std::clamp(momentum_min_eigenvalue_factor *
+                     std::exp(chebyshev_controller_gain *
+                              (chebyshev_target_failure_rate - (interval_too_narrow ? 1. : 0.))),
+                   1.,
+                   std::max(1., 0.5 * momentum_sliding_max_eigenvalue / min_eig_estimate));
+
+      if(observed_offset >= chebyshev_min_offset)
+      {
+        const unsigned int p         = (n_iterations - 1) % 2;
+        const double       deviation = observed_offset - momentum_chebyshev_offset_mean[p];
+        momentum_chebyshev_offset_mean[p] =
+          std::clamp(momentum_chebyshev_offset_mean[p] + chebyshev_offset_weight * deviation,
+                     chebyshev_min_offset,
+                     chebyshev_max_offset);
+        momentum_chebyshev_offset_variance[p] =
+          (1. - chebyshev_offset_weight) *
+          (momentum_chebyshev_offset_variance[p] + chebyshev_offset_weight * deviation * deviation);
+      }
+
+      this->pcout << "Chebyshev its " << n_iterations << " interval [" << std::setprecision(3)
+                  << lower_eigenvalue << ", " << momentum_sliding_max_eigenvalue << "] res/target "
+                  << reached_residual / absolute_residual_target << " offset " << observed_offset
+                  << " mean " << momentum_chebyshev_offset_mean[0] << " "
+                  << momentum_chebyshev_offset_mean[1] << " std "
+                  << std::sqrt(momentum_chebyshev_offset_variance[0]) << " "
+                  << std::sqrt(momentum_chebyshev_offset_variance[1]) << std::endl;
+    }
 
     if(need_cg_solver)
     {
@@ -1118,82 +1202,45 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
               0.7 * momentum_sliding_max_eigenvalue + 0.3 * limited_max_eigenvalue;
         }
 
-        // The Ritz values estimate by SolverCG will always be within the true
-        // eigenvalue range, so add a safety factor to the min eigenvalue as
-        // well. When updating the sliding average, only accept those
-        // estimates not too far off from the previous estimate.
-        const double limited_min_eigenvalue = 0.9 * min_eig;
-        if(momentum_sliding_min_eigenvalue <= 0 ||
-           limited_min_eigenvalue < momentum_sliding_min_eigenvalue)
-          momentum_sliding_min_eigenvalue = limited_min_eigenvalue;
-        else if(limited_min_eigenvalue < 2 * momentum_sliding_min_eigenvalue)
-          momentum_sliding_min_eigenvalue =
-            0.7 * momentum_sliding_min_eigenvalue + 0.3 * limited_min_eigenvalue;
+        // The lower end of the Chebyshev interval is set relative to the
+        // analytical lower bound 'min_eig_estimate' of the eigenvalues,
+        // which follows changes in the time step size immediately. Before the
+        // first Chebyshev solve, we initialize the factor from the smallest
+        // Ritz value of CG (with a safety factor, since Ritz values lie inside
+        // the spectrum); afterwards, the factor is adapted to the observed
+        // failure rate of Chebyshev.
+        if(momentum_min_eigenvalue_factor <= 0 && min_eig_estimate > 0)
+          momentum_min_eigenvalue_factor = std::max(0.9 * min_eig / min_eig_estimate, 1.);
 
-        typename ChebyshevSolver::AdditionalData chebyshev_data;
-        chebyshev_data.preconditioner.reset(&preconditioner_viscous, [](auto *) {
-          // custom deleter that does nothing, since the surrounding class owns
-          // the preconditioner
-        });
+        if(momentum_solver_chebyshev == nullptr && momentum_min_eigenvalue_factor > 0)
+        {
+          typename ChebyshevSolver::AdditionalData chebyshev_data;
+          chebyshev_data.preconditioner.reset(&preconditioner_viscous, [](auto *) {
+            // custom deleter that does nothing, since the surrounding class
+            // owns the preconditioner
+          });
 
-        chebyshev_data.max_eigenvalue = momentum_sliding_max_eigenvalue;
-        chebyshev_data.smoothing_range =
-          momentum_sliding_max_eigenvalue / momentum_sliding_min_eigenvalue;
+          // the actual interval and degree will be set before each solve
+          chebyshev_data.max_eigenvalue  = momentum_sliding_max_eigenvalue;
+          chebyshev_data.smoothing_range = 10.;
+          chebyshev_data.degree          = 1;
 
-        // the actual degree will be set when we know the tolerance for the
-        // solver
-        chebyshev_data.degree = 1;
-
-        momentum_solver_chebyshev = std::make_shared<ChebyshevSolver>();
-        momentum_solver_chebyshev->initialize(*op_rt_float, chebyshev_data);
+          momentum_solver_chebyshev = std::make_shared<ChebyshevSolver>();
+          momentum_solver_chebyshev->initialize(*op_rt_float, chebyshev_data);
+        }
       }
 
-      // If we got here after failing to meet the tolerance of Chebyshev, our
-      // iteration guess that is based on observing previous convergence was
-      // probably too aggressive (or, in rare cases, the estimates for the
-      // eigenvalues yielded bounds where Chebyshev does not converge). For
-      // severe failures, we should use the CG solver in the next iteration to
-      // refresh the eigenvalue/smoothing range parameters and get a better
-      // estimate of the sliding averages of eigenvalues. In any case, also
-      // increase the iterations of Chebyshev to avoid a similar problem next
-      // time around.
-      if(had_severe_chebyshev_failure)
+      // If Chebyshev diverged, the upper end of the interval is probably too
+      // small, so use the CG solver in the next time step to refresh it.
+      // Other failures are handled by the adaptation of the interval and
+      // the observed offset above, without increasing the iteration count.
+      if(chebyshev_diverged)
         momentum_solver_chebyshev.reset();
-      if(try_chebyshev_solver)
-        momentum_sliding_iteration_count += 1;
 
       const double elapsed_time = timer2.wall_time();
       solve_time += elapsed_time;
       stat_momentum_time_solve_cg.add_sample(elapsed_time);
       timer2.restart();
-    }
-    else
-    {
-      // If Chebyshev succeeded, we compute an estimate of the apparent
-      // condition number from the achieved residual reduction, that can then
-      // inform us about what iteration count should have been used. It is
-      // done by rearranging the above Chebyshev iteration count formula for
-      // the condition number. Note that we subtract 1 from the iteration
-      // count because the guess returned by the Chebyshev solver indicates
-      // the residual one iteration before the end. We skip the update when
-      // Chebyshev did not reduce the residual (possible if the initial
-      // residual was already close to the target), because an achieved
-      // reduction close to 2 gives a tiny denominator and thus a huge count.
-      // The result is clamped to the valid range of iteration counts.
-      const double achieved_reduction = reached_residual / initial_residual;
-      if(n_iterations > 1 && achieved_reduction > 0 && achieved_reduction < 1.)
-      {
-        const double denominator = std::log(2.0 / achieved_reduction);
-        if(std::abs(denominator) > max_reduction_float)
-        {
-          momentum_sliding_iteration_count =
-            std::clamp(0.7 * momentum_sliding_iteration_count +
-                         0.3 * static_cast<double>(n_iterations - 1) *
-                           std::log(2. / requested_reduction) / denominator,
-                       1.0,
-                       static_cast<double>(this->param.solver_data_momentum.max_iter));
-        }
-      }
     }
 
     /*

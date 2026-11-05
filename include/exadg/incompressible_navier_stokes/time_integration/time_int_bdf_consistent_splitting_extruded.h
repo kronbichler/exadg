@@ -254,9 +254,15 @@ private:
     PreconditionChebyshevScratch<RTOperator::RaviartThomasOperator<dim, float>>;
   std::shared_ptr<ChebyshevSolver> momentum_solver_chebyshev;
   double                           momentum_sliding_max_eigenvalue;
-  double                           momentum_sliding_min_eigenvalue;
-  double                           momentum_sliding_iteration_count;
-  std::pair<double, double>        momentum_eigenvalue_range_mass;
+  // factor between the analytical lower eigenvalue bound and the lower end
+  // of the Chebyshev interval, adapted to a target failure rate
+  double momentum_min_eigenvalue_factor;
+  // exponential average and variance of the offset c in the Chebyshev
+  // reduction model log(2/reduction) = degree * rate + c, separately for even
+  // and odd polynomial degrees (index degree % 2)
+  std::array<double, 2>     momentum_chebyshev_offset_mean;
+  std::array<double, 2>     momentum_chebyshev_offset_variance;
+  std::pair<double, double> momentum_eigenvalue_range_mass;
 
   double factor_cfl;
 
