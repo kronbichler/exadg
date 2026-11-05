@@ -256,6 +256,7 @@ private:
   double                           momentum_sliding_max_eigenvalue;
   double                           momentum_sliding_min_eigenvalue;
   double                           momentum_sliding_iteration_count;
+  std::pair<double, double>        momentum_eigenvalue_range_mass;
 
   double factor_cfl;
 

@@ -540,7 +540,7 @@ private:
     // for higher Reynolds numbers.
     double const width_factor = static_cast<double>(coarse_mesh_refinements[2]) /
                                 static_cast<double>(coarse_mesh_refinements[0]);
-    width_channel = length_channel * width_factor;
+    width_channel = length_channel * (0.5 + 0.5 * (width_factor - 0.5));
     AssertThrow(width_factor > 0.5 - 1e-12,
                 dealii::ExcMessage("The width of the channel needs to be at least 4.5 times "
                                    "the height of the hill, i.e., W >= 4.5 * H = 0.5 * L. "
