@@ -643,7 +643,7 @@ struct MappingInfo
     max_h_z = Utilities::MPI::max(max_h_z, triangulation.get_mpi_communicator());
     if(dim == 3 && max_h_z > 0)
     {
-      has_uniform_h_z = (max_h_z - min_h_z) <= 1e-12 * max_h_z;
+      has_uniform_h_z = (max_h_z - min_h_z) <= 1e-10 * max_h_z;
       h_z             = max_h_z;
       h_z_inverse     = 1. / h_z;
     }
