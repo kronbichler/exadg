@@ -28,6 +28,7 @@
 
 #include <cmath>
 #include <memory>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -107,10 +108,23 @@ public:
     // lower end of the eigenvalue range as in dealii::PreconditionChebyshev
     const double alpha = data.smoothing_range > 1. ? data.max_eigenvalue / data.smoothing_range :
                                                      0.9 * data.max_eigenvalue;
-    delta              = (data.max_eigenvalue - alpha) * 0.5;
-    theta              = (data.max_eigenvalue + alpha) * 0.5;
+    set_eigenvalue_range(alpha, data.max_eigenvalue);
 
     matrix.initialize_dof_vector(solution_old);
+  }
+
+  // Change the interval [lower, upper] the Chebyshev polynomial is built for,
+  // without touching the vectors, so it can be called before every solve
+  void
+  set_eigenvalue_range(const double lower, const double upper)
+  {
+    Assert(lower > 0 && upper > lower,
+           dealii::ExcMessage("Invalid eigenvalue range [" + std::to_string(lower) + ", " +
+                              std::to_string(upper) + "]"));
+    data.max_eigenvalue  = upper;
+    data.smoothing_range = upper / lower;
+    delta                = (upper - lower) * 0.5;
+    theta                = (upper + lower) * 0.5;
   }
 
   void
