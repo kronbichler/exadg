@@ -271,6 +271,29 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   for(auto & vector : velocity_matvec)
     op_rt_float->initialize_dof_vector(vector);
 
+  if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
+  {
+    // Estimate eigenvalue range of mass matrix with accurate solver and random
+    // vector
+    op_rt->set_parameters(1.0, 0.0);
+    for(double & a : rhs_rt)
+      a = static_cast<double>(rand()) / RAND_MAX;
+    dealii::SolverControl        control(1000, 1e-12 * rhs_rt.l2_norm());
+    dealii::SolverCG<VectorType> solver_cg(control);
+    double                       min_eig = 1, max_eig = 1;
+    solver_cg.connect_eigenvalues_slot([&min_eig, &max_eig](const std::vector<double> & eigval) {
+      if(!eigval.empty())
+      {
+        min_eig = eigval.front();
+        max_eig = eigval.back();
+      }
+    });
+    solver_cg.solve(*op_rt, solution_rt, rhs_rt, preconditioner_mass);
+    this->pcout << "Eigenvalue estimate mass with CG at " << control.last_step()
+                << " iterations: [ " << min_eig << " , " << max_eig << " ]" << std::endl;
+    momentum_eigenvalue_range_mass = std::make_pair(min_eig, max_eig);
+  }
+
   laplace_op = std::make_shared<LaplaceOperator::LaplaceOperatorDG<dim, Number>>();
   laplace_op->reinit(*pde_operator->get_mapping(),
                      pde_operator->get_dof_handler_p(),
@@ -892,13 +915,41 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
      * IV. Update point-Jacobi preconditioner entries
      */
 
-    const unsigned int owned_size = solution_rt.locally_owned_size();
-    DEAL_II_OPENMP_SIMD_PRAGMA
-    for(unsigned int i = 0; i < owned_size; ++i)
-      preconditioner_viscous.get_vector().local_element(i) =
-        1.0f / (float(factor_mass) * diagonal_mass.local_element(i) +
-                float(factor_lapl) * diagonal_laplace.local_element(i));
+    const unsigned int owned_size       = solution_rt.locally_owned_size();
+    float              min_eig_estimate = 0;
+    {
+      constexpr unsigned int         n_lanes        = dealii::VectorizedArray<float>::size();
+      const unsigned int             regular_size   = owned_size / n_lanes * n_lanes;
+      dealii::VectorizedArray<float> min_eig_factor = std::numeric_limits<float>::max();
+      const float *diag_mass = diagonal_mass.begin(), *diag_lapl = diagonal_laplace.begin();
+      float *      diag_prec = preconditioner_viscous.get_vector().begin();
+      for(unsigned int i = 0; i < regular_size; i += n_lanes)
+      {
+        dealii::VectorizedArray<float> diag_mass_i, diag_lapl_i;
+        diag_mass_i.load(diag_mass + i);
+        diag_lapl_i.load(diag_lapl + i);
+        const dealii::VectorizedArray<float> diag_entry =
+          1.0f / (float(factor_mass) * diag_mass_i + float(factor_lapl) * diag_lapl_i);
+        min_eig_factor = std::min(factor_mass * diag_mass_i * diag_entry, min_eig_factor);
+        diag_entry.store(diag_prec + i);
+      }
+      for(unsigned int i = regular_size; i < owned_size; ++i)
+      {
+        diag_prec[i] =
+          1.0f / (float(factor_mass) * diag_mass[i] + float(factor_lapl) * diag_lapl[i]);
+        min_eig_factor[i - regular_size] =
+          std::min(float(factor_mass) * diag_mass[i] * diag_prec[i],
+                   min_eig_factor[i - regular_size]);
+      }
+      min_eig_estimate = min_eig_factor[0];
+      for(unsigned int v = 1; v < n_lanes; ++v)
+        min_eig_estimate = std::min(min_eig_estimate, min_eig_factor[v]);
 
+      if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
+        min_eig_estimate =
+          momentum_eigenvalue_range_mass.first *
+          dealii::Utilities::MPI::min(min_eig_estimate, diagonal_mass.get_mpi_communicator());
+    }
     const double t_residual = timer2.wall_time();
     stat_momentum_time_dp_residual.add_sample(t_residual);
     timer2.restart();
@@ -1034,9 +1085,13 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       // Chebyshev if we did at least 5 iterations, otherwise the CG solution
       // might be too inaccurate and miss high eigenvalues (which leads to
       // convergence problems with Chebyshev).
-      constexpr unsigned int min_eigenvalue_iterations = 5;
+      constexpr unsigned int min_eigenvalue_iterations = 7;
       if(control.last_step() >= min_eigenvalue_iterations && min_eig > 0.0 && max_eig >= min_eig)
       {
+        this->pcout << "Eigenvalue estimate from CG with " << control.last_step()
+                    << " iterations: " << std::setprecision(3) << min_eig << " " << max_eig
+                    << " vs analytical min " << min_eig_estimate << " ratio "
+                    << min_eig / min_eig_estimate << std::endl;
         // Update the estimate for the eigenvalues that we pass to the
         // Chebyshev solver. We use an exponential sliding average here,
         // meaning that the previous value of the quantities is taken into
@@ -1047,19 +1102,14 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         // Only update the upper eigenvalue estimate when we did not do the
         // PreconditionChebyshev case before, because Chebyshev will have
         // damped the high-eigenvalue modes already and thus make them less
-        // visible to SolverCG.  An experience from practice is that the
-        // maximum eigenvalue of a Jacobi-preconditioned matrix stemming from
-        // a reaction-diffusion PDE is at least 2, so use 2.05 as a lower
-        // bound even if CG did not find such a big value. For other
-        // preconditions, we do not have gathered practical bounds that could
-        // be applied yet. This setting avoids some failures in Chebyshev when
-        // CG only does a small number of iterations.
+        // visible to SolverCG. An experience from practice is that the
+        // eigenvalue bound for the mass matrix is a lower bound to the
+        // maximal eigenvalue. This setting avoids some failures in Chebyshev
+        // when CG only does a small number of iterations.
         if(not try_chebyshev_solver)
         {
           const double limited_max_eigenvalue =
-            (this->param.preconditioner_momentum == MomentumPreconditioner::PointJacobi ?
-               std::max(2.05, 1.1 * max_eig) :
-               1.1 * max_eig);
+            std::max(momentum_eigenvalue_range_mass.second, 1.1 * max_eig);
           if(momentum_sliding_max_eigenvalue <= 0 ||
              limited_max_eigenvalue > momentum_sliding_max_eigenvalue)
             momentum_sliding_max_eigenvalue = limited_max_eigenvalue;

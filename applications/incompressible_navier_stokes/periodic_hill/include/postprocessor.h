@@ -229,9 +229,10 @@ private:
                          unsigned int time_step_number,
                          bool const   force_write) const
   {
-    const double vec_norm = consistent_splitting_operator ?
-                              consistent_splitting_operator->velocity_vector->l2_norm() :
-                              0.;
+    const double vec_norm =
+      (consistent_splitting_operator && time_step_number != dealii::numbers::invalid_unsigned_int) ?
+        consistent_splitting_operator->velocity_vector->l2_norm() :
+        0.;
     // write output file
     if(consistent_splitting_operator and my_pp_data.mean_velocity_data.write_to_file == true and
        dealii::Utilities::MPI::this_mpi_process(this->mpi_comm) == 0)
