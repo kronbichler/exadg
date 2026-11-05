@@ -1414,9 +1414,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
   this->pcout << std::endl;
   stat_momentum_iterations_cg.print_statistics(this->pcout, "Momentum iterations CG", 25);
   stat_momentum_iterations_cheby.print_statistics(this->pcout, "Momentum iterations Cheby", 25);
-  stat_momentum_iterations_cg_help.print_statistics(this->pcout,
-                                                    "Momentum iterations CG bk",
-                                                    25);
+  stat_momentum_iterations_cg_help.print_statistics(this->pcout, "Momentum iterations CG bk", 25);
   stat_momentum_rhs_norm.print_statistics(this->pcout, "U rhs norm", 25);
   stat_momentum_residual_start.print_statistics(this->pcout, "U residual start solve", 25);
   stat_momentum_residual_stop.print_statistics(this->pcout, "U residual end solve", 25);
@@ -1457,6 +1455,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::write_restart_vectors() cons
   std::vector<VectorType>         velocity_copied(this->get_size_velocity());
   std::vector<VectorType const *> vectors_velocity;
   std::vector<VectorType const *> vectors_pressure;
+
+  this->pcout << "Writing restart velocity[0]->norm: " << std::setprecision(8)
+              << velocity[0].l2_norm() << std::endl;
 
   for(unsigned int i = 0; i < this->get_size_velocity(); i++)
   {
@@ -1525,6 +1526,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
         pressure_nbc_rhs[i]);
   }
   velocity_np.copy_locally_owned_data_from(vectors_velocity[0]);
+
+  this->pcout << "Reading restart velocity[0]->norm: " << std::setprecision(8)
+              << velocity[0].l2_norm() << std::endl;
 }
 
 // instantiations

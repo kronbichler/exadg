@@ -67,7 +67,7 @@ public:
 
   ~MyPostProcessor()
   {
-    write_flow_rate_output(-1., -1., true);
+    write_flow_rate_output(-1., -1., dealii::numbers::invalid_unsigned_int, true);
   }
 
   void
@@ -132,7 +132,7 @@ public:
       // if done manually in our function rather than
       // mean_velocity_calculator, need to write the file here
       if(consistent_splitting_operator)
-        write_flow_rate_output(flow_rate, time, false);
+        write_flow_rate_output(flow_rate, time, time_step_number, false);
 
       // update body force
       flow_rate_controller.update_body_force(flow_rate, time);
@@ -210,7 +210,7 @@ private:
       momentum_op.evaluate_field(*consistent_splitting_operator->velocity_vector,
                                  indices,
                                  velocities,
-                                 true);
+                                 /* multiply_by_JxW */ true);
       dealii::VectorizedArray<Number> cell_sum = 0;
       for(const auto & velocity : velocities)
         cell_sum += velocity[0];
@@ -224,12 +224,25 @@ private:
   }
 
   void
-  write_flow_rate_output(Number const & value, double const & time, bool const force_write) const
+  write_flow_rate_output(Number const value,
+                         double const time,
+                         unsigned int time_step_number,
+                         bool const   force_write) const
   {
+    const double vec_norm = consistent_splitting_operator ?
+                              consistent_splitting_operator->velocity_vector->l2_norm() :
+                              0.;
     // write output file
     if(consistent_splitting_operator and my_pp_data.mean_velocity_data.write_to_file == true and
        dealii::Utilities::MPI::this_mpi_process(this->mpi_comm) == 0)
     {
+      if(time_step_number < 20 || force_write ||
+         accumulated_flow_rate_results.size() >
+           my_pp_data.line_plot_data.time_control_data_statistics
+             .write_preliminary_results_every_nth_time_step)
+        std::cout << "Flow rate check for vec with norm " << std::setprecision(8) << vec_norm
+                  << " at time " << time << ": " << value << " "
+                  << flow_rate_controller.get_body_force() << std::endl;
       if(force_write || accumulated_flow_rate_results.size() >
                           my_pp_data.line_plot_data.time_control_data_statistics
                             .write_preliminary_results_every_nth_time_step)
