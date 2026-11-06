@@ -229,25 +229,10 @@ private:
                          unsigned int time_step_number,
                          bool const   force_write) const
   {
-    const double vec_norm =
-      (consistent_splitting_operator && time_step_number != dealii::numbers::invalid_unsigned_int &&
-       (time_step_number < 20 || force_write ||
-        dealii::Utilities::MPI::broadcast(this->mpi_comm, accumulated_flow_rate_results.size(), 0) >
-          my_pp_data.line_plot_data.time_control_data_statistics
-            .write_preliminary_results_every_nth_time_step)) ?
-        consistent_splitting_operator->velocity_vector->l2_norm() :
-        0.;
     // write output file
     if(consistent_splitting_operator and my_pp_data.mean_velocity_data.write_to_file == true and
        dealii::Utilities::MPI::this_mpi_process(this->mpi_comm) == 0)
     {
-      if(time_step_number < 20 || force_write ||
-         accumulated_flow_rate_results.size() >
-           my_pp_data.line_plot_data.time_control_data_statistics
-             .write_preliminary_results_every_nth_time_step)
-        std::cout << "Flow rate check for vec with norm " << std::setprecision(8) << vec_norm
-                  << " at time " << time << ": " << value << " "
-                  << flow_rate_controller.get_body_force() << std::endl;
       if(force_write || accumulated_flow_rate_results.size() >
                           my_pp_data.line_plot_data.time_control_data_statistics
                             .write_preliminary_results_every_nth_time_step)
