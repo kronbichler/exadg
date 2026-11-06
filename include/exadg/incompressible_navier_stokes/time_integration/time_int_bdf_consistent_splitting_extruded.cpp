@@ -191,11 +191,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   const std::vector<unsigned int> cell_vectorization_category =
     Helper::compute_vectorization_category(pde_operator->get_dof_handler_u().get_triangulation());
 
-  // communicator of the processes in the same shared-memory domain, used by
-  // the RT operators to exchange face data via shared memory; only needed
-  // during setup. Setting the environment variable EXADG_RT_NO_SHARED_MEMORY
-  // selects the exchange via MPI messages for all processes, e.g. for
-  // comparisons.
+  // Communicator of the processes in the same shared-memory domain, used by
+  // the RT operators to exchange face data via shared memory used during
+  // setup. TODO: Change environment variable to parameter in input file.
   MPI_Comm comm_sm = MPI_COMM_SELF;
   if(std::getenv("EXADG_RT_NO_SHARED_MEMORY") == nullptr)
   {
@@ -262,8 +260,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
 
   for(VectorType & vec : this->vec_convective_term)
     op_rt->initialize_dof_vector(vec);
+
   // vector not used
   this->convective_term_np.reinit(0);
+
   for(VectorType & vector : pressure_nbc_rhs)
     op_rt->initialize_vector_pressure_neumann_boundary(vector);
 
@@ -272,10 +272,11 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   for(auto & vector : velocity_matvec)
     op_rt_float->initialize_dof_vector(vector);
 
+  // Estimate eigenvalue range of mass matrix with accurate solver and random
+  // vector, which is used to derive an analytical lower bound on the
+  // eigenvalue of the momentum matrix for the Chebyshev solver.
   if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
   {
-    // Estimate eigenvalue range of mass matrix with accurate solver and random
-    // vector
     op_rt->set_parameters(1.0, 0.0);
     for(double & a : rhs_rt)
       a = static_cast<double>(rand()) / RAND_MAX;
@@ -290,8 +291,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
       }
     });
     solver_cg.solve(*op_rt, solution_rt, rhs_rt, preconditioner_mass);
-    this->pcout << "Eigenvalue estimate mass with CG at " << control.last_step()
-                << " iterations: [ " << min_eig << " , " << max_eig << " ]" << std::endl;
     momentum_eigenvalue_range_mass = std::make_pair(min_eig, max_eig);
   }
 
@@ -309,9 +308,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   op_rt->initialize_coupling_pressure(pde_operator->get_dof_handler_p().get_fe(),
                                       laplace_op->get_dof_indices());
 
-  // depending on whether we have additional grids provided, enter the path
-  // with semi-coarsening possibilities or the standard path with a classical
-  // polynomial/geometric coarsening
+  // Depending on whether we have additional grids provided, enter the path
+  // with multigrid semi-coarsening or the standard path with a classical
+  // polynomial/geometric coarsening.
   if(pde_operator->get_grid().coarse_triangulations.empty())
     poisson_preconditioner = std::make_shared<LaplaceOperator::PoissonPreconditionerMG<dim, float>>(
       *pde_operator->get_mapping(),
@@ -377,7 +376,8 @@ template<int dim, typename Number>
 void
 TimeIntBDFConsistentSplittingExtruded<dim, Number>::initialize_former_multistep_dof_vectors()
 {
-  // note that the loop begins with i=1, since i=0 is not necessary.
+  // note that the loop begins with i=1, since i=0 is handled by the standard
+  // initial condition.
   for(unsigned int i = 1; i < this->order; ++i)
   {
     if(this->param.ale_formulation)
@@ -832,14 +832,16 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
     // This loop computes the residual vector in double precision as a
     // right-hand side for the actual CG solution and copies the vector to
-    // single precision for the subsequent solution with CG. Note we compute
-    // the extrapolation from the least-squares projection first at this
+    // single precision for the subsequent solution with CG. Note: we compute
+    // the solution guess from the least-squares projection first at this
     // stage, to benefit from data locality in accessing the solution_rt
-    // vector. Also note that we also copy the right-hand side into the second
-    // to last slot of velocity_matvec for usage in the next time step, and
-    // use the last slot of velocity_matvec for the solver. This vector will
-    // not be needed again, as it is overwritten with the mass matrix mat-vec
-    // in the next time step (done in the code above).
+    // vector, whereas in case of extrapolation we have already computed
+    // "solution_rt" in the right-hand side loop. Also note that we also copy
+    // the right-hand side into the last slot of velocity_matvec for usage in
+    // the solver and (if in least-squares mode) in the next time step. This
+    // vector in velocity_matvec will not be needed again, as it held values
+    // from the last previous time step and will be rotated to the front as
+    // the 'new time step' rhs/solution vectors.
     op_rt->set_parameters(-factor_mass, -factor_lapl);
     if(momentum_solver_in_extrapolation_mode)
     {
@@ -913,9 +915,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         });
 
     /*
-     * IV. Update point-Jacobi preconditioner entries
+     * IV. Update point-Jacobi preconditioner entries with vectorized loop
+     * (together with 'min' computation).
      */
-
     const unsigned int owned_size       = solution_rt.locally_owned_size();
     float              min_eig_estimate = 0;
     {
@@ -975,20 +977,14 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
                   this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev,
                 dealii::ExcMessage("For the viscous solver with the extruded specialization "
                                    "of the consistent splitting scheme, only the conjugate "
-                                   "gradient (cg) and the Chebyshev solver are implemented."));
+                                   "gradient (CG) and the Chebyshev solver are implemented."));
 
     // In the startup phase or at certain times, run the CG solver even if
-    // Chebyshev was set as the solver. The reason to run it every 32 steps is
-    // to provide a new eigenvalue estimate but, more importantly, let the CG
-    // solver with its directional minimization clean up the situation from
-    // time to time: Using just Chebyshev might leave some low-amplitude error
-    // components below the threshold for the residual unnoticed for a longer
-    // time, until they reach the residual tolerance. Adding some nonlinearity
-    // like the minimization of CG can be more robust against those undesired
-    // artifacts. Note that this was not tested thoroughly yet.
+    // Chebyshev was set as the solver. From time to time (i.e., every 64
+    // steps), we would like to get a new eigenvalue estimate.
     const bool try_chebyshev_solver =
       this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev &&
-      this->get_time_step_number() > 10 && this->get_time_step_number() % 32 != 0 &&
+      this->get_time_step_number() > 10 && this->get_time_step_number() % 64 != 0 &&
       momentum_solver_chebyshev != nullptr;
 
     // An unclamped target reduction above 2 (very good initial guess) would
@@ -1000,9 +996,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     // count: The lower end of the interval is adapted such that a fraction of
     // 'chebyshev_target_failure_rate' of the Chebyshev solves fails or shows
     // signs of eigenvalues below the interval, as the CG fallback is cheap
-    // compared to the saved iterations in the other solves. The offset of the reduction model is
-    // tracked by an exponential average with weight 'chebyshev_offset_weight', and we subtract
-    // 'chebyshev_offset_margin' standard deviations as safety.
+    // compared to the saved iterations in the other solves. The offset of the
+    // reduction model is tracked by an exponential average with weight
+    // 'chebyshev_offset_weight', and we subtract 'chebyshev_offset_margin'
+    // standard deviations as safety.
     constexpr double chebyshev_target_failure_rate = 0.1;
     constexpr double chebyshev_controller_gain     = 0.05;
     constexpr double chebyshev_offset_weight       = 0.1;
@@ -1072,7 +1069,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     // solver. As to the tolerance to determine whether Chebyshev was good
     // enough, we intentionally choose a rather big failure factor of 2.5
     // because the Chebyshev solver actually does one more iteration after the
-    // one where the residual is gathered.
+    // one where the residual can be gathered cheaply.
     const double chebyshev_failure_factor = 2.5;
     const bool   need_cg_solver =
       !try_chebyshev_solver ||
@@ -1126,14 +1123,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
           (1. - chebyshev_offset_weight) *
           (momentum_chebyshev_offset_variance[p] + chebyshev_offset_weight * deviation * deviation);
       }
-
-      this->pcout << "Chebyshev its " << n_iterations << " interval [" << std::setprecision(3)
-                  << lower_eigenvalue << ", " << momentum_sliding_max_eigenvalue << "] res/target "
-                  << reached_residual / absolute_residual_target << " offset " << observed_offset
-                  << " mean " << momentum_chebyshev_offset_mean[0] << " "
-                  << momentum_chebyshev_offset_mean[1] << " std "
-                  << std::sqrt(momentum_chebyshev_offset_variance[0]) << " "
-                  << std::sqrt(momentum_chebyshev_offset_variance[1]) << std::endl;
     }
 
     if(need_cg_solver)
@@ -1166,16 +1155,12 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
       // Prepare the Chebyshev solver for the other cases in case this is not
       // the cleanup part; we only accept the upper eigenvalue bound for
-      // Chebyshev if we did at least 5 iterations, otherwise the CG solution
+      // Chebyshev if we did at least 7 iterations, otherwise the CG solution
       // might be too inaccurate and miss high eigenvalues (which leads to
       // convergence problems with Chebyshev).
       constexpr unsigned int min_eigenvalue_iterations = 7;
       if(control.last_step() >= min_eigenvalue_iterations && min_eig > 0.0 && max_eig >= min_eig)
       {
-        this->pcout << "Eigenvalue estimate from CG with " << control.last_step()
-                    << " iterations: " << std::setprecision(3) << min_eig << " " << max_eig
-                    << " vs analytical min " << min_eig_estimate << " ratio "
-                    << min_eig / min_eig_estimate << std::endl;
         // Update the estimate for the eigenvalues that we pass to the
         // Chebyshev solver. We use an exponential sliding average here,
         // meaning that the previous value of the quantities is taken into
