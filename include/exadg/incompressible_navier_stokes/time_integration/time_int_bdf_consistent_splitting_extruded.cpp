@@ -946,34 +946,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
         // Create BF16 version of the inverse diagonal
         if(diagonal_bf16 != nullptr)
-        {
-#ifdef __AVX512F__
-          if constexpr(dealii::VectorizedArray<float>::size() == 16)
-          {
-            const __m512i bits = _mm512_castps_si512(diag_entry.data);
-            const __m512i odd = _mm512_and_si512(_mm512_srli_epi32(bits, 16), _mm512_set1_epi32(1));
-            const __m512i rounded =
-              _mm512_add_epi32(bits, _mm512_add_epi32(_mm512_set1_epi32(0x7fff), odd));
-            // values are below 2^16 after the shift, so truncation is exact
-            const __m256i reduced = _mm512_cvtepi32_epi16(_mm512_srli_epi32(rounded, 16));
-            _mm256_storeu_si256(reinterpret_cast<__m256i *>(diagonal_bf16 + i), reduced);
-          }
-#elif defined __AVX2__
-          if constexpr(dealii::VectorizedArray<float>::size() == 8)
-          {
-            const __m256i bits = _mm256_castps_si256(diag_entry.data);
-            const __m256i odd = _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
-            const __m256i rounded =
-              _mm256_add_epi32(bits, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), odd));
-            const __m256i upper = _mm256_srli_epi32(rounded, 16);
-            // AVX2 has no 32->16 bit truncation; pack the two 128-bit halves, which
-            // keeps the order (packus saturates, but all values are in [0, 0xffff])
-            const __m128i reduced =
-              _mm_packus_epi32(_mm256_castsi256_si128(upper), _mm256_extracti128_si256(upper, 1));
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(diagonal_bf16 + i), reduced);
-          }
-#endif
-        }
+          store_float_as_truncated_bf16(diag_entry, diagonal_bf16 + i);
         else
           diag_entry.store(diag_prec + i);
       }
@@ -984,12 +957,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         min_eig_factor[i - regular_size] =
           std::min(float(factor_mass) * diag_mass[i] * diag_i, min_eig_factor[i - regular_size]);
         if(diagonal_bf16 != nullptr)
-        {
-          std::uint32_t bits = std::bit_cast<std::uint32_t>(diag_i);
-          // round to nearest, ties to even, on the upper 16 bits
-          bits += 0x7fffu + ((bits >> 16) & 1u);
-          diagonal_bf16[i] = static_cast<std::uint16_t>(bits >> 16);
-        }
+          store_float_as_truncated_bf16(diag_i, diagonal_bf16 + i);
         else
           diag_prec[i] = diag_i;
       }
@@ -1189,12 +1157,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       {
         DEAL_II_OPENMP_SIMD_PRAGMA
         for(unsigned int i = 0; i < owned_size; ++i)
-        {
-          std::uint32_t entry =
-            static_cast<std::uint32_t>(momentum_solver_chebyshev->data.preconditioner_bf16[i])
-            << 16;
-          preconditioner_viscous.get_vector().local_element(i) = std::bit_cast<float>(entry);
-        }
+          preconditioner_viscous.get_vector().local_element(i) =
+            load_bf16_into_float(momentum_solver_chebyshev->data.preconditioner_bf16.data() + i,
+                                 float());
       }
       if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
         solver_cg.connect_eigenvalues_slot(

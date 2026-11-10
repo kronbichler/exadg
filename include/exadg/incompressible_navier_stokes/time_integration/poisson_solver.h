@@ -1287,20 +1287,22 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       typename SmootherType::AdditionalData smoother_data;
       smoother_data.preconditioner = std::make_shared<SmootherPreconditionerType>();
       mg_matrices[level].compute_inverse_diagonal(smoother_data.preconditioner->get_vector());
+
+      // For 'float' numbers, truncate the diagonal to BF16 format to reduce
+      // memory use
+      if constexpr(std::is_same_v<Number, float>)
       {
         const unsigned int owned_size =
           smoother_data.preconditioner->get_vector().locally_owned_size();
         auto & diagonal_bf16 = smoother_data.preconditioner_bf16;
         diagonal_bf16.resize_fast(owned_size);
+        DEAL_II_OPENMP_SIMD_PRAGMA
         for(unsigned int i = 0; i < owned_size; ++i)
         {
-          std::uint32_t bits;
-          std::memcpy(&bits,
-                      &smoother_data.preconditioner->get_vector().local_element(i),
-                      sizeof(bits));
-          // round to nearest, ties to even, on the upper 16 bits
-          bits += 0x7fffu + ((bits >> 16) & 1u);
-          diagonal_bf16[i] = static_cast<std::uint16_t>(bits >> 16);
+          ExaDG::store_float_as_truncated_bf16(
+            smoother_data.preconditioner->get_vector().local_element(i), diagonal_bf16.data() + i);
+          smoother_data.preconditioner->get_vector().local_element(i) =
+            ExaDG::load_bf16_into_float(diagonal_bf16.data() + i, float());
         }
       }
 
@@ -1334,6 +1336,10 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       else
         smoother_data.max_eigenvalue = eigenvalue_tracker.values.back();
 
+      // For float, we use the bf16 representation
+      if constexpr(std::is_same_v<Number, float>)
+        smoother_data.preconditioner.reset();
+
       mg_smoother[level].initialize(mg_matrices[level], smoother_data);
     }
 
@@ -1352,20 +1358,23 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       typename SmootherTypeDG::AdditionalData smoother_data_dg;
       smoother_data_dg.preconditioner = std::make_shared<SmootherPreconditionerType>();
       dg_matrix.compute_inverse_diagonal(smoother_data_dg.preconditioner->get_vector());
+
+      // For 'float' numbers, truncate the diagonal to BF16 format to reduce
+      // memory use
+      if constexpr(std::is_same_v<Number, float>)
       {
         const unsigned int owned_size =
           smoother_data_dg.preconditioner->get_vector().locally_owned_size();
         auto & diagonal_bf16 = smoother_data_dg.preconditioner_bf16;
         diagonal_bf16.resize_fast(owned_size);
+        DEAL_II_OPENMP_SIMD_PRAGMA
         for(unsigned int i = 0; i < owned_size; ++i)
         {
-          std::uint32_t bits;
-          std::memcpy(&bits,
-                      &smoother_data_dg.preconditioner->get_vector().local_element(i),
-                      sizeof(bits));
-          // round to nearest, ties to even, on the upper 16 bits
-          bits += 0x7fffu + ((bits >> 16) & 1u);
-          diagonal_bf16[i] = static_cast<std::uint16_t>(bits >> 16);
+          ExaDG::store_float_as_truncated_bf16(
+            smoother_data_dg.preconditioner->get_vector().local_element(i),
+            diagonal_bf16.data() + i);
+          smoother_data_dg.preconditioner->get_vector().local_element(i) =
+            ExaDG::load_bf16_into_float(diagonal_bf16.data() + i, float());
         }
       }
       smoother_data_dg.smoothing_range = 20.;
@@ -1393,6 +1402,11 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         smoother_data_dg.max_eigenvalue = 1.0;
       else
         smoother_data_dg.max_eigenvalue = eigenvalue_tracker.values.back();
+
+      // For float, we use the bf16 representation
+      if constexpr(std::is_same_v<Number, float>)
+        smoother_data_dg.preconditioner.reset();
+
       mg_smoother_dg.initialize(dg_matrix, smoother_data_dg);
     }
     auto transfer = std::make_unique<dealii::MGTwoLevelTransfer<dim, VectorType>>();

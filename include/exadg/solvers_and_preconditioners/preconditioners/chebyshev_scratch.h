@@ -54,6 +54,109 @@ struct has_pending_source_reads<
 } // namespace internal
 
 /**
+ * Truncate a float / VectorizedArray<float> number into BF16 format by
+ */
+template<typename Number>
+void
+store_float_as_truncated_bf16(const Number a, std::uint16_t * store_location)
+{
+  static_assert(std::is_same_v<Number, float> ||
+                  std::is_same_v<Number, dealii::VectorizedArray<float>>,
+                "Only conversion float -> BF16 is supported.");
+  if constexpr(std::is_same_v<Number, float>)
+  {
+    std::uint32_t bits = std::bit_cast<std::uint32_t>(a);
+    // round to nearest, ties to even, on the upper 16 bits
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    store_location[0] = static_cast<std::uint16_t>(bits >> 16);
+  }
+  else
+  {
+#ifdef __AVX2__
+    if constexpr(Number::size() == 8)
+    {
+      const __m256i bits = _mm256_castps_si256(a.data);
+      const __m256i odd  = _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
+      const __m256i rounded =
+        _mm256_add_epi32(bits, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), odd));
+      const __m256i upper = _mm256_srli_epi32(rounded, 16);
+      // AVX2 has no 32->16 bit truncation; pack the two 128-bit halves, which
+      // keeps the order (packus saturates, but all values are in [0, 0xffff])
+      const __m128i reduced =
+        _mm_packus_epi32(_mm256_castsi256_si128(upper), _mm256_extracti128_si256(upper, 1));
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(store_location), reduced);
+    }
+    else
+#endif
+#ifdef __AVX512F__
+      if constexpr(Number::size() == 16)
+    {
+      const __m512i bits = _mm512_castps_si512(a.data);
+      const __m512i odd  = _mm512_and_si512(_mm512_srli_epi32(bits, 16), _mm512_set1_epi32(1));
+      const __m512i rounded =
+        _mm512_add_epi32(bits, _mm512_add_epi32(_mm512_set1_epi32(0x7fff), odd));
+      // values are below 2^16 after the shift, so truncation is exact
+      const __m256i reduced = _mm512_cvtepi32_epi16(_mm512_srli_epi32(rounded, 16));
+      _mm256_storeu_si256(reinterpret_cast<__m256i *>(store_location), reduced);
+    }
+    else
+#endif
+      for(unsigned int i = 0; i < Number::size(); ++i)
+      {
+        std::uint32_t bits = std::bit_cast<std::uint32_t>(a[i]);
+        bits += 0x7fffu + ((bits >> 16) & 1u);
+        store_location[i] = static_cast<std::uint16_t>(bits >> 16);
+      }
+  }
+}
+
+/**
+ * Load data item from a std::uint16_t array (representing an FP type) into a
+ * float/VectorizedArray<float> field. This works by a left-shift the loaded
+ * uint-16 to the left 16 bits of a 32-bit integer, which is then
+ * reinterpreted as float.
+ */
+template<typename Number>
+Number
+load_bf16_into_float(const std::uint16_t * ptr, const Number)
+{
+  static_assert(std::is_same_v<Number, float> ||
+                  std::is_same_v<Number, dealii::VectorizedArray<float>>,
+                "Only conversion BF16 -> float is supported.");
+
+  if constexpr(std::is_same_v<Number, float>)
+    return std::bit_cast<float>(static_cast<std::uint32_t>(ptr[0]) << 16);
+  else
+  {
+#ifdef __AVX2__
+    if constexpr(Number::size() == 8)
+    {
+      Number result;
+      result.data = _mm256_castsi256_ps(_mm256_slli_epi32(
+        _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(ptr))), 16));
+      return result;
+    }
+#endif
+#ifdef __AVX512F__
+    if constexpr(Number::size() == 16)
+    {
+      Number result;
+      result.data = _mm512_castsi512_ps(_mm512_slli_epi32(
+        _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(ptr))), 16));
+      return result;
+    }
+#endif
+
+    Number result;
+    for(unsigned int i = 0; i < Number::size(); ++i)
+      result[i] = std::bit_cast<float>(static_cast<std::uint32_t>(ptr[i]) << 16);
+    return result;
+  }
+}
+
+
+
+/**
  * Chebyshev iteration of the first kind with a point-Jacobi preconditioner,
  * with the same coefficients as dealii::PreconditionChebyshev for given
  * bounds of the eigenvalues. The difference is in the vector updates: The
@@ -98,7 +201,9 @@ public:
   void
   initialize(const OperatorType & matrix, const AdditionalData & additional_data)
   {
-    AssertThrow(additional_data.preconditioner.get() != nullptr,
+    matrix.initialize_dof_vector(solution_old);
+    AssertThrow(additional_data.preconditioner.get() != nullptr ||
+                  additional_data.preconditioner_bf16.size() == solution_old.locally_owned_size(),
                 dealii::ExcMessage("Chebyshev iteration needs a preconditioner"));
     // solution_old may hold the source vector of the last product, which
     // other processes may still read
@@ -112,8 +217,6 @@ public:
     const double alpha = data.smoothing_range > 1. ? data.max_eigenvalue / data.smoothing_range :
                                                      0.9 * data.max_eigenvalue;
     set_eigenvalue_range(alpha, data.max_eigenvalue);
-
-    matrix.initialize_dof_vector(solution_old);
   }
 
   // Change the interval [lower, upper] the Chebyshev polynomial is built for,
@@ -171,8 +274,9 @@ private:
         const VectorType & rhs,
         const bool         compute_final_norm) const
   {
-    const Number *        rhs_ptr       = rhs.begin();
-    const Number *        diagonal      = data.preconditioner->get_vector().begin();
+    const Number * rhs_ptr = rhs.begin();
+    const Number * diagonal =
+      data.preconditioner ? data.preconditioner->get_vector().begin() : nullptr;
     const std::uint16_t * diagonal_bf16 = data.preconditioner_bf16.data();
     const unsigned int    n_owned       = solution.locally_owned_size();
 
@@ -233,9 +337,18 @@ private:
     {
       const Number factor       = 1. / theta;
       Number *     solution_ptr = solution.begin();
-      DEAL_II_OPENMP_SIMD_PRAGMA
-      for(unsigned int i = 0; i < n_owned; ++i)
-        solution_ptr[i] = factor * diagonal[i] * rhs_ptr[i];
+      if(diagonal != nullptr)
+      {
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int i = 0; i < n_owned; ++i)
+          solution_ptr[i] = factor * diagonal[i] * rhs_ptr[i];
+      }
+      else
+      {
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int i = 0; i < n_owned; ++i)
+          solution_ptr[i] = factor * load_bf16_into_float(diagonal_bf16 + i, float()) * rhs_ptr[i];
+      }
       if(compute_final_norm && data.degree < 2)
         residual_norm = rhs.l2_norm();
     }
@@ -285,6 +398,9 @@ private:
          const Number *        solution,
          Number *              new_solution)
   {
+    constexpr bool use_bf16 =
+      std::is_same_v<Number, float> && dealii::VectorizedArray<Number>::size() >= 8;
+
     constexpr unsigned int          n_lanes        = dealii::VectorizedArray<Number>::size();
     const Number                    factor1_plus_1 = 1. + factor1;
     const unsigned int              end_regular    = begin + (end - begin) / n_lanes * n_lanes;
@@ -293,13 +409,8 @@ private:
     {
       dealii::VectorizedArray<Number> rhs_i, sol_i, tmp_i, diag_i;
       rhs_i.load(rhs + i);
-      if constexpr(std::is_same_v<Number, float> && dealii::VectorizedArray<Number>::size() == 8)
-        diag_i.data = _mm256_castsi256_ps(_mm256_slli_epi32(
-          _mm256_cvtepu16_epi32(*reinterpret_cast<const __m128i *>(diagonal_bf16 + i)), 16));
-      else if constexpr(std::is_same_v<Number, float> &&
-                        dealii::VectorizedArray<Number>::size() == 16)
-        diag_i.data = _mm512_castsi512_ps(_mm512_slli_epi32(
-          _mm512_cvtepu16_epi32(*reinterpret_cast<const __m256i *>(diagonal_bf16 + i)), 16));
+      if constexpr(use_bf16)
+        diag_i = load_bf16_into_float(diagonal_bf16 + i, diag_i);
       else
         diag_i.load(diagonal + i);
       sol_i.load(solution + i);
@@ -324,9 +435,7 @@ private:
       if constexpr(compute_norm)
         sum[i - end_regular] += residual_i * residual_i;
       const float diag_i =
-        (std::is_same_v<Number, float> && dealii::VectorizedArray<Number>::size() >= 8) ?
-          std::bit_cast<float>(static_cast<std::uint32_t>(diagonal_bf16[i]) << 16) :
-          diagonal[i];
+        use_bf16 ? load_bf16_into_float(diagonal_bf16 + i, float()) : diagonal[i];
 
       if constexpr(first_update)
         new_solution[i] = factor1_plus_1 * solution[i] + factor2 * diag_i * residual_i;
