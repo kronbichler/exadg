@@ -926,6 +926,11 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       dealii::VectorizedArray<float> min_eig_factor = std::numeric_limits<float>::max();
       const float *diag_mass = diagonal_mass.begin(), *diag_lapl = diagonal_laplace.begin();
       float *      diag_prec = preconditioner_viscous.get_vector().begin();
+      if(momentum_solver_chebyshev != nullptr)
+        momentum_solver_chebyshev->data.preconditioner_bf16.resize_fast(owned_size);
+      std::uint16_t * diagonal_bf16 = momentum_solver_chebyshev != nullptr ?
+                                        momentum_solver_chebyshev->data.preconditioner_bf16.data() :
+                                        nullptr;
       for(unsigned int i = 0; i < regular_size; i += n_lanes)
       {
         dealii::VectorizedArray<float> diag_mass_i, diag_lapl_i;
@@ -935,6 +940,37 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
           1.0f / (float(factor_mass) * diag_mass_i + float(factor_lapl) * diag_lapl_i);
         min_eig_factor = std::min(factor_mass * diag_mass_i * diag_entry, min_eig_factor);
         diag_entry.store(diag_prec + i);
+
+        // Create BF16 version of the inverse diagonal
+        if(diagonal_bf16 != nullptr)
+        {
+#ifdef __AVX512F__
+          if constexpr(dealii::VectorizedArray<float>::size() == 16)
+          {
+            const __m512i bits = _mm512_castps_si512(diag_entry.data);
+            const __m512i odd = _mm512_and_si512(_mm512_srli_epi32(bits, 16), _mm512_set1_epi32(1));
+            const __m512i rounded =
+              _mm512_add_epi32(bits, _mm512_add_epi32(_mm512_set1_epi32(0x7fff), odd));
+            // values are below 2^16 after the shift, so truncation is exact
+            const __m256i reduced = _mm512_cvtepi32_epi16(_mm512_srli_epi32(rounded, 16));
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(diagonal_bf16 + i), reduced);
+          }
+#elif defined __AVX2__
+          if constexpr(dealii::VectorizedArray<float>::size() == 8)
+          {
+            const __m256i bits = _mm256_castps_si256(diag_entry.data);
+            const __m256i odd = _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
+            const __m256i rounded =
+              _mm256_add_epi32(bits, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), odd));
+            const __m256i upper = _mm256_srli_epi32(rounded, 16);
+            // AVX2 has no 32->16 bit truncation; pack the two 128-bit halves, which
+            // keeps the order (packus saturates, but all values are in [0, 0xffff])
+            const __m128i reduced =
+              _mm_packus_epi32(_mm256_castsi256_si128(upper), _mm256_extracti128_si256(upper, 1));
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(diagonal_bf16 + i), reduced);
+          }
+#endif
+        }
       }
       for(unsigned int i = regular_size; i < owned_size; ++i)
       {
@@ -943,6 +979,14 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         min_eig_factor[i - regular_size] =
           std::min(float(factor_mass) * diag_mass[i] * diag_prec[i],
                    min_eig_factor[i - regular_size]);
+        if(diagonal_bf16 != nullptr)
+        {
+          std::uint32_t bits;
+          std::memcpy(&bits, &diag_prec[i], sizeof(bits));
+          // round to nearest, ties to even, on the upper 16 bits
+          bits += 0x7fffu + ((bits >> 16) & 1u);
+          diagonal_bf16[i] = static_cast<std::uint16_t>(bits >> 16);
+        }
       }
       min_eig_estimate = min_eig_factor[0];
       for(unsigned int v = 1; v < n_lanes; ++v)
