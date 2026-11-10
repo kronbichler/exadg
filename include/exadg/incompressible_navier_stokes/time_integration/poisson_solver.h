@@ -1287,6 +1287,23 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       typename SmootherType::AdditionalData smoother_data;
       smoother_data.preconditioner = std::make_shared<SmootherPreconditionerType>();
       mg_matrices[level].compute_inverse_diagonal(smoother_data.preconditioner->get_vector());
+      {
+        const unsigned int owned_size =
+          smoother_data.preconditioner->get_vector().locally_owned_size();
+        auto & diagonal_bf16 = smoother_data.preconditioner_bf16;
+        diagonal_bf16.resize_fast(owned_size);
+        for(unsigned int i = 0; i < owned_size; ++i)
+        {
+          std::uint32_t bits;
+          std::memcpy(&bits,
+                      &smoother_data.preconditioner->get_vector().local_element(i),
+                      sizeof(bits));
+          // round to nearest, ties to even, on the upper 16 bits
+          bits += 0x7fffu + ((bits >> 16) & 1u);
+          diagonal_bf16[i] = static_cast<std::uint16_t>(bits >> 16);
+        }
+      }
+
       smoother_data.smoothing_range = 20.;
       smoother_data.degree          = 4;
 
@@ -1335,6 +1352,22 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       typename SmootherTypeDG::AdditionalData smoother_data_dg;
       smoother_data_dg.preconditioner = std::make_shared<SmootherPreconditionerType>();
       dg_matrix.compute_inverse_diagonal(smoother_data_dg.preconditioner->get_vector());
+      {
+        const unsigned int owned_size =
+          smoother_data_dg.preconditioner->get_vector().locally_owned_size();
+        auto & diagonal_bf16 = smoother_data_dg.preconditioner_bf16;
+        diagonal_bf16.resize_fast(owned_size);
+        for(unsigned int i = 0; i < owned_size; ++i)
+        {
+          std::uint32_t bits;
+          std::memcpy(&bits,
+                      &smoother_data_dg.preconditioner->get_vector().local_element(i),
+                      sizeof(bits));
+          // round to nearest, ties to even, on the upper 16 bits
+          bits += 0x7fffu + ((bits >> 16) & 1u);
+          diagonal_bf16[i] = static_cast<std::uint16_t>(bits >> 16);
+        }
+      }
       smoother_data_dg.smoothing_range = 20.;
       smoother_data_dg.degree          = 4;
 
@@ -1432,12 +1465,12 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       std::size_t cells_width = 6;
       for(const auto & description : level_descriptions)
         cells_width = std::max(cells_width, description.cells.size() + 2);
-      std::cout << "Level   degree  dofs        " << std::left << std::setw(cells_width) << "cells"
-                << "smooth      residual    restrict    prolongate   [rel. share]" << std::endl;
+      std::cout << "lvl  deg  dofs        " << std::left << std::setw(cells_width) << "cells"
+                << "smooth      residual    restrict    prolongate   [share]" << std::endl;
       for(unsigned int i = 0; i < timings.size(); ++i)
       {
         const LevelDescription & description = level_descriptions[i];
-        std::cout << std::left << std::setw(8) << i << std::setw(8)
+        std::cout << std::left << std::setw(5) << i << std::setw(5)
                   << (std::to_string(description.degree) + (i + 1 < timings.size() ? "" : "DG"))
                   << std::setw(12) << description.n_dofs << std::setw(cells_width)
                   << description.cells << std::scientific << std::setw(12) << std::setprecision(3)

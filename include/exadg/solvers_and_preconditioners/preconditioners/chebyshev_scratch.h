@@ -82,6 +82,9 @@ public:
     // inverse of the diagonal
     std::shared_ptr<dealii::DiagonalMatrix<VectorType>> preconditioner;
 
+    // diagonal in BF16 format
+    dealii::AlignedVector<std::uint16_t> preconditioner_bf16;
+
     // upper bound of the eigenvalues of the preconditioned matrix
     double max_eigenvalue = 1.;
 
@@ -159,6 +162,8 @@ public:
     return apply(true, solution, rhs, true);
   }
 
+  AdditionalData data;
+
 private:
   double
   apply(const bool         zero_initial_guess,
@@ -166,9 +171,10 @@ private:
         const VectorType & rhs,
         const bool         compute_final_norm) const
   {
-    const Number *     rhs_ptr  = rhs.begin();
-    const Number *     diagonal = data.preconditioner->get_vector().begin();
-    const unsigned int n_owned  = solution.locally_owned_size();
+    const Number *        rhs_ptr       = rhs.begin();
+    const Number *        diagonal      = data.preconditioner->get_vector().begin();
+    const std::uint16_t * diagonal_bf16 = data.preconditioner_bf16.data();
+    const unsigned int    n_owned       = solution.locally_owned_size();
 
     // One iteration with the matrix-vector product, where the first update
     // after a zero initial guess does not read the old solution. Returns the
@@ -183,8 +189,17 @@ private:
       const auto     run          = [&](auto first_tag, auto norm_tag) {
         matrix->vmult_scratch(
           solution, [&](const unsigned int begin, const unsigned int end, const Number * matvec) {
-            const Number sum = update<decltype(first_tag)::value, decltype(norm_tag)::value>(
-              begin, end, factor1, factor2, matvec, rhs_ptr, diagonal, solution_ptr, new_solution);
+            const Number sum =
+              update<decltype(first_tag)::value, decltype(norm_tag)::value>(begin,
+                                                                            end,
+                                                                            factor1,
+                                                                            factor2,
+                                                                            matvec,
+                                                                            rhs_ptr,
+                                                                            diagonal,
+                                                                            diagonal_bf16,
+                                                                            solution_ptr,
+                                                                            new_solution);
             if constexpr(decltype(norm_tag)::value)
               residual_sqr += sum;
           });
@@ -259,15 +274,16 @@ private:
   // entries if requested.
   template<bool first_update, bool compute_norm>
   static Number
-  update(const unsigned int begin,
-         const unsigned int end,
-         const Number       factor1,
-         const Number       factor2,
-         const Number *     matvec,
-         const Number *     rhs,
-         const Number *     diagonal,
-         const Number *     solution,
-         Number *           new_solution)
+  update(const unsigned int    begin,
+         const unsigned int    end,
+         const Number          factor1,
+         const Number          factor2,
+         const Number *        matvec,
+         const Number *        rhs,
+         const Number *        diagonal,
+         const std::uint16_t * diagonal_bf16,
+         const Number *        solution,
+         Number *              new_solution)
   {
     constexpr unsigned int          n_lanes        = dealii::VectorizedArray<Number>::size();
     const Number                    factor1_plus_1 = 1. + factor1;
@@ -277,7 +293,15 @@ private:
     {
       dealii::VectorizedArray<Number> rhs_i, sol_i, tmp_i, diag_i;
       rhs_i.load(rhs + i);
-      diag_i.load(diagonal + i);
+      if constexpr(std::is_same_v<Number, float> && dealii::VectorizedArray<Number>::size() == 8)
+        diag_i.data = _mm256_slli_epi32(
+          _mm256_cvtepu16_epi32(*reinterpret_cast<const __m128i *>(diagonal_bf16 + i)), 16);
+      else if constexpr(std::is_same_v<Number, float> &&
+                        dealii::VectorizedArray<Number>::size() == 16)
+        diag_i.data = _mm512_slli_epi32(
+          _mm512_cvtepu16_epi32(*reinterpret_cast<const __m256i *>(diagonal_bf16 + i)), 16);
+      else
+        diag_i.load(diagonal + i);
       sol_i.load(solution + i);
       tmp_i.load(matvec + i - begin);
       const dealii::VectorizedArray<Number> residual_i = rhs_i - tmp_i;
@@ -312,9 +336,8 @@ private:
   }
 
   const OperatorType * matrix = nullptr;
-  AdditionalData       data;
-  double               delta = 1.;
-  double               theta = 1.;
+  double               delta  = 1.;
+  double               theta  = 1.;
 
   // holds x^{n-1} on entry to the matrix-vector product and the new
   // solution x^{n+1} on exit
