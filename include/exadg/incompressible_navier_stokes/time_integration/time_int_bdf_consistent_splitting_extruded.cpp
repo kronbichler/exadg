@@ -918,16 +918,20 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
      * IV. Update point-Jacobi preconditioner entries with vectorized loop
      * (together with 'min' computation).
      */
-    const unsigned int owned_size       = solution_rt.locally_owned_size();
-    float              min_eig_estimate = 0;
+    const unsigned int owned_size         = solution_rt.locally_owned_size();
+    float              min_eig_estimate   = 0;
+    bool               has_float_diagonal = true;
     {
       constexpr unsigned int         n_lanes        = dealii::VectorizedArray<float>::size();
       const unsigned int             regular_size   = owned_size / n_lanes * n_lanes;
       dealii::VectorizedArray<float> min_eig_factor = std::numeric_limits<float>::max();
       const float *diag_mass = diagonal_mass.begin(), *diag_lapl = diagonal_laplace.begin();
       float *      diag_prec = preconditioner_viscous.get_vector().begin();
-      if(momentum_solver_chebyshev != nullptr)
+      if(momentum_solver_chebyshev != nullptr && dealii::VectorizedArray<float>::size() >= 8)
+      {
         momentum_solver_chebyshev->data.preconditioner_bf16.resize_fast(owned_size);
+        has_float_diagonal = false;
+      }
       std::uint16_t * diagonal_bf16 = momentum_solver_chebyshev != nullptr ?
                                         momentum_solver_chebyshev->data.preconditioner_bf16.data() :
                                         nullptr;
@@ -939,7 +943,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         const dealii::VectorizedArray<float> diag_entry =
           1.0f / (float(factor_mass) * diag_mass_i + float(factor_lapl) * diag_lapl_i);
         min_eig_factor = std::min(factor_mass * diag_mass_i * diag_entry, min_eig_factor);
-        diag_entry.store(diag_prec + i);
 
         // Create BF16 version of the inverse diagonal
         if(diagonal_bf16 != nullptr)
@@ -971,22 +974,24 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
           }
 #endif
         }
+        else
+          diag_entry.store(diag_prec + i);
       }
       for(unsigned int i = regular_size; i < owned_size; ++i)
       {
-        diag_prec[i] =
+        const float diag_i =
           1.0f / (float(factor_mass) * diag_mass[i] + float(factor_lapl) * diag_lapl[i]);
         min_eig_factor[i - regular_size] =
-          std::min(float(factor_mass) * diag_mass[i] * diag_prec[i],
-                   min_eig_factor[i - regular_size]);
+          std::min(float(factor_mass) * diag_mass[i] * diag_i, min_eig_factor[i - regular_size]);
         if(diagonal_bf16 != nullptr)
         {
-          std::uint32_t bits;
-          std::memcpy(&bits, &diag_prec[i], sizeof(bits));
+          std::uint32_t bits = std::bit_cast<std::uint32_t>(diag_i);
           // round to nearest, ties to even, on the upper 16 bits
           bits += 0x7fffu + ((bits >> 16) & 1u);
           diagonal_bf16[i] = static_cast<std::uint16_t>(bits >> 16);
         }
+        else
+          diag_prec[i] = diag_i;
       }
       min_eig_estimate = min_eig_factor[0];
       for(unsigned int v = 1; v < n_lanes; ++v)
@@ -1176,6 +1181,21 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
       double                            min_eig = 0.0, max_eig = 0.0;
       dealii::SolverCG<VectorTypeFloat> solver_cg(control, vector_memory_momentum);
+
+      // In case we did not store the float version of the diagonal but just
+      // the BF16 truncation for Chebyshev, we need to extract the right
+      // vector here for compatibility with SolverCG.
+      if(!has_float_diagonal)
+      {
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int i = 0; i < owned_size; ++i)
+        {
+          std::uint32_t entry =
+            static_cast<std::uint32_t>(momentum_solver_chebyshev->data.preconditioner_bf16[i])
+            << 16;
+          preconditioner_viscous.get_vector().local_element(i) = std::bit_cast<float>(entry);
+        }
+      }
       if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
         solver_cg.connect_eigenvalues_slot(
           [&min_eig, &max_eig](const std::vector<double> & eigval) {
