@@ -294,11 +294,11 @@ private:
       dealii::VectorizedArray<Number> rhs_i, sol_i, tmp_i, diag_i;
       rhs_i.load(rhs + i);
       if constexpr(std::is_same_v<Number, float> && dealii::VectorizedArray<Number>::size() == 8)
-        diag_i.data = reinterpret_cast<__m256>(_mm256_slli_epi32(
+        diag_i.data = _mm256_castsi256_ps(_mm256_slli_epi32(
           _mm256_cvtepu16_epi32(*reinterpret_cast<const __m128i *>(diagonal_bf16 + i)), 16));
       else if constexpr(std::is_same_v<Number, float> &&
                         dealii::VectorizedArray<Number>::size() == 16)
-        diag_i.data = reinterpret_cast<__m512>(_mm512_slli_epi32(
+        diag_i.data = _mm512_castsi512_ps(_mm512_slli_epi32(
           _mm512_cvtepu16_epi32(*reinterpret_cast<const __m256i *>(diagonal_bf16 + i)), 16));
       else
         diag_i.load(diagonal + i);
@@ -323,11 +323,16 @@ private:
       const Number residual_i = rhs[i] - matvec[i - begin];
       if constexpr(compute_norm)
         sum[i - end_regular] += residual_i * residual_i;
+      const float diag_i =
+        (std::is_same_v<Number, float> && dealii::VectorizedArray<Number>::size() >= 8) ?
+          std::bit_cast<float>(static_cast<std::uint32_t>(diagonal_bf16[i]) << 16) :
+          diagonal[i];
+
       if constexpr(first_update)
-        new_solution[i] = factor1_plus_1 * solution[i] + factor2 * diagonal[i] * residual_i;
+        new_solution[i] = factor1_plus_1 * solution[i] + factor2 * diag_i * residual_i;
       else
-        new_solution[i] = factor1_plus_1 * solution[i] - factor1 * new_solution[i] +
-                          factor2 * diagonal[i] * residual_i;
+        new_solution[i] =
+          factor1_plus_1 * solution[i] - factor1 * new_solution[i] + factor2 * diag_i * residual_i;
     }
     if constexpr(compute_norm)
       return sum.sum();
