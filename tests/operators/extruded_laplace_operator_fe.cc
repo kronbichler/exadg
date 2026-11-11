@@ -136,6 +136,15 @@ test(const unsigned int degree, const unsigned int n_refinements)
 
   VectorType inverse_diagonal;
   op.compute_inverse_diagonal(inverse_diagonal);
+  // the first Chebyshev iteration is fused into the second one, first with
+  // 'before_loop' on all entries before the loop, as the mesh is below the
+  // default minimal size, then within the cell loop
+  static_assert(
+    ExaDG::internal::has_vmult_scratch_with_before_loop<std::decay_t<decltype(op)>>::value);
+  check_chebyshev(
+    pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
+  op.set_min_size_for_pre_list(0);
+  pcout << "  with before_loop within the cell loop" << std::endl;
   check_chebyshev(
     pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
   pcout << std::endl;

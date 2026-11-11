@@ -1,0 +1,58 @@
+FE degree 1, double, 2112 fine cells, 264 coarse cells
+ h-transfer to coarse mesh
+  prolongate                                    : OK
+  restrict                                      : OK
+
+FE degree 1, float, 2112 fine cells, 264 coarse cells
+ h-transfer to coarse mesh
+  prolongate                                    : OK
+  restrict                                      : OK
+
+FE degree 2, double, 2112 fine cells, 264 coarse cells
+ p-transfer to degree 1
+  prolongate                                    : OK
+  restrict                                      : OK
+ h-transfer to coarse mesh
+  prolongate                                    : OK
+  restrict                                      : OK
+
+FE degree 2, float, 2112 fine cells, 264 coarse cells
+ p-transfer to degree 1
+  prolongate                                    : OK
+  restrict                                      : OK
+ h-transfer to coarse mesh
+  prolongate                                    : OK
+  restrict                                      : OK
+
+FE degree 3, double, 2112 fine cells, 264 coarse cells
+ p-transfer to degree 2
+  prolongate                                    : OK
+  restrict                                      : OK
+ h-transfer to coarse mesh
+  prolongate                                    : OK
+  restrict                                      : OK
+
+FE degree 3, float, 2112 fine cells, 264 coarse cells
+ p-transfer to degree 2
+  prolongate                                    : OK
+  restrict                                      : OK
+ h-transfer to coarse mesh
+  prolongate                                    : OK
+  restrict                                      : OK
+
+FE degree 4, double, 2112 fine cells, 264 coarse cells
+ p-transfer to degree 2
+  prolongate                                    : OK
+  restrict                                      : OK
+ h-transfer to coarse mesh
+  prolongate                                    : OK
+  restrict                                      : OK
+
+FE degree 4, float, 2112 fine cells, 264 coarse cells
+ p-transfer to degree 2
+  prolongate                                    : OK
+  restrict                                      : OK
+ h-transfer to coarse mesh
+  prolongate                                    : OK
+  restrict                                      : OK
+

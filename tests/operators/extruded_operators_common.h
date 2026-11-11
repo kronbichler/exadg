@@ -213,7 +213,9 @@ check_vmult_scratch(dealii::ConditionalOStream & pcout,
 // values are copied into the constrained entries only before the last cell
 // range, so ranges of constrained entries finalized earlier see a zero
 // result, whereas vmult_scratch() consistently uses the source values.
-// Both variants agree if all constrained entries are zero.
+// Both variants agree if all constrained entries are zero. For float, the
+// ExaDG variant uses the diagonal in BF16 format and deal.II the same
+// rounded values in float.
 template<typename Operator, typename VectorType>
 void
 check_chebyshev(dealii::ConditionalOStream &      pcout,
@@ -223,20 +225,25 @@ check_chebyshev(dealii::ConditionalOStream &      pcout,
                 const std::vector<unsigned int> & constrained_dofs = {})
 {
   using PreconditionerType = dealii::DiagonalMatrix<VectorType>;
+  using Number             = typename VectorType::value_type;
+
+  typename ExaDG::PreconditionChebyshevScratch<Operator>::AdditionalData data;
 
   typename dealii::PreconditionChebyshev<Operator, VectorType, PreconditionerType>::AdditionalData
     data_dealii;
   data_dealii.preconditioner               = std::make_shared<PreconditionerType>();
   data_dealii.preconditioner->get_vector() = inverse_diagonal;
-  data_dealii.degree                       = 4;
-  data_dealii.smoothing_range              = 20.;
-  data_dealii.max_eigenvalue               = 2.5;
-  data_dealii.eig_cg_n_iterations          = 0;
+  if constexpr(std::is_same_v<Number, float>)
+    ExaDG::round_to_bf16(data_dealii.preconditioner->get_vector(), data.preconditioner_bf16);
+  data_dealii.degree              = 4;
+  data_dealii.smoothing_range     = 20.;
+  data_dealii.max_eigenvalue      = 2.5;
+  data_dealii.eig_cg_n_iterations = 0;
   dealii::PreconditionChebyshev<Operator, VectorType, PreconditionerType> chebyshev_dealii;
   chebyshev_dealii.initialize(op, data_dealii);
 
-  typename ExaDG::PreconditionChebyshevScratch<Operator>::AdditionalData data;
-  data.preconditioner  = data_dealii.preconditioner;
+  if constexpr(!std::is_same_v<Number, float>)
+    data.preconditioner = data_dealii.preconditioner;
   data.degree          = data_dealii.degree;
   data.smoothing_range = data_dealii.smoothing_range;
   data.max_eigenvalue  = data_dealii.max_eigenvalue;

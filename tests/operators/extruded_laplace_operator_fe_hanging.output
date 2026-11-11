@@ -1,0 +1,184 @@
+FE degree 1, double, 264 cells, 456 DoFs
+  has hanging nodes                             : 1
+  cells with hanging nodes                      : 96
+  read with hanging nodes vs. FEEvaluation      : OK
+  own indices: wrongly visited/missed DoFs      : 0
+  vmult vs. Poisson::LaplaceOperator            : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+
+FE degree 1, float, 264 cells, 456 DoFs
+  has hanging nodes                             : 1
+  cells with hanging nodes                      : 96
+  read with hanging nodes vs. FEEvaluation      : OK
+  own indices: wrongly visited/missed DoFs      : 0
+  vmult vs. Poisson::LaplaceOperator            : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+
+FE degree 2, double, 264 cells, 2909 DoFs
+  has hanging nodes                             : 1
+  cells with hanging nodes                      : 96
+  read with hanging nodes vs. FEEvaluation      : OK
+  own indices: wrongly visited/missed DoFs      : 0
+  vmult vs. Poisson::LaplaceOperator            : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+
+FE degree 2, float, 264 cells, 2909 DoFs
+  has hanging nodes                             : 1
+  cells with hanging nodes                      : 96
+  read with hanging nodes vs. FEEvaluation      : OK
+  own indices: wrongly visited/missed DoFs      : 0
+  vmult vs. Poisson::LaplaceOperator            : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+
+FE degree 3, double, 264 cells, 8910 DoFs
+  has hanging nodes                             : 1
+  cells with hanging nodes                      : 96
+  read with hanging nodes vs. FEEvaluation      : OK
+  own indices: wrongly visited/missed DoFs      : 0
+  vmult vs. Poisson::LaplaceOperator            : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+
+FE degree 3, float, 264 cells, 8910 DoFs
+  has hanging nodes                             : 1
+  cells with hanging nodes                      : 96
+  read with hanging nodes vs. FEEvaluation      : OK
+  own indices: wrongly visited/missed DoFs      : 0
+  vmult vs. Poisson::LaplaceOperator            : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+
+FE degree 4, double, 264 cells, 20043 DoFs
+  has hanging nodes                             : 1
+  cells with hanging nodes                      : 96
+  read with hanging nodes vs. FEEvaluation      : OK
+  own indices: wrongly visited/missed DoFs      : 0
+  vmult vs. Poisson::LaplaceOperator            : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+
+FE degree 4, float, 264 cells, 20043 DoFs
+  has hanging nodes                             : 1
+  cells with hanging nodes                      : 96
+  read with hanging nodes vs. FEEvaluation      : OK
+  own indices: wrongly visited/missed DoFs      : 0
+  vmult vs. Poisson::LaplaceOperator            : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+
