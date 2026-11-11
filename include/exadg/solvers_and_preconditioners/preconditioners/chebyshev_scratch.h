@@ -21,12 +21,15 @@
 
 #pragma once
 
+#include <deal.II/base/aligned_vector.h>
 #include <deal.II/base/mpi.h>
 #include <deal.II/base/vectorization.h>
 #include <deal.II/lac/diagonal_matrix.h>
 #include <deal.II/lac/la_parallel_vector.h>
 
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -51,14 +54,37 @@ struct has_pending_source_reads<
   : std::true_type
 {
 };
+
+// Detect operators with the variant vmult_scratch(src, before_loop,
+// after_loop) that runs 'before_loop' on the entries of src before their
+// first read
+template<typename OperatorType, typename = void>
+struct has_vmult_scratch_with_before_loop : std::false_type
+{
+};
+
+template<typename OperatorType>
+struct has_vmult_scratch_with_before_loop<
+  OperatorType,
+  std::void_t<decltype(std::declval<const OperatorType &>().vmult_scratch(
+    std::declval<const typename OperatorType::VectorType &>(),
+    std::declval<void (*)(const unsigned int, const unsigned int)>(),
+    std::declval<void (*)(const unsigned int,
+                          const unsigned int,
+                          const typename OperatorType::VectorType::value_type *)>()))>>
+  : std::true_type
+{
+};
 } // namespace internal
 
 /**
- * Truncate a float / VectorizedArray<float> number into BF16 format by
+ * Round a float / VectorizedArray<float> number to the BF16 format (to
+ * nearest, ties to even) and store the upper 16 bits of the result at
+ * store_location. Infinity and NaN are not treated specially.
  */
 template<typename Number>
 void
-store_float_as_truncated_bf16(const Number a, std::uint16_t * store_location)
+store_float_as_bf16(const Number a, std::uint16_t * store_location)
 {
   static_assert(std::is_same_v<Number, float> ||
                   std::is_same_v<Number, dealii::VectorizedArray<float>>,
@@ -102,23 +128,19 @@ store_float_as_truncated_bf16(const Number a, std::uint16_t * store_location)
     else
 #endif
       for(unsigned int i = 0; i < Number::size(); ++i)
-      {
-        std::uint32_t bits = std::bit_cast<std::uint32_t>(a[i]);
-        bits += 0x7fffu + ((bits >> 16) & 1u);
-        store_location[i] = static_cast<std::uint16_t>(bits >> 16);
-      }
+        store_float_as_bf16(a[i], store_location + i);
   }
 }
 
 /**
  * Load data item from a std::uint16_t array (representing an FP type) into a
- * float/VectorizedArray<float> field. This works by a left-shift the loaded
- * uint-16 to the left 16 bits of a 32-bit integer, which is then
- * reinterpreted as float.
+ * float/VectorizedArray<float> field, selected by the template argument. This
+ * works by a left-shift the loaded uint-16 to the left 16 bits of a 32-bit
+ * integer, which is then reinterpreted as float.
  */
 template<typename Number>
 Number
-load_bf16_into_float(const std::uint16_t * ptr, const Number)
+load_bf16_into_float(const std::uint16_t * ptr)
 {
   static_assert(std::is_same_v<Number, float> ||
                   std::is_same_v<Number, dealii::VectorizedArray<float>>,
@@ -128,10 +150,10 @@ load_bf16_into_float(const std::uint16_t * ptr, const Number)
     return std::bit_cast<float>(static_cast<std::uint32_t>(ptr[0]) << 16);
   else
   {
+    Number result;
 #ifdef __AVX2__
     if constexpr(Number::size() == 8)
     {
-      Number result;
       result.data = _mm256_castsi256_ps(_mm256_slli_epi32(
         _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(ptr))), 16));
       return result;
@@ -140,17 +162,47 @@ load_bf16_into_float(const std::uint16_t * ptr, const Number)
 #ifdef __AVX512F__
     if constexpr(Number::size() == 16)
     {
-      Number result;
       result.data = _mm512_castsi512_ps(_mm512_slli_epi32(
         _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(ptr))), 16));
       return result;
     }
 #endif
-
-    Number result;
     for(unsigned int i = 0; i < Number::size(); ++i)
-      result[i] = std::bit_cast<float>(static_cast<std::uint32_t>(ptr[i]) << 16);
+      result[i] = load_bf16_into_float<float>(ptr + i);
     return result;
+  }
+}
+
+/**
+ * Round the locally owned entries of 'diagonal' to BF16 format, store them
+ * in 'diagonal_bf16', and write the rounded values back to 'diagonal'. This
+ * way, both representations describe the same preconditioner, e.g. for an
+ * eigenvalue estimate with the float vector before Chebyshev runs with the
+ * BF16 version.
+ */
+inline void
+round_to_bf16(dealii::LinearAlgebra::distributed::Vector<float> & diagonal,
+              dealii::AlignedVector<std::uint16_t> &              diagonal_bf16)
+{
+  using VectorizedArrayType      = dealii::VectorizedArray<float>;
+  constexpr unsigned int n_lanes = VectorizedArrayType::size();
+
+  const unsigned int owned_size   = diagonal.locally_owned_size();
+  const unsigned int regular_size = owned_size / n_lanes * n_lanes;
+  float *            values       = diagonal.begin();
+  diagonal_bf16.resize_fast(owned_size);
+  std::uint16_t * values_bf16 = diagonal_bf16.data();
+  for(unsigned int i = 0; i < regular_size; i += n_lanes)
+  {
+    VectorizedArrayType value;
+    value.load(values + i);
+    store_float_as_bf16(value, values_bf16 + i);
+    load_bf16_into_float<VectorizedArrayType>(values_bf16 + i).store(values + i);
+  }
+  for(unsigned int i = regular_size; i < owned_size; ++i)
+  {
+    store_float_as_bf16(values[i], values_bf16 + i);
+    values[i] = load_bf16_into_float<float>(values_bf16 + i);
   }
 }
 
@@ -182,10 +234,15 @@ public:
 
   struct AdditionalData
   {
-    // inverse of the diagonal
+    // inverse of the diagonal; if not set, the iteration uses
+    // 'preconditioner_bf16' instead
     std::shared_ptr<dealii::DiagonalMatrix<VectorType>> preconditioner;
 
-    // diagonal in BF16 format
+    // inverse of the diagonal in BF16 format (only for float), see
+    // round_to_bf16(), with one entry per locally owned index. The choice
+    // between the two formats depends on 'preconditioner' only, not on the
+    // size of this field, which is empty on processes without locally owned
+    // indices.
     dealii::AlignedVector<std::uint16_t> preconditioner_bf16;
 
     // upper bound of the eigenvalues of the preconditioned matrix
@@ -202,8 +259,10 @@ public:
   initialize(const OperatorType & matrix, const AdditionalData & additional_data)
   {
     matrix.initialize_dof_vector(solution_old);
-    AssertThrow(additional_data.preconditioner.get() != nullptr ||
-                  additional_data.preconditioner_bf16.size() == solution_old.locally_owned_size(),
+    // without 'preconditioner', the BF16 diagonal is used, which is only
+    // available for float
+    constexpr bool is_float = std::is_same_v<Number, float>;
+    AssertThrow(additional_data.preconditioner.get() != nullptr || is_float,
                 dealii::ExcMessage("Chebyshev iteration needs a preconditioner"));
     // solution_old may hold the source vector of the last product, which
     // other processes may still read
@@ -279,6 +338,33 @@ private:
       data.preconditioner ? data.preconditioner->get_vector().begin() : nullptr;
     const std::uint16_t * diagonal_bf16 = data.preconditioner_bf16.data();
     const unsigned int    n_owned       = solution.locally_owned_size();
+    const bool            use_bf16      = diagonal == nullptr;
+    AssertThrow(!use_bf16 || data.preconditioner_bf16.size() == n_owned,
+                dealii::ExcMessage("The BF16 diagonal has " +
+                                   std::to_string(data.preconditioner_bf16.size()) +
+                                   " entries, but the vector " + std::to_string(n_owned)));
+
+    // With a zero initial guess, the first iteration x^1 = 1/theta P^{-1} b
+    // does not need a matrix-vector product. If the operator supports it, we
+    // compute it on the fly in the matrix-vector product of the second
+    // iteration, which reads x^1, before each entry is read for the first
+    // time. This saves a separate pass through the vectors.
+    constexpr bool can_fuse_first_step =
+      internal::has_vmult_scratch_with_before_loop<OperatorType>::value;
+    const bool fuse_first_step =
+      can_fuse_first_step && zero_initial_guess && data.degree >= 2 && std::abs(delta) >= 1e-40;
+    const Number factor_first_step = 1. / theta;
+    const auto   run_first_step    = [&](const unsigned int begin, const unsigned int end) {
+      if constexpr(std::is_same_v<Number, float>)
+        if(use_bf16)
+        {
+          first_step<true>(
+            begin, end, factor_first_step, rhs_ptr, diagonal, diagonal_bf16, solution.begin());
+          return;
+        }
+      first_step<false>(
+        begin, end, factor_first_step, rhs_ptr, diagonal, diagonal_bf16, solution.begin());
+    };
 
     // One iteration with the matrix-vector product, where the first update
     // after a zero initial guess does not read the old solution. Returns the
@@ -286,27 +372,56 @@ private:
     const auto iterate = [&](const bool   first_update,
                              const bool   compute_norm,
                              const Number factor1,
-                             const Number factor2) {
+                             const Number factor2,
+                             const bool   with_first_step = false) {
       const Number * solution_ptr = solution.begin();
       Number *       new_solution = solution_old.begin();
       double         residual_sqr = 0;
-      const auto     run          = [&](auto first_tag, auto norm_tag) {
-        matrix->vmult_scratch(
-          solution, [&](const unsigned int begin, const unsigned int end, const Number * matvec) {
-            const Number sum =
-              update<decltype(first_tag)::value, decltype(norm_tag)::value>(begin,
-                                                                            end,
-                                                                            factor1,
-                                                                            factor2,
-                                                                            matvec,
-                                                                            rhs_ptr,
-                                                                            diagonal,
-                                                                            diagonal_bf16,
-                                                                            solution_ptr,
-                                                                            new_solution);
+      const auto     product      = [&](auto first_tag, auto norm_tag, auto bf16_tag) {
+        const auto after_loop =
+          [&](const unsigned int begin, const unsigned int end, const Number * matvec) {
+            const Number sum = update<decltype(first_tag)::value,
+                                      decltype(norm_tag)::value,
+                                      decltype(bf16_tag)::value>(begin,
+                                                                 end,
+                                                                 factor1,
+                                                                 factor2,
+                                                                 matvec,
+                                                                 rhs_ptr,
+                                                                 diagonal,
+                                                                 diagonal_bf16,
+                                                                 solution_ptr,
+                                                                 new_solution);
             if constexpr(decltype(norm_tag)::value)
               residual_sqr += sum;
-          });
+          };
+        if constexpr(can_fuse_first_step && decltype(first_tag)::value)
+          if(with_first_step)
+          {
+            matrix->vmult_scratch(
+              solution,
+              [&](const unsigned int begin, const unsigned int end) {
+                first_step<decltype(bf16_tag)::value>(begin,
+                                                      end,
+                                                      factor_first_step,
+                                                      rhs_ptr,
+                                                      diagonal,
+                                                      diagonal_bf16,
+                                                      solution.begin());
+              },
+              after_loop);
+            return;
+          }
+        matrix->vmult_scratch(solution, after_loop);
+      };
+      const auto run = [&](auto first_tag, auto norm_tag) {
+        if constexpr(std::is_same_v<Number, float>)
+          if(use_bf16)
+          {
+            product(first_tag, norm_tag, std::true_type());
+            return;
+          }
+        product(first_tag, norm_tag, std::false_type());
       };
       if(first_update)
       {
@@ -335,20 +450,8 @@ private:
     double residual_norm = 0;
     if(zero_initial_guess)
     {
-      const Number factor       = 1. / theta;
-      Number *     solution_ptr = solution.begin();
-      if(diagonal != nullptr)
-      {
-        DEAL_II_OPENMP_SIMD_PRAGMA
-        for(unsigned int i = 0; i < n_owned; ++i)
-          solution_ptr[i] = factor * diagonal[i] * rhs_ptr[i];
-      }
-      else
-      {
-        DEAL_II_OPENMP_SIMD_PRAGMA
-        for(unsigned int i = 0; i < n_owned; ++i)
-          solution_ptr[i] = factor * load_bf16_into_float(diagonal_bf16 + i, float()) * rhs_ptr[i];
-      }
+      if(!fuse_first_step)
+        run_first_step(0, n_owned);
       if(compute_final_norm && data.degree < 2)
         residual_norm = rhs.l2_norm();
     }
@@ -372,10 +475,44 @@ private:
       residual_norm = iterate(zero_initial_guess && k == 0,
                               compute_final_norm && k + 2 == data.degree,
                               factor1,
-                              factor2);
+                              factor2,
+                              fuse_first_step && k == 0);
     }
 
     return residual_norm;
+  }
+
+  // Compute x^1 = f P^{-1} b on the range [begin, end), the first iteration
+  // with zero initial guess
+  template<bool use_bf16>
+  static void
+  first_step(const unsigned int    begin,
+             const unsigned int    end,
+             const Number          factor,
+             const Number *        rhs,
+             const Number *        diagonal,
+             const std::uint16_t * diagonal_bf16,
+             Number *              solution)
+  {
+    constexpr unsigned int n_lanes     = dealii::VectorizedArray<Number>::size();
+    const unsigned int     end_regular = begin + (end - begin) / n_lanes * n_lanes;
+    for(unsigned int i = begin; i < end_regular; i += n_lanes)
+    {
+      dealii::VectorizedArray<Number> rhs_i, diag_i;
+      rhs_i.load(rhs + i);
+      if constexpr(use_bf16)
+        diag_i = load_bf16_into_float<dealii::VectorizedArray<Number>>(diagonal_bf16 + i);
+      else
+        diag_i.load(diagonal + i);
+      (factor * diag_i * rhs_i).store(solution + i);
+    }
+    for(unsigned int i = end_regular; i < end; ++i)
+    {
+      if constexpr(use_bf16)
+        solution[i] = factor * load_bf16_into_float<Number>(diagonal_bf16 + i) * rhs[i];
+      else
+        solution[i] = factor * diagonal[i] * rhs[i];
+    }
   }
 
   // Compute x^{n+1} = x^n + f_1 (x^n - x^{n-1}) + f_2 P^{-1} (b - A x^n) on
@@ -384,8 +521,9 @@ private:
   // exit, and matvec points to the entry 'begin' of A x^n. The range starts
   // at a multiple of the SIMD width and only the last range of the vector
   // can have a remainder. Returns the sum of the squares of the residual
-  // entries if requested.
-  template<bool first_update, bool compute_norm>
+  // entries if requested. With use_bf16, the inverse diagonal is read from
+  // diagonal_bf16, otherwise from diagonal.
+  template<bool first_update, bool compute_norm, bool use_bf16>
   static Number
   update(const unsigned int    begin,
          const unsigned int    end,
@@ -398,9 +536,6 @@ private:
          const Number *        solution,
          Number *              new_solution)
   {
-    constexpr bool use_bf16 =
-      std::is_same_v<Number, float> && dealii::VectorizedArray<Number>::size() >= 8;
-
     constexpr unsigned int          n_lanes        = dealii::VectorizedArray<Number>::size();
     const Number                    factor1_plus_1 = 1. + factor1;
     const unsigned int              end_regular    = begin + (end - begin) / n_lanes * n_lanes;
@@ -410,7 +545,7 @@ private:
       dealii::VectorizedArray<Number> rhs_i, sol_i, tmp_i, diag_i;
       rhs_i.load(rhs + i);
       if constexpr(use_bf16)
-        diag_i = load_bf16_into_float(diagonal_bf16 + i, diag_i);
+        diag_i = load_bf16_into_float<dealii::VectorizedArray<Number>>(diagonal_bf16 + i);
       else
         diag_i.load(diagonal + i);
       sol_i.load(solution + i);
@@ -434,8 +569,11 @@ private:
       const Number residual_i = rhs[i] - matvec[i - begin];
       if constexpr(compute_norm)
         sum[i - end_regular] += residual_i * residual_i;
-      const float diag_i =
-        use_bf16 ? load_bf16_into_float(diagonal_bf16 + i, float()) : diagonal[i];
+      Number diag_i;
+      if constexpr(use_bf16)
+        diag_i = load_bf16_into_float<Number>(diagonal_bf16 + i);
+      else
+        diag_i = diagonal[i];
 
       if constexpr(first_update)
         new_solution[i] = factor1_plus_1 * solution[i] + factor2 * diag_i * residual_i;

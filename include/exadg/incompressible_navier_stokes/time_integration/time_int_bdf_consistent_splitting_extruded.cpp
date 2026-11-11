@@ -927,7 +927,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       dealii::VectorizedArray<float> min_eig_factor = std::numeric_limits<float>::max();
       const float *diag_mass = diagonal_mass.begin(), *diag_lapl = diagonal_laplace.begin();
       float *      diag_prec = preconditioner_viscous.get_vector().begin();
-      if(momentum_solver_chebyshev != nullptr && dealii::VectorizedArray<float>::size() >= 8)
+      // Chebyshev reads the BF16 version of the diagonal only, so skip the
+      // float version (CG converts it below when needed)
+      if(momentum_solver_chebyshev != nullptr)
       {
         momentum_solver_chebyshev->data.preconditioner_bf16.resize_fast(owned_size);
         has_float_diagonal = false;
@@ -945,8 +947,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         min_eig_factor = std::min(factor_mass * diag_mass_i * diag_entry, min_eig_factor);
 
         // Create BF16 version of the inverse diagonal
-        if(diagonal_bf16 != nullptr)
-          store_float_as_truncated_bf16(diag_entry, diagonal_bf16 + i);
+        if(!has_float_diagonal)
+          store_float_as_bf16(diag_entry, diagonal_bf16 + i);
         else
           diag_entry.store(diag_prec + i);
       }
@@ -956,8 +958,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
           1.0f / (float(factor_mass) * diag_mass[i] + float(factor_lapl) * diag_lapl[i]);
         min_eig_factor[i - regular_size] =
           std::min(float(factor_mass) * diag_mass[i] * diag_i, min_eig_factor[i - regular_size]);
-        if(diagonal_bf16 != nullptr)
-          store_float_as_truncated_bf16(diag_i, diagonal_bf16 + i);
+        if(!has_float_diagonal)
+          store_float_as_bf16(diag_i, diagonal_bf16 + i);
         else
           diag_prec[i] = diag_i;
       }
@@ -1157,9 +1159,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       {
         DEAL_II_OPENMP_SIMD_PRAGMA
         for(unsigned int i = 0; i < owned_size; ++i)
-          preconditioner_viscous.get_vector().local_element(i) =
-            load_bf16_into_float(momentum_solver_chebyshev->data.preconditioner_bf16.data() + i,
-                                 float());
+          preconditioner_viscous.get_vector().local_element(i) = load_bf16_into_float<float>(
+            momentum_solver_chebyshev->data.preconditioner_bf16.data() + i);
       }
       if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
         solver_cg.connect_eigenvalues_slot(
@@ -1228,11 +1229,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
 
         if(momentum_solver_chebyshev == nullptr && momentum_min_eigenvalue_factor > 0)
         {
+          // Chebyshev uses the BF16 version of the diagonal only, which is
+          // filled before each solve, so we do not set the preconditioner
+          // here
           typename ChebyshevSolver::AdditionalData chebyshev_data;
-          chebyshev_data.preconditioner.reset(&preconditioner_viscous, [](auto *) {
-            // custom deleter that does nothing, since the surrounding class
-            // owns the preconditioner
-          });
 
           // the actual interval and degree will be set before each solve
           chebyshev_data.max_eigenvalue  = momentum_sliding_max_eigenvalue;

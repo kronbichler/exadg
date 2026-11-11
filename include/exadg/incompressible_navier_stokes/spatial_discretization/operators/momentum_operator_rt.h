@@ -1404,11 +1404,51 @@ public:
   void
   vmult_scratch(const VectorType & src, const AfterLoop & after_loop) const
   {
+    vmult_scratch(src, nullptr, after_loop);
+  }
+
+  // Variant of vmult_scratch() that also runs 'before_loop(begin, end)' on
+  // the locally owned entries of src, like vmult(), before their first read
+  // by this process (in the cell integrals or the packing of the data sent
+  // to other processes) or by other processes in shared memory. Each entry
+  // passes through 'before_loop' exactly once, in the ranges of the pre list
+  // in units of 'vector_access_chunk_size'. As the other processes may read
+  // src during the call, 'before_loop' may only change entries of src
+  // (together with other vectors not read by the product).
+  template<typename BeforeLoop, typename AfterLoop>
+  void
+  vmult_scratch(const VectorType & src,
+                const BeforeLoop & before_loop,
+                const AfterLoop &  after_loop) const
+  {
     Timer total_timer;
     if(factor_laplace != 0.)
       timings[0] += 1;
     else
       timings[10] += 1;
+
+    constexpr bool     has_before_loop = !std::is_same_v<BeforeLoop, std::nullptr_t>;
+    const unsigned int n_cell_batches  = dof_indices.size();
+    const auto &       pre_list_index =
+      factor_laplace != 0. ? cell_loop_pre_list_index : cell_loop_mass_pre_list_index;
+    const auto & pre_list = factor_laplace != 0. ? cell_loop_pre_list : cell_loop_mass_pre_list;
+    [[maybe_unused]] const auto run_pre_list = [&](const unsigned int index) {
+      if constexpr(has_before_loop)
+        for(unsigned int range = pre_list_index[index]; range < pre_list_index[index + 1]; ++range)
+          before_loop(pre_list[range].first, pre_list[range].second);
+    };
+
+    // entries sent to other processes as ghost values (both lists) and the
+    // entries of the cells whose data is sent or read in shared memory by
+    // other processes (Laplace list only)
+    if constexpr(has_before_loop)
+    {
+      Timer time;
+      run_pre_list(n_cell_batches);
+      if(factor_laplace != 0.)
+        run_pre_list(n_cell_batches + 1);
+      timings[4] += time.wall_time();
+    }
 
     exchange_ghosts_overlapped(src, [&]() { scratch.prepare_loop(); });
 
@@ -1419,6 +1459,8 @@ public:
     Timer time;
     scratch.cell_loop(
       [&](const unsigned int cell, Number * scratch_array) {
+        if constexpr(has_before_loop)
+          run_pre_list(cell);
         dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
       },
       after_loop);
@@ -2055,10 +2097,11 @@ private:
   // Granularity of the pre and post lists. This number is a tradeoff of
   // creating sufficiently big chunks of data (that allows the CPU to do more
   // hardware prefetching and thus amortize loads) and the increase in cache
-  // pressure. We did tests where values between 128 and 512 did similarly
-  // for the latter, whereas 1024 started to deviate, so we can choose the
-  // largest size.
-  static constexpr unsigned int vector_access_chunk_size = 512;
+  // pressure. On the periodic hill (12 processes, AMD Zen 5), 64 made the
+  // products with 'before_loop' and 'after_loop' on global vectors (conjugate
+  // gradient method, residual) 4-5% faster than 512, as the entries stay in
+  // cache between the two functions, without a measurable cost elsewhere.
+  static constexpr unsigned int vector_access_chunk_size = 64;
 
   // scratch array of vmult_scratch() and the offsets of the entities of
   // each cell batch into it, in the same format as dof_indices

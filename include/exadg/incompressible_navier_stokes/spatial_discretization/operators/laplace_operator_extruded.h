@@ -230,16 +230,17 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
 // retrieve the coarsening sequence for p multigrid, defined in a central
 // place: pick the next coarser degree as half the previous degree, but for
 // small degrees we do smaller steps to avoid too aggressive coarsening (i.e.,
-// we do steps like 2-1, 3-2-1, 4-2-1, 5-3-2-1, 6-4-2-1, 7-4-2-1, 8-4-2-1 etc)
+// we do steps like 2-1, 3-2-1, 4-2-1, 5-3-2-1, 6-4-2-1, 7-5-3-2-1,
+// 8-5-3-2-1 etc)
 constexpr unsigned int
 get_coarser_fe_degree(const unsigned int degree)
 {
   if(degree < 4)
     return degree - 1;
-  else if(degree < 7)
+  else if(degree < 8)
     return degree - 2;
   else
-    return (degree + 1) / 2;
+    return degree - 3;
 }
 
 
