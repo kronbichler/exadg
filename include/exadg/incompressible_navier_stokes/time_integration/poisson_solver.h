@@ -50,24 +50,33 @@ namespace LaplaceOperator
 {
 template<typename Number>
 void
-make_zero_mean(const std::vector<unsigned int> &                    constrained_dofs,
+make_zero_mean(const Number                                         scaling_factor_for_zero_mean,
+               const std::vector<unsigned int> &                    constrained_dofs,
                dealii::LinearAlgebra::distributed::Vector<Number> & vec)
 {
   // set constrained entries to zero
   for(const unsigned int index : constrained_dofs)
     vec.local_element(index) = 0.;
 
-  // rescale mean value computed among all vector entries to the vector size
-  // without constraints
-  const unsigned int n_unconstrained_dofs = vec.locally_owned_size() - constrained_dofs.size();
-  vec.add(-vec.mean_value() * vec.size() /
-          dealii::Utilities::MPI::sum(n_unconstrained_dofs, vec.get_mpi_communicator()));
+  vec.add(-vec.mean_value() * scaling_factor_for_zero_mean);
 
-  // set constrained entries to zero again, this should now have zero mean
+  // set constrained entries to zero again, the resulting vector should now
+  // have zero mean
   for(const unsigned int index : constrained_dofs)
     vec.local_element(index) = 0.;
 }
 
+template<typename Number>
+void
+make_zero_mean(const std::vector<unsigned int> &                    constrained_dofs,
+               dealii::LinearAlgebra::distributed::Vector<Number> & vec)
+{
+  const unsigned int n_unconstrained_dofs = vec.locally_owned_size() - constrained_dofs.size();
+  const Number       scaling_factor_for_zero_mean =
+    static_cast<Number>(vec.size()) /
+    dealii::Utilities::MPI::sum(n_unconstrained_dofs, vec.get_mpi_communicator());
+  make_zero_mean(scaling_factor_for_zero_mean, constrained_dofs, vec);
+}
 
 
 /**
@@ -929,7 +938,8 @@ public:
       fe_hierarchy(create_fe_hierarchy(dof_handler.get_fe())),
       min_level(0),
       max_level(dof_handler.get_triangulation().n_global_levels() - 1 + fe_hierarchy.max_level()),
-      is_test(is_test)
+      is_test(is_test),
+      factor_for_zero_mean_with_constraints_l0(1.0)
   {
     dof_handler_hierarchy.resize(min_level, max_level);
 
@@ -1041,7 +1051,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       min_level(0),
       max_level(coarser_triangulations.size() + dof_handler.get_triangulation().n_global_levels() -
                 1 + fe_hierarchy.max_level()),
-      is_test(is_test)
+      is_test(is_test),
+      factor_for_zero_mean_with_constraints_l0(1.0)
   {
     dof_handler_hierarchy.resize(min_level, max_level);
 
@@ -1329,10 +1340,24 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         smoother_data.preconditioner.reset();
 
       mg_smoother[level].initialize(mg_matrices[level], smoother_data);
+
+      // Factor to rescale the mean value computed among all vector entries on
+      // level 0 to the vector size without constraints. We precompute this
+      // factor to avoid calling MPI::sum() in every V-cycle, where this
+      // function is used.
+      if(level == min_level)
+      {
+        const unsigned int n_unconstrained_dofs =
+          rhs[level].locally_owned_size() -
+          mg_matrices[level].get_matrix_free().get_constrained_dofs().size();
+        factor_for_zero_mean_with_constraints_l0 =
+          mg_matrices[level].m() /
+          dealii::Utilities::MPI::sum(n_unconstrained_dofs, rhs[level].get_mpi_communicator());
+      }
     }
 
-    // create a different matrix on the finest level due to enable the
-    // efficient implementation of the DG discretization
+    // create a different matrix on the finest level to enable the efficient
+    // implementation of the DG discretization
     dealii::AffineConstraints<Number> empty_constraints;
     empty_constraints.close();
     dg_matrix.reinit(mapping_fine,
@@ -1586,9 +1611,12 @@ private:
     }
 
     // coarse solver, taking into account zero mean
-    make_zero_mean(mg_matrices[min_level].get_matrix_free().get_constrained_dofs(), rhs[min_level]);
+    make_zero_mean(factor_for_zero_mean_with_constraints_l0,
+                   mg_matrices[min_level].get_matrix_free().get_constrained_dofs(),
+                   rhs[min_level]);
     mg_smoother[min_level].vmult(solution_update[min_level], rhs[min_level]);
-    make_zero_mean(mg_matrices[min_level].get_matrix_free().get_constrained_dofs(),
+    make_zero_mean(factor_for_zero_mean_with_constraints_l0,
+                   mg_matrices[min_level].get_matrix_free().get_constrained_dofs(),
                    solution_update[min_level]);
     timings[min_level][1] += time.wall_time();
     time.restart();
@@ -1627,9 +1655,9 @@ private:
 
   MatrixTypeDG dg_matrix;
 
-  SmootherType                        mg_coarse_grid_smoother;
   dealii::MGLevelObject<SmootherType> mg_smoother;
   SmootherTypeDG                      mg_smoother_dg;
+  Number                              factor_for_zero_mean_with_constraints_l0;
 
   dealii::MGLevelObject<std::unique_ptr<dealii::MGTwoLevelTransferBase<dim, VectorType>>>
     mg_transfers;
