@@ -161,6 +161,9 @@ test(const unsigned int degree, const unsigned int n_refinements)
   op.compute_diagonal(inverse_diagonal);
   for(Number & entry : inverse_diagonal)
     entry = Number(1.) / entry;
+  // the first Chebyshev iteration is fused into the second one
+  static_assert(
+    ExaDG::internal::has_vmult_scratch_with_before_loop<std::decay_t<decltype(op)>>::value);
   check_chebyshev(pcout, op, inverse_diagonal, tolerance<Number>());
   pcout << std::endl;
 }
