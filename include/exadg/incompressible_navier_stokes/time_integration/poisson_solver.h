@@ -1288,23 +1288,11 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       smoother_data.preconditioner = std::make_shared<SmootherPreconditionerType>();
       mg_matrices[level].compute_inverse_diagonal(smoother_data.preconditioner->get_vector());
 
-      // For 'float' numbers, truncate the diagonal to BF16 format to reduce
-      // memory use
+      // For 'float' numbers, round the diagonal to BF16 format to reduce
+      // memory transfer in the smoother
       if constexpr(std::is_same_v<Number, float>)
-      {
-        const unsigned int owned_size =
-          smoother_data.preconditioner->get_vector().locally_owned_size();
-        auto & diagonal_bf16 = smoother_data.preconditioner_bf16;
-        diagonal_bf16.resize_fast(owned_size);
-        DEAL_II_OPENMP_SIMD_PRAGMA
-        for(unsigned int i = 0; i < owned_size; ++i)
-        {
-          ExaDG::store_float_as_truncated_bf16(
-            smoother_data.preconditioner->get_vector().local_element(i), diagonal_bf16.data() + i);
-          smoother_data.preconditioner->get_vector().local_element(i) =
-            ExaDG::load_bf16_into_float(diagonal_bf16.data() + i, float());
-        }
-      }
+        ExaDG::round_to_bf16(smoother_data.preconditioner->get_vector(),
+                             smoother_data.preconditioner_bf16);
 
       smoother_data.smoothing_range = 20.;
       smoother_data.degree          = 4;
@@ -1359,24 +1347,11 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       smoother_data_dg.preconditioner = std::make_shared<SmootherPreconditionerType>();
       dg_matrix.compute_inverse_diagonal(smoother_data_dg.preconditioner->get_vector());
 
-      // For 'float' numbers, truncate the diagonal to BF16 format to reduce
-      // memory use
+      // For 'float' numbers, round the diagonal to BF16 format to reduce
+      // memory transfer in the smoother
       if constexpr(std::is_same_v<Number, float>)
-      {
-        const unsigned int owned_size =
-          smoother_data_dg.preconditioner->get_vector().locally_owned_size();
-        auto & diagonal_bf16 = smoother_data_dg.preconditioner_bf16;
-        diagonal_bf16.resize_fast(owned_size);
-        DEAL_II_OPENMP_SIMD_PRAGMA
-        for(unsigned int i = 0; i < owned_size; ++i)
-        {
-          ExaDG::store_float_as_truncated_bf16(
-            smoother_data_dg.preconditioner->get_vector().local_element(i),
-            diagonal_bf16.data() + i);
-          smoother_data_dg.preconditioner->get_vector().local_element(i) =
-            ExaDG::load_bf16_into_float(diagonal_bf16.data() + i, float());
-        }
-      }
+        ExaDG::round_to_bf16(smoother_data_dg.preconditioner->get_vector(),
+                             smoother_data_dg.preconditioner_bf16);
       smoother_data_dg.smoothing_range = 20.;
       smoother_data_dg.degree          = 4;
 

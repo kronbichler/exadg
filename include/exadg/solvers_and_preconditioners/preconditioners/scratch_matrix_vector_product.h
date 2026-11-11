@@ -142,6 +142,29 @@ public:
       return layout.ghost_start + (index - n_owned);
   }
 
+  // Call 'f(cell, begin, end)' for the ranges of locally owned entries that
+  // cell_loop() passes to 'after_loop' or to the gap operation after the
+  // cell batch 'cell'. The remaining entries are passed on in finish_loop().
+  // This allows an operator to determine the latest point where an entry of
+  // the result may be computed from other data.
+  template<typename Function>
+  void
+  for_each_range_finished_in_cell_loop(const Function & f) const
+  {
+    const unsigned int n_cell_batches = layout.finalize_list_index.size() - 1;
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      for(unsigned int r = layout.finalize_list_index[cell];
+          r < layout.finalize_list_index[cell + 1];
+          ++r)
+        f(cell,
+          layout.finalize_list[r][0],
+          layout.finalize_list[r][0] + layout.finalize_list[r][2]);
+      for(unsigned int r = layout.gap_list_index[cell]; r < layout.gap_list_index[cell + 1]; ++r)
+        f(cell, layout.gap_list[r][0], layout.gap_list[r][0] + layout.gap_list[r][2]);
+    }
+  }
+
   // Release the data only needed for scratch_index()
   void
   release_setup_data()
