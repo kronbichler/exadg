@@ -2,7 +2,7 @@
  *
  *  ExaDG - High-Order Discontinuous Galerkin for the Exa-Scale
  *
- *  Copyright (C) 2025 by Martin Kronbichler, Shubham Goswami,
+ *  Copyright (C) 2025 - 2026 by Martin Kronbichler, Shubham Goswami,
  *  Richard Schussnig
  *
  *  This file is dual-licensed under the Apache-2.0 with LLVM Exception (see
@@ -40,10 +40,19 @@
 #include <deal.II/multigrid/mg_transfer_global_coarsening.h>
 #include <deal.II/multigrid/mg_transfer_matrix_free.h>
 #include <deal.II/numerics/vector_tools.h>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <iomanip>
+#include <map>
+#include <random>
+#include <set>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/laplace_operator_extruded.h>
 #include <exadg/operators/constraints.h>
 #include <exadg/solvers_and_preconditioners/preconditioners/chebyshev_scratch.h>
+#include <exadg/utilities/mpi_shared_memory.h>
 
 
 namespace LaplaceOperator
@@ -80,13 +89,48 @@ make_zero_mean(const std::vector<unsigned int> &                    constrained_
 
 
 /**
+ * Interface of the transfer operators of the Poisson multigrid that can
+ * compute the residual b - A u on the fine level and restrict it in a single
+ * cell loop. The operator part is computed cell by cell without summation
+ * into a global vector and restricted directly, whereas the right hand side
+ * is read with the masked indices of the restriction, where each DoF is
+ * visited by exactly one cell. Compared to the separate matrix-vector
+ * product, vector update and restriction, this avoids four passes through
+ * the fine vector and the communication of the matrix-vector product.
+ */
+template<int dim, typename Number>
+class MGTwoLevelTransferResidualRestriction
+{
+public:
+  using VectorType = LinearAlgebra::distributed::Vector<Number>;
+
+  virtual ~MGTwoLevelTransferResidualRestriction() = default;
+
+  /**
+   * Compute the residual rhs - A * solution on the fine level, with A the
+   * operator returned by get_operator_fine(), and restrict it to
+   * the coarse level vector 'dst'.
+   */
+  virtual void
+  restrict_residual(VectorType &       dst,
+                    const VectorType & rhs,
+                    const VectorType & solution) const = 0;
+
+  virtual const LaplaceOperatorFE<dim, Number> &
+  get_operator_fine() const = 0;
+};
+
+
+
+/**
  * This is a specialized transfer operator, designed for transfer between
  * p-levels only, that aims to utilize the fact that we have the same cells
  * and the same cell order to design a highly efficient transfer operation.
  */
 template<int dim, typename Number>
 class MGTwoLevelTransferFromOperator
-  : public MGTwoLevelTransferBase<dim, LinearAlgebra::distributed::Vector<Number>>
+  : public MGTwoLevelTransferBase<dim, LinearAlgebra::distributed::Vector<Number>>,
+    public MGTwoLevelTransferResidualRestriction<dim, Number>
 {
 public:
   using VectorType                      = LinearAlgebra::distributed::Vector<Number>;
@@ -232,33 +276,30 @@ public:
   void
   restrict_and_add(VectorType & dst, const VectorType & src) const override
   {
-    const unsigned int size_fine      = prolongation_matrix.n();
-    const unsigned int n_cell_batches = operator_fine.get_matrix_free().n_cell_batches();
-    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
-    {
-      if(size_fine == 2)
-        do_restrict_and_add_on_cell<2>(cell, dst, src);
-      else if(size_fine == 3)
-        do_restrict_and_add_on_cell<3>(cell, dst, src);
-      else if(size_fine == 4)
-        do_restrict_and_add_on_cell<4>(cell, dst, src);
-      else if(size_fine == 5)
-        do_restrict_and_add_on_cell<5>(cell, dst, src);
-      else if(size_fine == 6)
-        do_restrict_and_add_on_cell<6>(cell, dst, src);
-      else if(size_fine == 7)
-        do_restrict_and_add_on_cell<7>(cell, dst, src);
-      else if(size_fine == 8)
-        do_restrict_and_add_on_cell<8>(cell, dst, src);
-      else if(size_fine == 9)
-        do_restrict_and_add_on_cell<9>(cell, dst, src);
-      else
-        AssertThrow(false,
-                    ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
-                               " not instantiated"));
-    }
+    restrict_cells<false>(dst, src, nullptr);
+  }
 
-    dst.compress(VectorOperation::add);
+  /**
+   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual_and_add
+   */
+  void
+  restrict_residual(VectorType &       dst,
+                    const VectorType & rhs,
+                    const VectorType & solution) const override
+  {
+    const bool has_ghosts = solution.has_ghost_elements();
+    if(!has_ghosts)
+      solution.update_ghost_values();
+    dst = 0;
+    restrict_cells<true>(dst, solution, &rhs);
+    if(!has_ghosts)
+      solution.zero_out_ghost_values();
+  }
+
+  const LaplaceOperatorFE<dim, Number> &
+  get_operator_fine() const override
+  {
+    return operator_fine;
   }
 
   void
@@ -298,6 +339,41 @@ private:
   FullMatrix<Number>                     prolongation_matrix;
   AlignedVector<Number>                  prolongation_matrix_data;
 
+  // Restriction of a vector src (residual == false) or of the residual *rhs - A src
+  // with 'A src' evaluated within the same loop (residual == true), and summed into dst
+  template<bool residual>
+  void
+  restrict_cells(VectorType & dst, const VectorType & src, const VectorType * rhs) const
+  {
+    const unsigned int size_fine      = prolongation_matrix.n();
+    const unsigned int n_cell_batches = operator_fine.get_matrix_free().n_cell_batches();
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      if(size_fine == 2)
+        do_restrict_and_add_on_cell<2, residual>(cell, dst, src, rhs);
+      else if(size_fine == 3)
+        do_restrict_and_add_on_cell<3, residual>(cell, dst, src, rhs);
+      else if(size_fine == 4)
+        do_restrict_and_add_on_cell<4, residual>(cell, dst, src, rhs);
+      else if(size_fine == 5)
+        do_restrict_and_add_on_cell<5, residual>(cell, dst, src, rhs);
+      else if(size_fine == 6)
+        do_restrict_and_add_on_cell<6, residual>(cell, dst, src, rhs);
+      else if(size_fine == 7)
+        do_restrict_and_add_on_cell<7, residual>(cell, dst, src, rhs);
+      else if(size_fine == 8)
+        do_restrict_and_add_on_cell<8, residual>(cell, dst, src, rhs);
+      else if(size_fine == 9)
+        do_restrict_and_add_on_cell<9, residual>(cell, dst, src, rhs);
+      else
+        AssertThrow(false,
+                    ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
+                               " not instantiated"));
+    }
+
+    dst.compress(VectorOperation::add);
+  }
+
   template<int size_fine>
   void
   do_prolongate_and_add_on_cell(const unsigned int cell,
@@ -322,18 +398,32 @@ private:
       dst, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
   }
 
-  template<int size_fine>
+  template<int size_fine, bool residual>
   void
   do_restrict_and_add_on_cell(const unsigned int cell,
                               VectorType &       dst,
-                              const VectorType & src) const
+                              const VectorType & src,
+                              const VectorType * rhs) const
   {
     constexpr int size_coarse = get_coarser_fe_degree(size_fine - 1) + 1;
     AssertDimension(prolongation_matrix.m(), size_coarse);
-    VectorizedArray<Number> tmp[Utilities::pow(size_fine, dim)];
+    constexpr unsigned int  dofs_per_cell = Utilities::pow(size_fine, dim);
+    VectorizedArray<Number> tmp[dofs_per_cell];
 
     operator_fine.template read_dof_values_compressed<size_fine - 1, size_fine, 1>(
-      src, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
+      residual ? *rhs : src, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
+    if constexpr(residual)
+    {
+      // The operator is applied without the transpose of the hanging-node
+      // interpolation and the cell values are restricted at all nodes: the
+      // interpolation of the coarse space to the nodes of a fine cell
+      // already contains the hanging-node interpolation and constraints of
+      // the fine level, because the coarse space is a subspace.
+      VectorizedArray<Number> cell_result[dofs_per_cell];
+      operator_fine.template compute_cell_operation_nodal<size_fine - 1>(cell, src, cell_result);
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        tmp[i] -= cell_result[i];
+    }
     dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_general,
                                                   dealii::internal::EvaluatorQuantity::value,
                                                   dim,
@@ -358,7 +448,8 @@ private:
  */
 template<int dim, typename Number>
 class MGTwoLevelTransferAnisotropicNested
-  : public MGTwoLevelTransferBase<dim, LinearAlgebra::distributed::Vector<Number>>
+  : public MGTwoLevelTransferBase<dim, LinearAlgebra::distributed::Vector<Number>>,
+    public MGTwoLevelTransferResidualRestriction<dim, Number>
 {
 public:
   using VectorType                      = LinearAlgebra::distributed::Vector<Number>;
@@ -366,8 +457,12 @@ public:
 
   MGTwoLevelTransferAnisotropicNested(
     const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_fine,
-    const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_coarse)
-    : operator_fine(operator_fine), operator_coarse(operator_coarse)
+    const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_coarse,
+    const bool                                              print_statistics = false)
+    : operator_fine(operator_fine),
+      operator_coarse(operator_coarse),
+      print_timings(print_statistics),
+      barrier_before_transfer(std::getenv("EXADG_TRANSFER_PROFILE_BARRIER") != nullptr)
   {
     // find unique indices of prolongation to identify the actual read
     // pattern; on cells with hanging nodes, only the DoFs actually owned by
@@ -447,8 +542,7 @@ public:
     const unsigned int dofs_per_cell = mf.get_dof_handler().get_fe().dofs_per_cell;
     partitioner_coarse_cells =
       std::make_shared<Utilities::MPI::Partitioner>(owned_cells, requested_cells, communicator);
-    data_sent.resize(partitioner_coarse_cells->n_import_indices() * dofs_per_cell);
-    data_received.resize(partitioner_coarse_cells->n_ghost_indices() * dofs_per_cell);
+    setup_communication(dofs_per_cell);
 
     std::vector<unsigned int> active_cell_index_to_index(
       partitioner_coarse_cells->locally_owned_size());
@@ -471,18 +565,41 @@ public:
     cell_indices_to_be_read.resize(mf_fine.n_cell_batches() * n_lanes,
                                    numbers::invalid_unsigned_int);
 
-    count = 0;
+    count                                   = 0;
+    unsigned int n_fine_cells_remote_coarse = 0;
     interpolation_index_of_cells.resize(mf_fine.n_cell_batches());
     const unsigned int size_prol = (dof_handler_coarse.get_fe().degree + 1) * (degree_fine + 1);
+    // the first fine cell (in the order of the restriction loop) contributing
+    // to a coarse cell of another process sets the values in the receive
+    // buffer, the others add to them, which avoids zeroing the buffer
+    static_assert(n_lanes <= 32, "Lane mask must fit into 32 bits");
+    first_contribution_lanes.assign(mf_fine.n_cell_batches(), 0);
+    std::vector<bool> ghost_cell_touched(partitioner_coarse_cells->n_ghost_indices(), false);
     for(unsigned int c = 0; c < mf_fine.n_cell_batches(); ++c)
       for(unsigned int v = 0; v < mf_fine.n_active_entries_per_cell_batch(c); ++v, ++count)
       {
         const auto & item        = indices_of_needed_cells[count];
         unsigned int local_index = partitioner_coarse_cells->global_to_local(item.first);
         if(local_index < partitioner_coarse_cells->locally_owned_size())
+        {
           cell_indices_to_be_read[c * n_lanes + v] = active_cell_index_to_index[local_index];
+          // local and remote cells are distinguished by comparing with the
+          // number of locally owned cells
+          AssertThrow(active_cell_index_to_index[local_index] <
+                        partitioner_coarse_cells->locally_owned_size(),
+                      ExcMessage("Cell batches of the coarse level contain padded lanes"));
+        }
         else
+        {
           cell_indices_to_be_read[c * n_lanes + v] = local_index;
+          ++n_fine_cells_remote_coarse;
+          const unsigned int ghost = local_index - partitioner_coarse_cells->locally_owned_size();
+          if(!ghost_cell_touched[ghost])
+          {
+            ghost_cell_touched[ghost] = true;
+            first_contribution_lanes[c] |= 1u << v;
+          }
+        }
         const Point<dim> ref_point = item.second;
         for(unsigned int d = 0; d < dim; ++d)
         {
@@ -500,6 +617,9 @@ public:
         }
       }
 
+    if(print_statistics)
+      print_ownership_statistics(count, n_fine_cells_remote_coarse, dofs_per_cell);
+
     std::vector<Polynomials::Polynomial<double>> poly =
       Polynomials::generate_complete_Lagrange_basis(
         QGaussLobatto<1>(dof_handler_coarse.get_fe().degree + 1).get_points());
@@ -516,6 +636,22 @@ public:
       }
   }
 
+  ~MGTwoLevelTransferAnisotropicNested() override
+  {
+    if(print_timings)
+      print_phase_timings();
+    for(std::vector<MPI_Request> * requests : {&prolongation_done_send,
+                                               &prolongation_done_recv,
+                                               &restriction_done_send,
+                                               &restriction_done_recv})
+      wait_for_signals(*requests);
+    if(comm_done != MPI_COMM_NULL)
+    {
+      const int ierr = MPI_Comm_free(&comm_done);
+      AssertThrowMPI(ierr);
+    }
+  }
+
   /**
    * @copydoc MGTwoLevelTransferBase::prolongate_and_add
    */
@@ -525,22 +661,41 @@ public:
     // Retrieve solution from coarse space into a separate field that gets
     // communicated (cells not present in the local range of the solution
     // vector) or by reading directly on the locally owned cells
+    PhaseTimer<7> timer(time_prolongation);
+    ++n_prolongations;
+    if(barrier_before_transfer)
+    {
+      const int ierr = MPI_Barrier(src.get_mpi_communicator());
+      AssertThrowMPI(ierr);
+    }
+    timer.lap(0);
     src.update_ghost_values();
+    timer.lap(1);
     const unsigned int dofs_per_cell =
       operator_coarse.get_matrix_free().get_dof_handler().get_fe().dofs_per_cell;
 
+    // the partners on this node must have finished reading the cells packed
+    // in the last prolongation before the send buffer is overwritten
+    wait_for_signals(prolongation_done_recv);
+    wait_for_signals(prolongation_done_send);
+    timer.lap(2);
+
+    // partners on the same node only exchange an empty message signaling that
+    // the send buffer is ready, and read the data in place
     std::vector<MPI_Request> requests(partitioner_coarse_cells->import_targets().size() +
                                       partitioner_coarse_cells->ghost_targets().size());
     unsigned int             offset = 0, count_request = 0;
-    for(const auto & target : partitioner_coarse_cells->ghost_targets())
+    for(unsigned int t = 0; t < partitioner_coarse_cells->ghost_targets().size(); ++t)
     {
-      const auto ierr = MPI_Irecv(data_received.data() + offset,
-                                  target.second * dofs_per_cell * sizeof(Number),
-                                  MPI_BYTE,
-                                  target.first,
-                                  15,
-                                  src.get_mpi_communicator(),
-                                  &requests[count_request]);
+      const auto & target = partitioner_coarse_cells->ghost_targets()[t];
+      const auto   ierr =
+        MPI_Irecv(recv_buffer + offset,
+                  ghost_target_shared[t] ? 0 : target.second * dofs_per_cell * sizeof(Number),
+                  MPI_BYTE,
+                  target.first,
+                  15,
+                  src.get_mpi_communicator(),
+                  &requests[count_request]);
       AssertThrowMPI(ierr);
       offset += target.second * dofs_per_cell;
       ++count_request;
@@ -548,32 +703,45 @@ public:
 
     unsigned int count_cell = 0;
     offset                  = 0;
-    for(const auto & target : partitioner_coarse_cells->import_targets())
+    for(unsigned int t = 0; t < partitioner_coarse_cells->import_targets().size(); ++t)
     {
+      const auto & target = partitioner_coarse_cells->import_targets()[t];
       for(unsigned int i = 0; i < target.second; ++i, ++count_cell)
         operator_coarse.read_dof_values_compressed(src,
                                                    cell_indices_to_send[count_cell] / n_lanes,
                                                    cell_indices_to_send[count_cell] % n_lanes,
-                                                   data_sent.data() + offset + i * dofs_per_cell);
-      const auto ierr = MPI_Isend(data_sent.data() + offset,
-                                  target.second * dofs_per_cell * sizeof(Number),
-                                  MPI_BYTE,
-                                  target.first,
-                                  15,
-                                  src.get_mpi_communicator(),
-                                  &requests[count_request]);
+                                                   send_buffer + offset + i * dofs_per_cell);
+      std::atomic_thread_fence(std::memory_order_release);
+      const auto ierr =
+        MPI_Isend(send_buffer + offset,
+                  import_target_shared[t] ? 0 : target.second * dofs_per_cell * sizeof(Number),
+                  MPI_BYTE,
+                  target.first,
+                  15,
+                  src.get_mpi_communicator(),
+                  &requests[count_request]);
       AssertThrowMPI(ierr);
       offset += target.second * dofs_per_cell;
       ++count_request;
     }
-    AssertDimension(offset, data_sent.size());
+    AssertDimension(offset, send_buffer_size);
     AssertDimension(count_request, requests.size());
+
+    // receive the signals that the partners on this node are done reading
+    post_signals(partitioner_coarse_cells->import_targets(),
+                 import_target_shared,
+                 tag_prolongation_done,
+                 false,
+                 prolongation_done_recv);
+    timer.lap(3);
 
     if(requests.size() > 0)
     {
       const int ierr = MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
       AssertThrowMPI(ierr);
     }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    timer.lap(4);
 
     const unsigned int size_fine =
       operator_fine.get_matrix_free().get_dof_handler().get_fe().degree + 1;
@@ -603,7 +771,18 @@ public:
                                " not instantiated"));
     }
 
+    timer.lap(5);
+
+    // signal to the partners on the same node that their send buffer may be
+    // overwritten
+    post_signals(partitioner_coarse_cells->ghost_targets(),
+                 ghost_target_shared,
+                 tag_prolongation_done,
+                 true,
+                 prolongation_done_send);
+
     src.zero_out_ghost_values();
+    timer.lap(6);
   }
 
   /**
@@ -612,85 +791,157 @@ public:
   void
   restrict_and_add(VectorType & dst, const VectorType & src) const override
   {
+    restrict_cells<false>(dst, src, nullptr);
+  }
+
+  /**
+   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual_and_add
+   */
+  void
+  restrict_residual(VectorType &       dst,
+                    const VectorType & rhs,
+                    const VectorType & solution) const override
+  {
+    dst                   = 0;
+    const bool has_ghosts = solution.has_ghost_elements();
+    if(!has_ghosts)
+      solution.update_ghost_values();
+    restrict_cells<true>(dst, solution, &rhs);
+    if(!has_ghosts)
+      solution.zero_out_ghost_values();
+  }
+
+  const LaplaceOperatorFE<dim, Number> &
+  get_operator_fine() const override
+  {
+    return operator_fine;
+  }
+
+private:
+  // Restriction of src (residual == false) or of the residual *rhs - A src
+  // (residual == true), summed into dst
+  template<bool residual>
+  void
+  restrict_cells(VectorType & dst, const VectorType & src, const VectorType * rhs) const
+  {
     const unsigned int size_fine =
       operator_fine.get_matrix_free().get_dof_handler().get_fe().degree + 1;
     const unsigned int n_cell_batches = fine_dof_indices.size() / n_lanes /
                                         Utilities::pow(std::min<unsigned int>(3u, size_fine), dim);
-    std::fill(data_received.begin(), data_received.end(), Number(0));
+    PhaseTimer<6> timer(time_restriction);
+    ++n_restrictions;
+    if(barrier_before_transfer)
+    {
+      const int ierr = MPI_Barrier(dst.get_mpi_communicator());
+      AssertThrowMPI(ierr);
+    }
+    timer.lap(0);
+
+    // the partners on the same node must have finished reading the contributions
+    // of the last restriction before the buffer is overwritten
+    wait_for_signals(restriction_done_recv);
+    wait_for_signals(restriction_done_send);
+    timer.lap(1);
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
       if(size_fine == 2)
-        do_restrict_and_add_on_cell<2>(cell, dst, src);
+        do_restrict_and_add_on_cell<2, residual>(cell, dst, src, rhs);
       else if(size_fine == 3)
-        do_restrict_and_add_on_cell<3>(cell, dst, src);
+        do_restrict_and_add_on_cell<3, residual>(cell, dst, src, rhs);
       else if(size_fine == 4)
-        do_restrict_and_add_on_cell<4>(cell, dst, src);
+        do_restrict_and_add_on_cell<4, residual>(cell, dst, src, rhs);
       else if(size_fine == 5)
-        do_restrict_and_add_on_cell<5>(cell, dst, src);
+        do_restrict_and_add_on_cell<5, residual>(cell, dst, src, rhs);
       else if(size_fine == 6)
-        do_restrict_and_add_on_cell<6>(cell, dst, src);
+        do_restrict_and_add_on_cell<6, residual>(cell, dst, src, rhs);
       else if(size_fine == 7)
-        do_restrict_and_add_on_cell<7>(cell, dst, src);
+        do_restrict_and_add_on_cell<7, residual>(cell, dst, src, rhs);
       else if(size_fine == 8)
-        do_restrict_and_add_on_cell<8>(cell, dst, src);
+        do_restrict_and_add_on_cell<8, residual>(cell, dst, src, rhs);
       else if(size_fine == 9)
-        do_restrict_and_add_on_cell<9>(cell, dst, src);
+        do_restrict_and_add_on_cell<9, residual>(cell, dst, src, rhs);
       else
         AssertThrow(false,
                     ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
                                " not instantiated"));
     }
 
+    timer.lap(2);
     const unsigned int dofs_per_cell =
       operator_coarse.get_matrix_free().get_dof_handler().get_fe().dofs_per_cell;
 
     std::vector<MPI_Request> requests(partitioner_coarse_cells->import_targets().size() +
                                       partitioner_coarse_cells->ghost_targets().size());
     unsigned int             offset = 0, count_request = 0;
-    for(const auto & target : partitioner_coarse_cells->import_targets())
+    for(unsigned int t = 0; t < partitioner_coarse_cells->import_targets().size(); ++t)
     {
-      const auto ierr = MPI_Irecv(data_sent.data() + offset,
-                                  target.second * dofs_per_cell * sizeof(Number),
-                                  MPI_BYTE,
-                                  target.first,
-                                  15,
-                                  dst.get_mpi_communicator(),
-                                  &requests[count_request]);
+      const auto & target = partitioner_coarse_cells->import_targets()[t];
+      const auto   ierr =
+        MPI_Irecv(send_buffer + offset,
+                  import_target_shared[t] ? 0 : target.second * dofs_per_cell * sizeof(Number),
+                  MPI_BYTE,
+                  target.first,
+                  15,
+                  dst.get_mpi_communicator(),
+                  &requests[count_request]);
       AssertThrowMPI(ierr);
       offset += target.second * dofs_per_cell;
       ++count_request;
     }
 
+    std::atomic_thread_fence(std::memory_order_release);
     offset = 0;
-    for(const auto & target : partitioner_coarse_cells->ghost_targets())
+    for(unsigned int t = 0; t < partitioner_coarse_cells->ghost_targets().size(); ++t)
     {
-      const auto ierr = MPI_Isend(data_received.data() + offset,
-                                  target.second * dofs_per_cell * sizeof(Number),
-                                  MPI_BYTE,
-                                  target.first,
-                                  15,
-                                  dst.get_mpi_communicator(),
-                                  &requests[count_request]);
+      const auto & target = partitioner_coarse_cells->ghost_targets()[t];
+      const auto   ierr =
+        MPI_Isend(recv_buffer + offset,
+                  ghost_target_shared[t] ? 0 : target.second * dofs_per_cell * sizeof(Number),
+                  MPI_BYTE,
+                  target.first,
+                  15,
+                  dst.get_mpi_communicator(),
+                  &requests[count_request]);
       AssertThrowMPI(ierr);
       offset += target.second * dofs_per_cell;
       ++count_request;
     }
     AssertDimension(count_request, requests.size());
 
+    // receive the signals that the partners on this node are done reading
+    post_signals(partitioner_coarse_cells->ghost_targets(),
+                 ghost_target_shared,
+                 tag_restriction_done,
+                 false,
+                 restriction_done_recv);
+
     if(requests.size() > 0)
     {
       const int ierr = MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
       AssertThrowMPI(ierr);
     }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    timer.lap(3);
     for(unsigned int i = 0; i < partitioner_coarse_cells->n_import_indices(); ++i)
       operator_coarse.distribute_local_to_global_compressed(dst,
                                                             cell_indices_to_send[i] / n_lanes,
                                                             cell_indices_to_send[i] % n_lanes,
-                                                            data_sent.data() + i * dofs_per_cell);
+                                                            import_cell_contributions[i]);
+
+    // signal to the partners on this node that their buffer may be
+    // overwritten
+    post_signals(partitioner_coarse_cells->import_targets(),
+                 import_target_shared,
+                 tag_restriction_done,
+                 true,
+                 restriction_done_send);
+    timer.lap(4);
 
     dst.compress(VectorOperation::add);
+    timer.lap(5);
   }
 
+public:
   void
   interpolate(VectorType &, const VectorType &) const override
   {
@@ -724,17 +975,541 @@ public:
   }
 
 private:
-  const LaplaceOperator::LaplaceOperatorFE<dim, Number> &  operator_fine;
-  const LaplaceOperator::LaplaceOperatorFE<dim, Number> &  operator_coarse;
+  /**
+   * Print how many of the coarse cells needed by the locally owned fine cells
+   * are owned by other processes, and which part of that data has to cross
+   * node boundaries. This measures how well the partitions of the fine and
+   * coarse triangulations are aligned. Both prolongation and restriction move
+   * the same amount of data (in opposite directions).
+   */
+  void
+  print_ownership_statistics(const unsigned int n_fine_cells,
+                             const unsigned int n_fine_cells_remote_coarse,
+                             const unsigned int dofs_per_cell) const
+  {
+    const Utilities::MPI::Partitioner & part    = *partitioner_coarse_cells;
+    const MPI_Comm                      comm    = part.get_mpi_communicator();
+    const unsigned int                  my_rank = Utilities::MPI::this_mpi_process(comm);
+
+    // identify the node of each process by the rank of the first process in
+    // its shared-memory communicator
+    MPI_Comm comm_shared;
+    int      ierr =
+      MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, my_rank, MPI_INFO_NULL, &comm_shared);
+    AssertThrowMPI(ierr);
+    unsigned int node_id = my_rank;
+    ierr                 = MPI_Bcast(&node_id, 1, MPI_UNSIGNED, 0, comm_shared);
+    AssertThrowMPI(ierr);
+    ierr = MPI_Comm_free(&comm_shared);
+    AssertThrowMPI(ierr);
+    // emulate a layout with several nodes on a single machine
+    if(const char * env = std::getenv("EXADG_RANKS_PER_NODE"))
+    {
+      const unsigned int ranks_per_node = std::max(1, std::atoi(env));
+      node_id                           = my_rank / ranks_per_node * ranks_per_node;
+    }
+    const std::vector<unsigned int> node_of_rank = Utilities::MPI::all_gather(comm, node_id);
+    const std::size_t               n_nodes =
+      std::set<unsigned int>(node_of_rank.begin(), node_of_rank.end()).size();
+
+    unsigned int cells_on_node = 0, cells_off_node = 0, partners_off_node = 0;
+    for(const auto & [rank, n_cells] : part.ghost_targets())
+      if(node_of_rank[rank] == node_id)
+        cells_on_node += n_cells;
+      else
+      {
+        cells_off_node += n_cells;
+        ++partners_off_node;
+      }
+
+    // Count the distinct vertices, lines, faces and cells among the coarse
+    // cells sent to each target. With k the degree, a message containing each
+    // shared DoF only once has V + (k-1) E + (k-1)^2 F + (k-1)^3 C entries,
+    // compared to C (k+1)^3 for the current per-cell messages.
+    std::array<std::uint64_t, 4> entities_on_node{}, entities_off_node{};
+    if constexpr(dim == 3)
+    {
+      const auto & mf_coarse  = operator_coarse.get_matrix_free();
+      unsigned int count_cell = 0;
+      for(const auto & [rank, n_cells] : part.import_targets())
+      {
+        std::set<unsigned int> vertices, lines, faces;
+        for(unsigned int i = 0; i < n_cells; ++i, ++count_cell)
+        {
+          const auto cell = mf_coarse.get_cell_iterator(cell_indices_to_send[count_cell] / n_lanes,
+                                                        cell_indices_to_send[count_cell] % n_lanes);
+          for(const unsigned int v : cell->vertex_indices())
+            vertices.insert(cell->vertex_index(v));
+          for(const unsigned int l : cell->line_indices())
+            lines.insert(cell->line(l)->index());
+          for(const unsigned int f : cell->face_indices())
+            faces.insert(cell->face(f)->index());
+        }
+        auto & entities = (node_of_rank[rank] == node_id) ? entities_on_node : entities_off_node;
+        entities[0] += vertices.size();
+        entities[1] += lines.size();
+        entities[2] += faces.size();
+        entities[3] += n_cells;
+      }
+      for(auto & e : entities_on_node)
+        e = Utilities::MPI::sum(e, comm);
+      for(auto & e : entities_off_node)
+        e = Utilities::MPI::sum(e, comm);
+    }
+    const auto unique_fraction = [](const std::array<std::uint64_t, 4> & e, const unsigned int k) {
+      const double km = k - 1.;
+      return 100. * (e[0] + km * e[1] + km * km * e[2] + km * km * km * e[3]) /
+             std::max(1., e[3] * Utilities::fixed_power<3>(k + 1.));
+    };
+    const unsigned int degree_coarse =
+      operator_coarse.get_matrix_free().get_dof_handler().get_fe().degree;
+    const auto kb_ghosts_vector = Utilities::MPI::min_max_avg(
+      operator_coarse.get_matrix_free().get_dof_info().vector_partitioner->n_ghost_indices() *
+        sizeof(Number) / 1024.,
+      comm);
+
+    // Load of the coarse level if each coarse cell was owned by the owner of
+    // its fine children (aligned partition): every fine cell contributes the
+    // inverse of the number of children of its coarse cell. Compare the
+    // maximum with the average per process and per node.
+    double aligned_load = 0;
+    for(unsigned int c = 0; c < interpolation_index_of_cells.size(); ++c)
+      for(unsigned int v = 0;
+          v < operator_fine.get_matrix_free().n_active_entries_per_cell_batch(c);
+          ++v)
+      {
+        unsigned int n_children = 1;
+        for(unsigned int d = 0; d < dim; ++d)
+          if(interpolation_index_of_cells[c][d][v] != 0)
+            n_children *= 2;
+        aligned_load += 1. / n_children;
+      }
+    const auto                     aligned_rank = Utilities::MPI::min_max_avg(aligned_load, comm);
+    const std::vector<double>      aligned_all  = Utilities::MPI::all_gather(comm, aligned_load);
+    std::map<unsigned int, double> aligned_node;
+    for(unsigned int r = 0; r < aligned_all.size(); ++r)
+      aligned_node[node_of_rank[r]] += aligned_all[r];
+    double aligned_node_max = 0, aligned_node_sum = 0;
+    for(const auto & [node, load] : aligned_node)
+    {
+      aligned_node_max = std::max(aligned_node_max, load);
+      aligned_node_sum += load;
+    }
+    const double aligned_node_avg =
+      aligned_node_sum / std::max<std::size_t>(1, aligned_node.size());
+
+    const auto sum = [&](const unsigned int value) {
+      return Utilities::MPI::sum<std::uint64_t>(value, comm);
+    };
+    const std::uint64_t n_fine_global          = sum(n_fine_cells);
+    const std::uint64_t n_fine_remote_global   = sum(n_fine_cells_remote_coarse);
+    const std::uint64_t n_coarse_global        = sum(part.locally_owned_size());
+    const std::uint64_t n_received_on_global   = sum(cells_on_node);
+    const std::uint64_t n_received_off_global  = sum(cells_off_node);
+    const std::uint64_t n_received_cell_global = n_received_on_global + n_received_off_global;
+
+    const double kb_per_cell = dofs_per_cell * sizeof(Number) / 1024.;
+    const auto   kb_received =
+      Utilities::MPI::min_max_avg(part.n_ghost_indices() * kb_per_cell, comm);
+    const auto kb_off_node  = Utilities::MPI::min_max_avg(cells_off_node * kb_per_cell, comm);
+    const auto partners     = Utilities::MPI::min_max_avg(part.ghost_targets().size(), comm);
+    const auto partners_off = Utilities::MPI::min_max_avg(partners_off_node, comm);
+
+    if(my_rank == 0)
+    {
+      const auto percent = [](const std::uint64_t value, const std::uint64_t whole) {
+        return 100. * value / std::max<std::uint64_t>(whole, 1);
+      };
+      std::cout << std::defaultfloat << std::setprecision(4) << "Anisotropic transfer, "
+                << n_fine_global << " fine cells -> " << n_coarse_global << " coarse cells on "
+                << Utilities::MPI::n_mpi_processes(comm) << " processes, " << n_nodes
+                << " nodes:" << std::endl
+                << "  fine cells whose coarse cell is on another process: " << n_fine_remote_global
+                << " (" << percent(n_fine_remote_global, n_fine_global) << "%)" << std::endl
+                << "  coarse cells moved per transfer:                   " << n_received_cell_global
+                << " (" << percent(n_received_cell_global, n_coarse_global)
+                << "% of all coarse cells), off-node "
+                << percent(n_received_off_global, n_received_cell_global) << "%" << std::endl
+                << "  KB received per process and transfer:   min " << kb_received.min << " avg "
+                << kb_received.avg << " max " << kb_received.max << std::endl
+                << "  KB received from other nodes:           min " << kb_off_node.min << " avg "
+                << kb_off_node.avg << " max " << kb_off_node.max << std::endl
+                << "  unique DoFs vs. per-cell entries, degree " << degree_coarse << ": "
+                << unique_fraction(entities_on_node, degree_coarse) << "% on-node, "
+                << unique_fraction(entities_off_node, degree_coarse)
+                << "% off-node; degree 7: " << unique_fraction(entities_on_node, 7) << "% / "
+                << unique_fraction(entities_off_node, 7) << "%" << std::endl
+                << "  coarse cells per process if aligned:    min " << aligned_rank.min << " avg "
+                << aligned_rank.avg << " max " << aligned_rank.max << " (max/avg "
+                << aligned_rank.max / aligned_rank.avg << "), per node max/avg "
+                << aligned_node_max / aligned_node_avg << std::endl
+                << "  KB of ghost update of the coarse vector: avg " << kb_ghosts_vector.avg
+                << " max " << kb_ghosts_vector.max << std::endl
+                << "  partner processes (all / off-node):     avg " << partners.avg << " / "
+                << partners_off.avg << ", max " << partners.max << " / " << partners_off.max
+                << std::endl;
+    }
+  }
+
+  const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_fine;
+  const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_coarse;
+
+  // Accumulated wall time of the phases of prolongation and restriction,
+  // printed at destruction; with EXADG_TRANSFER_PROFILE_BARRIER, a barrier
+  // before each transfer separates the waiting for late processes (phase 0)
+  // from the transfer itself
+  const bool                     print_timings;
+  const bool                     barrier_before_transfer;
+  mutable std::array<double, 7>  time_prolongation = {};
+  mutable std::array<double, 6>  time_restriction  = {};
+  mutable unsigned long long int n_prolongations   = 0;
+  mutable unsigned long long int n_restrictions    = 0;
+
+  // Adds the time since the last lap (or construction) to the given phase
+  template<std::size_t n_phases>
+  class PhaseTimer
+  {
+  public:
+    PhaseTimer(std::array<double, n_phases> & times)
+      : times(times), last(std::chrono::steady_clock::now())
+    {
+    }
+
+    void
+    lap(const unsigned int phase)
+    {
+      AssertIndexRange(phase, n_phases);
+      const auto now = std::chrono::steady_clock::now();
+      times[phase] += std::chrono::duration<double>(now - last).count();
+      last = now;
+    }
+
+  private:
+    std::array<double, n_phases> &                     times;
+    std::chrono::time_point<std::chrono::steady_clock> last;
+  };
+
+  void
+  print_phase_timings() const
+  {
+    const MPI_Comm comm = partitioner_coarse_cells->get_mpi_communicator();
+    const auto     print =
+      [&](const auto & times, const auto & names, const unsigned long long int n_calls) {
+        double total = 0;
+        for(const double t : times)
+          total += t;
+        const auto total_stat = Utilities::MPI::min_max_avg(total, comm);
+        if(Utilities::MPI::this_mpi_process(comm) == 0)
+          std::cout << "  " << names[0] << " (" << n_calls
+                    << " calls), microseconds per call, avg / max over processes:" << std::endl;
+        for(unsigned int i = 0; i < times.size(); ++i)
+        {
+          const auto stat = Utilities::MPI::min_max_avg(times[i], comm);
+          if(Utilities::MPI::this_mpi_process(comm) == 0)
+            std::cout << "    " << std::left << std::setw(36) << names[i + 1] << std::right
+                      << std::fixed << std::setprecision(1) << std::setw(9)
+                      << 1e6 * stat.avg / std::max(1ull, n_calls) << std::setw(9)
+                      << 1e6 * stat.max / std::max(1ull, n_calls) << std::defaultfloat << std::endl;
+        }
+        if(Utilities::MPI::this_mpi_process(comm) == 0)
+          std::cout << "    " << std::left << std::setw(36) << "total" << std::right << std::fixed
+                    << std::setprecision(1) << std::setw(9)
+                    << 1e6 * total_stat.avg / std::max(1ull, n_calls) << std::setw(9)
+                    << 1e6 * total_stat.max / std::max(1ull, n_calls) << std::defaultfloat
+                    << std::endl;
+      };
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << "Phases of anisotropic transfer, "
+                << operator_fine.get_matrix_free().get_dof_handler().n_dofs() << " fine DoFs -> "
+                << operator_coarse.get_matrix_free().get_dof_handler().n_dofs()
+                << " coarse DoFs:" << std::endl;
+    print(time_prolongation,
+          std::array<std::string, 8>{{"prolongation",
+                                      "barrier (waiting for late processes)",
+                                      "ghost update coarse vector",
+                                      "wait for done signals",
+                                      "pack and post messages",
+                                      "wait for messages",
+                                      "cell loop",
+                                      "signal done, zero ghosts"}},
+          n_prolongations);
+    print(time_restriction,
+          std::array<std::string, 7>{{"restriction",
+                                      "barrier (waiting for late processes)",
+                                      "wait for done signals",
+                                      "cell loop",
+                                      "post and wait for messages",
+                                      "add received contributions",
+                                      "compress coarse vector"}},
+          n_restrictions);
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << std::endl;
+  }
   std::vector<unsigned int>                                fine_dof_indices;
   std::vector<unsigned char>                               all_indices_unconstrained;
   AlignedVector<Number>                                    prolongation_matrix_data;
   std::shared_ptr<const Utilities::MPI::Partitioner>       partitioner_coarse_cells;
   std::vector<unsigned int>                                cell_indices_to_be_read;
+  std::vector<std::uint32_t>                               first_contribution_lanes;
   std::vector<unsigned int>                                cell_indices_to_send;
   std::vector<dealii::ndarray<std::uint8_t, dim, n_lanes>> interpolation_index_of_cells;
-  mutable std::vector<Number>                              data_sent;
-  mutable std::vector<Number>                              data_received;
+
+  // Communication buffers, both with one section of whole cells per partner
+  // process in the order of the partitioner's targets:
+  // - send buffer: coarse cells owned here, packed for the partners in the
+  //   prolongation, and the contributions to them received in the
+  //   restriction;
+  // - receive buffer: coarse cells of the partners received in the
+  //   prolongation, and the contributions to them computed here in the
+  //   restriction.
+  // With shared memory, both buffers are allocated in shared windows, and the
+  // partners on the same node read the sections for them in place instead
+  // of receiving messages.
+  Number *                                                                send_buffer = nullptr;
+  Number *                                                                recv_buffer = nullptr;
+  unsigned int                                                            send_buffer_size = 0;
+  unsigned int                                                            recv_buffer_size = 0;
+  std::vector<Number>                                                     send_storage;
+  std::vector<Number>                                                     recv_storage;
+  dealii::MemorySpace::MemorySpaceData<Number, dealii::MemorySpace::Host> send_storage_sm;
+  dealii::MemorySpace::MemorySpaceData<Number, dealii::MemorySpace::Host> recv_storage_sm;
+
+  // per ghost coarse cell: location of its values in the prolongation, in the
+  // receive buffer or in the send buffer of the owner on the same node
+  std::vector<const Number *> ghost_cell_values;
+
+  // per imported coarse cell: location of the contributions to it in the
+  // restriction, in the send buffer or in the receive buffer of the partner
+  // on the same node
+  std::vector<const Number *> import_cell_contributions;
+
+  // per ghost resp. import target: whether the partner is on the same node
+  std::vector<bool> ghost_target_shared;
+  std::vector<bool> import_target_shared;
+
+  // Signals that a partner on the same node has finished reading a buffer of
+  // this process, posted after reading and waited for before the buffer is
+  // overwritten in the next call. They are sent over a separate communicator
+  // because they are still in flight when the transfer returns. The send
+  // requests are kept per target to be completed before their slots are
+  // reused.
+  MPI_Comm                         comm_done = MPI_COMM_NULL;
+  mutable std::vector<MPI_Request> prolongation_done_send;
+  mutable std::vector<MPI_Request> prolongation_done_recv;
+  mutable std::vector<MPI_Request> restriction_done_send;
+  mutable std::vector<MPI_Request> restriction_done_recv;
+
+  static constexpr int tag_offset_send       = 1;
+  static constexpr int tag_offset_recv       = 4;
+  static constexpr int tag_prolongation_done = 2;
+  static constexpr int tag_restriction_done  = 3;
+
+  /**
+   * Allocate the communication buffers and set up the access to the data of
+   * the partners. Shared memory is used unless the environment variable
+   * EXADG_TRANSFER_NO_SHARED_MEMORY is set. Collective over the communicator
+   * of the coarse cells.
+   */
+  void
+  setup_communication(const unsigned int dofs_per_cell)
+  {
+    const Utilities::MPI::Partitioner & part = *partitioner_coarse_cells;
+    const MPI_Comm                      comm = part.get_mpi_communicator();
+    send_buffer_size                         = part.n_import_indices() * dofs_per_cell;
+    recv_buffer_size                         = part.n_ghost_indices() * dofs_per_cell;
+    ghost_target_shared.assign(part.ghost_targets().size(), false);
+    import_target_shared.assign(part.import_targets().size(), false);
+    ghost_cell_values.resize(part.n_ghost_indices());
+    import_cell_contributions.resize(part.n_import_indices());
+
+    MPI_Comm comm_sm = MPI_COMM_NULL;
+    int      ierr;
+    if(std::getenv("EXADG_TRANSFER_NO_SHARED_MEMORY") == nullptr)
+    {
+      ierr = MPI_Comm_split_type(comm,
+                                 MPI_COMM_TYPE_SHARED,
+                                 Utilities::MPI::this_mpi_process(comm),
+                                 MPI_INFO_NULL,
+                                 &comm_sm);
+      AssertThrowMPI(ierr);
+
+      // emulate a layout with several nodes on a single machine, for testing
+      // the combination of shared memory and messages
+      if(const char * env = std::getenv("EXADG_RANKS_PER_NODE"))
+      {
+        const unsigned int rank           = Utilities::MPI::this_mpi_process(comm);
+        const unsigned int ranks_per_node = std::max(1, std::atoi(env));
+        MPI_Comm           comm_node;
+        ierr = MPI_Comm_split(comm_sm, rank / ranks_per_node, rank, &comm_node);
+        AssertThrowMPI(ierr);
+        ierr = MPI_Comm_free(&comm_sm);
+        AssertThrowMPI(ierr);
+        comm_sm = comm_node;
+      }
+    }
+
+    if(comm_sm == MPI_COMM_NULL)
+    {
+      send_storage.resize(send_buffer_size);
+      recv_storage.resize(recv_buffer_size);
+      send_buffer = send_storage.data();
+      recv_buffer = recv_storage.data();
+      for(unsigned int c = 0; c < part.n_ghost_indices(); ++c)
+        ghost_cell_values[c] = recv_buffer + c * dofs_per_cell;
+      for(unsigned int c = 0; c < part.n_import_indices(); ++c)
+        import_cell_contributions[c] = send_buffer + c * dofs_per_cell;
+      return;
+    }
+
+    mpi_shared_memory::allocate_shared_recv_data(send_storage_sm, send_buffer_size, comm_sm);
+    mpi_shared_memory::allocate_shared_recv_data(recv_storage_sm, recv_buffer_size, comm_sm);
+    send_buffer = send_storage_sm.values.data();
+    recv_buffer = recv_storage_sm.values.data();
+
+    // rank of the partners in the shared-memory communicator, or
+    // MPI_UNDEFINED for partners on other nodes
+    const auto translate_ranks = [&](const auto & targets) {
+      std::vector<int> ranks(targets.size()), ranks_sm(targets.size());
+      for(unsigned int t = 0; t < targets.size(); ++t)
+        ranks[t] = targets[t].first;
+      MPI_Group group, group_sm;
+      int       ierr = MPI_Comm_group(comm, &group);
+      AssertThrowMPI(ierr);
+      ierr = MPI_Comm_group(comm_sm, &group_sm);
+      AssertThrowMPI(ierr);
+      ierr =
+        MPI_Group_translate_ranks(group, ranks.size(), ranks.data(), group_sm, ranks_sm.data());
+      AssertThrowMPI(ierr);
+      MPI_Group_free(&group);
+      MPI_Group_free(&group_sm);
+      return ranks_sm;
+    };
+    const std::vector<int> ghost_ranks_sm  = translate_ranks(part.ghost_targets());
+    const std::vector<int> import_ranks_sm = translate_ranks(part.import_targets());
+
+    ierr = MPI_Comm_dup(comm, &comm_done);
+    AssertThrowMPI(ierr);
+
+    // offsets of the sections of the targets in the two buffers
+    const auto compute_offsets = [&](const auto & targets) {
+      std::vector<unsigned int> offsets(targets.size());
+      for(unsigned int t = 0, offset = 0; t < targets.size(); ++t)
+      {
+        offsets[t] = offset;
+        offset += targets[t].second * dofs_per_cell;
+      }
+      return offsets;
+    };
+    std::vector<unsigned int> ghost_offsets  = compute_offsets(part.ghost_targets());
+    std::vector<unsigned int> import_offsets = compute_offsets(part.import_targets());
+
+    // Exchange the offsets of the sections with the partners on the same
+    // node: the owner of the coarse cells sends the offset in its send
+    // buffer, the other side the offset in its receive buffer.
+    std::vector<unsigned int> remote_ghost_offsets(ghost_offsets.size());
+    std::vector<unsigned int> remote_import_offsets(import_offsets.size());
+    std::vector<MPI_Request>  requests;
+    requests.reserve(2 * (ghost_offsets.size() + import_offsets.size()));
+    const auto exchange_offset = [&](const unsigned int rank,
+                                     unsigned int &     local_offset,
+                                     unsigned int &     remote_offset,
+                                     const int          tag_local,
+                                     const int          tag_remote) {
+      requests.emplace_back();
+      int ierr =
+        MPI_Irecv(&remote_offset, 1, MPI_UNSIGNED, rank, tag_remote, comm_done, &requests.back());
+      AssertThrowMPI(ierr);
+      requests.emplace_back();
+      ierr =
+        MPI_Isend(&local_offset, 1, MPI_UNSIGNED, rank, tag_local, comm_done, &requests.back());
+      AssertThrowMPI(ierr);
+    };
+    // two partners may need cells of each other, so the offsets in the send
+    // and receive buffers are distinguished by the tag
+    for(unsigned int t = 0; t < ghost_offsets.size(); ++t)
+      if(ghost_ranks_sm[t] != MPI_UNDEFINED)
+      {
+        ghost_target_shared[t] = true;
+        exchange_offset(part.ghost_targets()[t].first,
+                        ghost_offsets[t],
+                        remote_ghost_offsets[t],
+                        tag_offset_recv,
+                        tag_offset_send);
+      }
+    for(unsigned int t = 0; t < import_offsets.size(); ++t)
+      if(import_ranks_sm[t] != MPI_UNDEFINED)
+      {
+        import_target_shared[t] = true;
+        exchange_offset(part.import_targets()[t].first,
+                        import_offsets[t],
+                        remote_import_offsets[t],
+                        tag_offset_send,
+                        tag_offset_recv);
+      }
+    ierr = MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    AssertThrowMPI(ierr);
+
+    for(unsigned int t = 0, c = 0; t < ghost_offsets.size(); ++t)
+    {
+      const Number * base =
+        ghost_target_shared[t] ?
+          send_storage_sm.values_sm[ghost_ranks_sm[t]].data() + remote_ghost_offsets[t] :
+          recv_buffer + ghost_offsets[t];
+      for(unsigned int i = 0; i < part.ghost_targets()[t].second; ++i, ++c)
+        ghost_cell_values[c] = base + i * dofs_per_cell;
+    }
+    for(unsigned int t = 0, c = 0; t < import_offsets.size(); ++t)
+    {
+      const Number * base =
+        import_target_shared[t] ?
+          recv_storage_sm.values_sm[import_ranks_sm[t]].data() + remote_import_offsets[t] :
+          send_buffer + import_offsets[t];
+      for(unsigned int i = 0; i < part.import_targets()[t].second; ++i, ++c)
+        import_cell_contributions[c] = base + i * dofs_per_cell;
+    }
+
+    prolongation_done_send.assign(ghost_offsets.size(), MPI_REQUEST_NULL);
+    restriction_done_recv.assign(ghost_offsets.size(), MPI_REQUEST_NULL);
+    prolongation_done_recv.assign(import_offsets.size(), MPI_REQUEST_NULL);
+    restriction_done_send.assign(import_offsets.size(), MPI_REQUEST_NULL);
+
+    ierr = MPI_Comm_free(&comm_sm);
+    AssertThrowMPI(ierr);
+  }
+
+  // Post empty messages over 'comm_done' to (send == true) or from
+  // (send == false) the targets on the same node, one request per target.
+  void
+  post_signals(const std::vector<std::pair<unsigned int, unsigned int>> & targets,
+               const std::vector<bool> &                                  target_shared,
+               const int                                                  tag,
+               const bool                                                 send,
+               std::vector<MPI_Request> &                                 requests) const
+  {
+    if(requests.empty())
+      return;
+    if(send)
+      std::atomic_thread_fence(std::memory_order_release);
+    for(unsigned int t = 0; t < targets.size(); ++t)
+      if(target_shared[t])
+      {
+        const int ierr =
+          send ? MPI_Isend(nullptr, 0, MPI_BYTE, targets[t].first, tag, comm_done, &requests[t]) :
+                 MPI_Irecv(nullptr, 0, MPI_BYTE, targets[t].first, tag, comm_done, &requests[t]);
+        AssertThrowMPI(ierr);
+      }
+  }
+
+  // Complete the given signal requests, a no-op for null requests
+  void
+  wait_for_signals(std::vector<MPI_Request> & requests) const
+  {
+    if(requests.empty())
+      return;
+    const int ierr = MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    AssertThrowMPI(ierr);
+    std::atomic_thread_fence(std::memory_order_acquire);
+  }
 
   template<int size_fine>
   void
@@ -765,8 +1540,7 @@ private:
       else if(cell_indices_to_be_read[cell * n_lanes + v] != numbers::invalid_unsigned_int)
       {
         const Number * ptr =
-          data_received.data() +
-          (cell_indices_to_be_read[cell * n_lanes + v] - locally_owned_size) * dofs_per_cell;
+          ghost_cell_values[cell_indices_to_be_read[cell * n_lanes + v] - locally_owned_size];
         for(unsigned int i = 0; i < dofs_per_cell; ++i)
           tmp[i][v] = ptr[i];
       }
@@ -823,11 +1597,12 @@ private:
         dst, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
   }
 
-  template<int size_fine>
+  template<int size_fine, bool residual>
   void
   do_restrict_and_add_on_cell(const unsigned int cell,
                               VectorType &       dst,
-                              const VectorType & src) const
+                              const VectorType & src,
+                              const VectorType * rhs) const
   {
     constexpr int size_coarse = size_fine;
     AssertDimension(prolongation_matrix_data.size(), size_coarse * size_fine * 3);
@@ -844,12 +1619,22 @@ private:
       for(unsigned int i = 0; i < dofs_per_cell; ++i)
         for(unsigned int v = 0; v < n_lanes; ++v)
           tmp[i][v] = indices[i * n_lanes + v] != numbers::invalid_unsigned_int ?
-                        src.local_element(indices[i * n_lanes + v]) :
+                        (residual ? *rhs : src).local_element(indices[i * n_lanes + v]) :
                         Number(0);
     }
     else
       operator_fine.template read_dof_values_compressed<size_fine - 1, size_fine, 1>(
-        src, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
+        residual ? *rhs : src, fine_dof_indices, all_indices_unconstrained, cell, {}, true, tmp);
+    if constexpr(residual)
+    {
+      // The operator is applied without the transpose of the hanging-node
+      // interpolation and the cell values are restricted at all nodes, see
+      // MGTwoLevelTransferFromOperator
+      VectorizedArray<Number> cell_result[dofs_per_cell];
+      operator_fine.template compute_cell_operation_nodal<size_fine - 1>(cell, src, cell_result);
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        tmp[i] -= cell_result[i];
+    }
     std::array<unsigned int, n_lanes> indices_interpolation;
     dealii::internal::EvaluatorTensorProduct<dealii::internal::evaluate_general,
                                              dim,
@@ -900,10 +1685,14 @@ private:
       else if(cell_indices_to_be_read[cell * n_lanes + v] != numbers::invalid_unsigned_int)
       {
         Number * ptr =
-          data_received.data() +
+          recv_buffer +
           (cell_indices_to_be_read[cell * n_lanes + v] - locally_owned_size) * dofs_per_cell;
-        for(unsigned int i = 0; i < dofs_per_cell; ++i)
-          ptr[i] += tmp[i][v];
+        if(first_contribution_lanes[cell] & (1u << v))
+          for(unsigned int i = 0; i < dofs_per_cell; ++i)
+            ptr[i] = tmp[i][v];
+        else
+          for(unsigned int i = 0; i < dofs_per_cell; ++i)
+            ptr[i] += tmp[i][v];
       }
   }
 };
@@ -1174,7 +1963,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         else if(level > max_level - n_final_geometric_levels)
         {
           auto transfer = std::make_unique<MGTwoLevelTransferAnisotropicNested<dim, Number>>(
-            mg_matrices[level], mg_matrices[level - 1]);
+            mg_matrices[level], mg_matrices[level - 1], not is_test);
           // Compare the nested anisotropic transfer result with the output of
           // the (more general) non-nested transfer of deal.II to ensure
           // correctness of the result.
@@ -1306,7 +2095,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
                              smoother_data.preconditioner_bf16);
 
       smoother_data.smoothing_range = 20.;
-      smoother_data.degree          = 4;
+      smoother_data.degree =
+        mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree > 1 ? 5 : 3;
 
       // manually compute the eigenvalue estimate for Chebyshev because we
       // need to be careful with the constrained indices
@@ -1333,7 +2123,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       if(eigenvalue_tracker.values.empty())
         smoother_data.max_eigenvalue = 1.0;
       else
-        smoother_data.max_eigenvalue = eigenvalue_tracker.values.back();
+        smoother_data.max_eigenvalue = 1.05 * eigenvalue_tracker.values.back();
 
       // For float, we use the bf16 representation
       if constexpr(std::is_same_v<Number, float>)
@@ -1401,7 +2191,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       if(eigenvalue_tracker.values.empty())
         smoother_data_dg.max_eigenvalue = 1.0;
       else
-        smoother_data_dg.max_eigenvalue = eigenvalue_tracker.values.back();
+        smoother_data_dg.max_eigenvalue = 1.05 * eigenvalue_tracker.values.back();
 
       // For float, we use the bf16 representation
       if constexpr(std::is_same_v<Number, float>)
@@ -1480,7 +2270,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       for(const auto & description : level_descriptions)
         cells_width = std::max(cells_width, description.cells.size() + 2);
       std::cout << "lvl  deg  dofs        " << std::left << std::setw(cells_width) << "cells"
-                << "smooth      residual    restrict    prolongate   [share]" << std::endl;
+                << "smooth      resid_restrict  prolongate   [share]" << std::endl;
       for(unsigned int i = 0; i < timings.size(); ++i)
       {
         const LevelDescription & description = level_descriptions[i];
@@ -1488,8 +2278,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
                   << (std::to_string(description.degree) + (i + 1 < timings.size() ? "" : "DG"))
                   << std::setw(12) << description.n_dofs << std::setw(cells_width)
                   << description.cells << std::scientific << std::setw(12) << std::setprecision(3)
-                  << timings[i][1] << std::setw(12) << timings[i][2] << std::setw(12)
-                  << timings[i][0] << std::setw(13) << timings[i][3] << std::defaultfloat
+                  << timings[i][1] << std::setw(16) << timings[i][0] << std::setw(13)
+                  << timings[i][3] << std::defaultfloat
                   << (timings[i][0] + timings[i][1] + timings[i][2] + timings[i][3]) / all_time *
                        100
                   << "%" << std::endl;
@@ -1522,13 +2312,13 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     {
       Timer time;
       rhs_dg.copy_locally_owned_data_from(src);
-      timings.back()[0] += time.wall_time();
+      timings.back()[2] += time.wall_time();
 
       do_vcycle(true, rhs_dg, solution_update_dg);
 
       time.restart();
       dst.copy_locally_owned_data_from(solution_update_dg);
-      timings.back()[0] += time.wall_time();
+      timings.back()[2] += time.wall_time();
     }
   }
 
@@ -1540,19 +2330,13 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         const unsigned int      n_max_iterations,
         const double            target_residual) const
   {
-    VectorTypeOuter tmp;
-    tmp.reinit(sol, true);
-    matrix.vmult(
-      tmp,
-      sol,
-      [&tmp](const unsigned int begin, const unsigned int end) {
-        std::fill(tmp.begin() + begin, tmp.begin() + end, typename VectorTypeOuter::value_type(0));
-      },
-      [&](const unsigned int begin, const unsigned int end) {
+    using Number2 = typename VectorTypeOuter::value_type;
+    matrix.vmult_scratch(sol,
+      [&](const unsigned int begin, const unsigned int end, const Number2 * matvec) {
         DEAL_II_OPENMP_SIMD_PRAGMA
         for(unsigned int i = begin; i < end; ++i)
         {
-          rhs_dg.local_element(i)             = rhs.local_element(i) - tmp.local_element(i);
+          rhs_dg.local_element(i)             = rhs.local_element(i) - matvec[i - begin];
           solution_update_dg.local_element(i) = 0.;
         }
       });
@@ -1574,9 +2358,68 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
   }
 
 private:
+  // Find the transfers that can compute the residual within the restriction,
+  // unless disabled by the environment variable EXADG_NO_FUSED_RESIDUAL. If
+  // EXADG_CHECK_FUSED_RESIDUAL is set, compare to the separate computation
+  // on random vectors.
+  void
+  setup_residual_restriction() const
+  {
+    residual_restriction.assign(max_level + 1, nullptr);
+    for(unsigned int level = min_level; level < max_level; ++level)
+    {
+      if(std::getenv("EXADG_NO_FUSED_RESIDUAL") != nullptr)
+        continue;
+      const auto * transfer =
+        dynamic_cast<const MGTwoLevelTransferResidualRestriction<dim, Number> *>(
+          mg_transfers[level].get());
+      if(transfer == nullptr)
+        continue;
+      AssertThrow(&transfer->get_operator_fine() == &mg_matrices[level + 1],
+                  ExcMessage("The fine operator of the transfer must be the level operator"));
+      residual_restriction[level] = transfer;
+
+      if(std::getenv("EXADG_CHECK_FUSED_RESIDUAL") != nullptr)
+      {
+        VectorType u, b, r, coarse_separate, coarse_fused;
+        mg_matrices[level + 1].initialize_dof_vector(u);
+        mg_matrices[level + 1].initialize_dof_vector(b);
+        mg_matrices[level + 1].initialize_dof_vector(r);
+        mg_matrices[level].initialize_dof_vector(coarse_separate);
+        mg_matrices[level].initialize_dof_vector(coarse_fused);
+        std::mt19937 gen(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD));
+        std::uniform_real_distribution<Number> dist(-1., 1.);
+        for(unsigned int i = 0; i < u.locally_owned_size(); ++i)
+        {
+          u.local_element(i) = dist(gen);
+          b.local_element(i) = dist(gen);
+        }
+        mg_matrices[level + 1].vmult(r, u);
+        r.sadd(-1.0, 1.0, b);
+        mg_transfers[level]->restrict_and_add(coarse_separate, r);
+        transfer->restrict_residual(coarse_fused, b, u);
+        const double norm = coarse_separate.l2_norm();
+        coarse_fused -= coarse_separate;
+        const double error = coarse_fused.l2_norm();
+        const bool   has_hanging_nodes =
+          Utilities::MPI::max(mg_matrices[level + 1].has_hanging_nodes() ? 1 : 0, MPI_COMM_WORLD) ==
+          1;
+        const types::global_dof_index n_constrained = Utilities::MPI::sum<types::global_dof_index>(
+          mg_matrices[level + 1].get_matrix_free().get_constrained_dofs().size(), MPI_COMM_WORLD);
+        if(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+          std::cout << "Fused residual restriction to level " << level << ": |separate| = " << norm
+                    << ", |fused - separate| / |separate| = " << error / norm
+                    << ", hanging nodes: " << (has_hanging_nodes ? "yes" : "no")
+                    << ", constrained DoFs: " << n_constrained << std::endl;
+      }
+    }
+  }
+
   void
   do_vcycle(const bool zero_out_solution, const VectorType & src_rhs, VectorType & solution) const
   {
+    if(residual_restriction.empty())
+      setup_residual_restriction();
     ++count_times;
     Timer time;
     if(zero_out_solution)
@@ -1590,7 +2433,7 @@ private:
                                                 solution,
                                                 mg_matrices[max_level],
                                                 rhs[max_level]);
-    timings.back()[2] += time.wall_time();
+    timings.back()[0] += time.wall_time();
     time.restart();
 
     for(unsigned int level = max_level; level > min_level; --level)
@@ -1599,15 +2442,24 @@ private:
       timings[level][1] += time.wall_time();
       time.restart();
 
-      mg_matrices[level].vmult(temp_vector[level], solution_update[level]);
-      temp_vector[level].sadd(-1.0, 1.0, rhs[level]);
-      timings[level][2] += time.wall_time();
-      time.restart();
-
-      rhs[level - 1] = 0;
-      mg_transfers[level - 1]->restrict_and_add(rhs[level - 1], temp_vector[level]);
-      timings[level][0] += time.wall_time();
-      time.restart();
+      if(residual_restriction[level - 1] != nullptr)
+      {
+        // residual and restriction in one cell loop
+        residual_restriction[level - 1]->restrict_residual(rhs[level - 1],
+                                                           rhs[level],
+                                                           solution_update[level]);
+        timings[level][0] += time.wall_time();
+        time.restart();
+      }
+      else
+      {
+        mg_matrices[level].vmult(temp_vector[level], solution_update[level]);
+        temp_vector[level].sadd(-1.0, 1.0, rhs[level]);
+        rhs[level - 1] = 0;
+        mg_transfers[level - 1]->restrict_and_add(rhs[level - 1], temp_vector[level]);
+        timings[level][0] += time.wall_time();
+        time.restart();
+      }
     }
 
     // coarse solver, taking into account zero mean
@@ -1655,6 +2507,7 @@ private:
 
   MatrixTypeDG dg_matrix;
 
+  SmootherType                        mg_coarse_grid_smoother;
   dealii::MGLevelObject<SmootherType> mg_smoother;
   SmootherTypeDG                      mg_smoother_dg;
   Number                              factor_for_zero_mean_with_constraints_l0;
@@ -1662,11 +2515,19 @@ private:
   dealii::MGLevelObject<std::unique_ptr<dealii::MGTwoLevelTransferBase<dim, VectorType>>>
     mg_transfers;
 
+  // per level the transfer if it can compute the residual within the
+  // restriction, else nullptr, set up in the first V-cycle
+  mutable std::vector<const MGTwoLevelTransferResidualRestriction<dim, Number> *>
+    residual_restriction;
+
   mutable dealii::MGLevelObject<VectorType> rhs;
   mutable dealii::MGLevelObject<VectorType> temp_vector;
   mutable dealii::MGLevelObject<VectorType> solution_update;
 
-  mutable std::size_t                        count_times;
+  mutable std::size_t count_times;
+  // per level the time for residual and restriction [0], smoothing [1],
+  // other operations such as vector copies on the DG level, only contained
+  // in the total and the share [2], and prolongation [3]
   mutable std::vector<std::array<double, 4>> timings;
 
   // polynomial degree, number of DoFs, and number of active cells per

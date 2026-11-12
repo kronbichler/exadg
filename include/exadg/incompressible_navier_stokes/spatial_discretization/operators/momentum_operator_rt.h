@@ -38,6 +38,7 @@
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/extruded_mapping_info.h>
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/momentum_operator_rt_single_exchange.h>
 #include <exadg/solvers_and_preconditioners/preconditioners/scratch_matrix_vector_product.h>
+#include <exadg/utilities/mpi_shared_memory.h>
 
 namespace RTOperator
 {
@@ -191,94 +192,6 @@ distribute_local_to_global_rt_compressed(
 
 
 using namespace dealii;
-
-
-
-namespace mpi_shared_memory
-{
-template<typename Number>
-void
-allocate_shared_recv_data(MemorySpace::MemorySpaceData<Number, MemorySpace::Host> & data,
-                          const unsigned int                                        expected_size,
-                          const MPI_Comm communicator_shared)
-{
-  const unsigned int n_shared_ranks = Utilities::MPI::n_mpi_processes(communicator_shared);
-  const unsigned int rank_shared    = Utilities::MPI::this_mpi_process(communicator_shared);
-
-  MPI_Win  mpi_window;
-  Number * data_this;
-
-  std::vector<Number *> others(n_shared_ranks);
-
-  MPI_Info info;
-  int      ierr = MPI_Info_create(&info);
-  AssertThrowMPI(ierr);
-
-  ierr = MPI_Info_set(info, "alloc_shared_noncontig", "true");
-  AssertThrowMPI(ierr);
-
-  const std::size_t align_by = 64;
-
-  std::size_t allocated_bytes =
-    ((expected_size * sizeof(Number) + align_by) / sizeof(Number)) * sizeof(Number);
-
-  ierr = MPI_Win_allocate_shared(
-    allocated_bytes, sizeof(Number), info, communicator_shared, &data_this, &mpi_window);
-  AssertThrowMPI(ierr);
-
-  for(unsigned int i = 0; i < n_shared_ranks; ++i)
-  {
-    int        disp_unit;
-    MPI_Aint   segment_size;
-    const auto ierr = MPI_Win_shared_query(mpi_window, i, &segment_size, &disp_unit, &others[i]);
-    AssertDimension(disp_unit, sizeof(Number));
-    AssertThrowMPI(ierr);
-  }
-
-  Number * ptr_unaligned = others[rank_shared];
-  Number * ptr_aligned   = ptr_unaligned;
-
-  AssertThrow(std::align(align_by,
-                         expected_size * sizeof(Number),
-                         reinterpret_cast<void *&>(ptr_aligned),
-                         allocated_bytes) != nullptr,
-              dealii::ExcNotImplemented());
-
-  unsigned int              n_align_local = ptr_aligned - ptr_unaligned;
-  std::vector<unsigned int> n_align_sm(n_shared_ranks);
-
-  ierr = MPI_Allgather(
-    &n_align_local, 1, MPI_UNSIGNED, n_align_sm.data(), 1, MPI_UNSIGNED, communicator_shared);
-  AssertThrowMPI(ierr);
-
-  for(unsigned int i = 0; i < n_shared_ranks; ++i)
-    others[i] += n_align_sm[i];
-
-  std::vector<unsigned int> allocated_sizes(n_shared_ranks);
-
-  ierr = MPI_Allgather(
-    &expected_size, 1, MPI_UNSIGNED, allocated_sizes.data(), 1, MPI_UNSIGNED, communicator_shared);
-  AssertThrowMPI(ierr);
-
-  data.values_sm.resize(n_shared_ranks);
-  for(unsigned int i = 0; i < n_shared_ranks; ++i)
-    data.values_sm[i] = ArrayView<const Number>(others[i], allocated_sizes[i]);
-
-  data.values = Kokkos::View<Number *, Kokkos::HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
-    ptr_aligned, expected_size);
-
-  // Kokkos will not free the memory because the memory is
-  // unmanaged. Instead we use a shared pointer to take care of
-  // that.
-  data.values_sm_ptr = {ptr_aligned, [mpi_window](Number *) mutable {
-                          // note: we are creating here a copy of
-                          // the window other approaches led to
-                          // segmentation faults
-                          const auto ierr = MPI_Win_free(&mpi_window);
-                          AssertThrowMPI(ierr);
-                        }};
-}
-} // namespace mpi_shared_memory
 
 
 
