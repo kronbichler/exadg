@@ -280,7 +280,7 @@ public:
   }
 
   /**
-   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual_and_add
+   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual
    */
   void
   restrict_residual(VectorType &       dst,
@@ -290,7 +290,6 @@ public:
     const bool has_ghosts = solution.has_ghost_elements();
     if(!has_ghosts)
       solution.update_ghost_values();
-    dst = 0;
     restrict_cells<true>(dst, solution, &rhs);
     if(!has_ghosts)
       solution.zero_out_ghost_values();
@@ -343,35 +342,42 @@ private:
   // with 'A src' evaluated within the same loop (residual == true), and summed into dst
   template<bool residual>
   void
-  restrict_cells(VectorType & dst, const VectorType & src, const VectorType * rhs) const
+  restrict_cells(VectorType & coarse_dst, const VectorType & src, const VectorType * rhs) const
   {
-    const unsigned int size_fine      = prolongation_matrix.n();
-    const unsigned int n_cell_batches = operator_fine.get_matrix_free().n_cell_batches();
-    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
-    {
-      if(size_fine == 2)
-        do_restrict_and_add_on_cell<2, residual>(cell, dst, src, rhs);
-      else if(size_fine == 3)
-        do_restrict_and_add_on_cell<3, residual>(cell, dst, src, rhs);
-      else if(size_fine == 4)
-        do_restrict_and_add_on_cell<4, residual>(cell, dst, src, rhs);
-      else if(size_fine == 5)
-        do_restrict_and_add_on_cell<5, residual>(cell, dst, src, rhs);
-      else if(size_fine == 6)
-        do_restrict_and_add_on_cell<6, residual>(cell, dst, src, rhs);
-      else if(size_fine == 7)
-        do_restrict_and_add_on_cell<7, residual>(cell, dst, src, rhs);
-      else if(size_fine == 8)
-        do_restrict_and_add_on_cell<8, residual>(cell, dst, src, rhs);
-      else if(size_fine == 9)
-        do_restrict_and_add_on_cell<9, residual>(cell, dst, src, rhs);
-      else
-        AssertThrow(false,
-                    ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
-                               " not instantiated"));
-    }
-
-    dst.compress(VectorOperation::add);
+    int dummy = 0;
+    operator_coarse.get_matrix_free().template cell_loop<VectorType, int>(
+      [&](const auto &,
+          VectorType & dst,
+          const int &,
+          const std::pair<unsigned int, unsigned int> & cell_range) {
+        const unsigned int size_fine = prolongation_matrix.n();
+        for(unsigned int cell = cell_range.first; cell < cell_range.second; ++cell)
+        {
+          if(size_fine == 2)
+            do_restrict_and_add_on_cell<2, residual>(cell, dst, src, rhs);
+          else if(size_fine == 3)
+            do_restrict_and_add_on_cell<3, residual>(cell, dst, src, rhs);
+          else if(size_fine == 4)
+            do_restrict_and_add_on_cell<4, residual>(cell, dst, src, rhs);
+          else if(size_fine == 5)
+            do_restrict_and_add_on_cell<5, residual>(cell, dst, src, rhs);
+          else if(size_fine == 6)
+            do_restrict_and_add_on_cell<6, residual>(cell, dst, src, rhs);
+          else if(size_fine == 7)
+            do_restrict_and_add_on_cell<7, residual>(cell, dst, src, rhs);
+          else if(size_fine == 8)
+            do_restrict_and_add_on_cell<8, residual>(cell, dst, src, rhs);
+          else if(size_fine == 9)
+            do_restrict_and_add_on_cell<9, residual>(cell, dst, src, rhs);
+          else
+            AssertThrow(false,
+                        ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
+                                   " not instantiated"));
+        }
+      },
+      coarse_dst,
+      dummy,
+      /* zero_dst */ residual);
   }
 
   template<int size_fine>
@@ -795,7 +801,7 @@ public:
   }
 
   /**
-   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual_and_add
+   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual
    */
   void
   restrict_residual(VectorType &       dst,
@@ -2331,8 +2337,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         const double            target_residual) const
   {
     using Number2 = typename VectorTypeOuter::value_type;
-    matrix.vmult_scratch(sol,
-      [&](const unsigned int begin, const unsigned int end, const Number2 * matvec) {
+    matrix.vmult_scratch(
+      sol, [&](const unsigned int begin, const unsigned int end, const Number2 * matvec) {
         DEAL_II_OPENMP_SIMD_PRAGMA
         for(unsigned int i = begin; i < end; ++i)
         {
