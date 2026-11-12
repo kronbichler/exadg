@@ -554,7 +554,46 @@ public:
   void
   vmult_scratch(const VectorType & src, const AfterLoop & after_loop) const
   {
-    const bool src_has_ghosts = src.has_ghost_elements();
+    vmult_scratch(src, nullptr, after_loop);
+  }
+
+  // Variant of vmult_scratch() that also runs 'before_loop(begin, end)' on
+  // the locally owned entries of src before their first read, i.e., before
+  // the ghost exchange for the entries sent to other processes, before the
+  // first cell batch reading them, and before the result of the entries is
+  // passed to 'after_loop' or set from src for the constrained entries. Each
+  // entry passes through 'before_loop' exactly once. On processes with
+  // fewer locally owned entries than set by set_min_size_for_pre_list(),
+  // 'before_loop' runs on all entries before the loop.
+  template<typename BeforeLoop, typename AfterLoop>
+  void
+  vmult_scratch(const VectorType & src,
+                const BeforeLoop & before_loop,
+                const AfterLoop &  after_loop) const
+  {
+    constexpr bool              has_before_loop = !std::is_same_v<BeforeLoop, std::nullptr_t>;
+    const bool                  src_has_ghosts  = src.has_ghost_elements();
+    const unsigned int          n_cell_batches  = matrix_free.n_cell_batches();
+    const bool                  use_pre_list    = !cell_loop_pre_list_index.empty();
+    [[maybe_unused]] const auto run_pre_list    = [&](const unsigned int index) {
+      if constexpr(has_before_loop)
+        for(unsigned int range = cell_loop_pre_list_index[index];
+            range < cell_loop_pre_list_index[index + 1];
+            ++range)
+          before_loop(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
+    };
+    if constexpr(has_before_loop)
+    {
+      // the ghost values of src on other processes would not see the
+      // changes by 'before_loop'
+      AssertThrow(!src_has_ghosts,
+                  ExcMessage("The source vector must not have ghost values with before_loop"));
+      if(use_pre_list)
+        run_pre_list(n_cell_batches);
+      else
+        before_loop(0, src.locally_owned_size());
+    }
+
     if(!src_has_ghosts)
       src.update_ghost_values_start();
     scratch.prepare_loop();
@@ -569,6 +608,9 @@ public:
     const unsigned int degree = matrix_free.get_shape_info().data[0].fe_degree;
     scratch.cell_loop(
       [&](const unsigned int cell, Number * scratch_array) {
+        if constexpr(has_before_loop)
+          if(use_pre_list)
+            run_pre_list(cell);
         typename ExaDG::ScratchMatrixVectorProduct<Number>::View dst{scratch_array};
         if(degree == 1)
           apply_cell_operation<1>(cell, src, scratch_dof_indices, dst);
@@ -601,6 +643,18 @@ public:
           src.zero_out_ghost_values();
       },
       copy_constrained);
+  }
+
+  // Set the minimal number of locally owned entries for which the variant
+  // of vmult_scratch() with 'before_loop' runs it within the cell loop,
+  // close to the first read of the entries. Below, the overhead of the
+  // lists would not pay off, as the vectors stay in cache anyway.
+  void
+  set_min_size_for_pre_list(const unsigned int min_size)
+  {
+    min_size_for_pre_list = min_size;
+    if(dof_handler != nullptr)
+      setup_pre_list();
   }
 
   types::global_dof_index
@@ -688,6 +742,59 @@ public:
         src, compressed_dof_indices, all_indices_unconstrained, cell, {}, true, dof_values);
 
     apply_hanging_node_constraints<degree>(cell, false, dof_values);
+  }
+
+  // Apply the operator on the given cell batch and return the result in the
+  // nodal basis at all (degree+1)^dim nodes of the cell, without the
+  // transpose of the hanging-node interpolation and without summation into a
+  // global vector. The values of src are read including the hanging-node
+  // interpolation and constraints, so src must have its ghost values
+  // updated. This is the cell contribution to a residual that gets
+  // restricted cell by cell, see the transfer classes of the Poisson
+  // multigrid.
+  template<int degree>
+  void
+  compute_cell_operation_nodal(const unsigned int        cell,
+                               const VectorType &        src,
+                               VectorizedArray<Number> * values) const
+  {
+    if(degree <= 2 || (!batch_has_hanging_nodes.empty() && batch_has_hanging_nodes[cell]))
+    {
+      read_dof_values<degree>(cell, src, values);
+      apply_cell_operation_local<degree>(cell, values);
+    }
+    else if constexpr(degree > 2)
+      compute_cell_operation_nodal_fast<degree>(cell, src, values);
+  }
+
+  // Part of compute_cell_operation_nodal() for cells without hanging nodes
+  // and degree > 2
+  template<int degree>
+  void
+  compute_cell_operation_nodal_fast(const unsigned int        cell,
+                                    const VectorType &        src,
+                                    VectorizedArray<Number> * values) const
+  {
+    // fast path: interleave the first step of sum factorization with the
+    // read operation
+    const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data =
+      matrix_free.get_shape_info().data[0];
+    read_dof_values_compressed<degree, degree + 1, 1>(src,
+                                                      compressed_dof_indices,
+                                                      all_indices_unconstrained,
+                                                      cell,
+                                                      shape_data.shape_values_eo,
+                                                      false,
+                                                      values);
+    AssertThrow(factor_laplace != 0, ExcNotImplemented());
+    compute_cell_lapl<degree + 1>(
+      shape_data, mapping_info, cell, factor_mass, factor_laplace, values, values);
+    dealii::internal::FEEvaluationImplBasisChange<
+      dealii::internal::evaluate_evenodd,
+      dealii::internal::EvaluatorQuantity::value,
+      dim,
+      degree + 1,
+      degree + 1>::do_backward(1, shape_data.shape_values_eo, false, values, values);
   }
 
   const std::vector<unsigned int> &
@@ -861,6 +968,89 @@ private:
     for(unsigned int & idx : scratch_dof_indices)
       idx = scratch.scratch_index(idx);
     scratch.release_setup_data();
+    setup_pre_list();
+  }
+
+  // Set up the ranges of locally owned entries for 'before_loop' in
+  // vmult_scratch(), in units of 'pre_list_chunk_size' entries: the
+  // entries sent to other processes are processed before the ghost
+  // exchange (index n_cell_batches), all others before the first cell batch
+  // reading them or the cell batch after which their result is passed on
+  // (for the constrained entries, which no cell reads).
+  //
+  // This follows DoFInfo::compute_vector_zero_access_pattern() in deal.II,
+  // but the pre list of MatrixFree cannot be used here: it puts the entries
+  // not read by any cell at the last partition, as the cell loop of
+  // MatrixFree sets the constrained entries only at the end, whereas the
+  // scratch loop sets them when finalizing their chunk, which can be much
+  // earlier. Furthermore, the partitions of MatrixFree span several cell
+  // batches, so the lists here are closer to the first read.
+  void
+  setup_pre_list()
+  {
+    cell_loop_pre_list_index.clear();
+    cell_loop_pre_list.clear();
+    const std::shared_ptr<const Utilities::MPI::Partitioner> & partitioner =
+      matrix_free.get_dof_info().vector_partitioner;
+    const unsigned int n_owned = partitioner->locally_owned_size();
+    if(n_owned < min_size_for_pre_list)
+      return;
+
+    const unsigned int        fe_degree        = dof_handler->get_fe().degree;
+    const unsigned int        n_stored_per_dir = fe_degree == 1 ? 2 : 3;
+    const unsigned int        n_stored         = Utilities::pow(n_stored_per_dir, dim);
+    std::vector<unsigned int> entity_length(n_stored, 1);
+    if(fe_degree > 1)
+      for(unsigned int i = 0; i < n_stored; ++i)
+        for(unsigned int d = 0, j = i; d < dim; ++d, j /= 3)
+          if(j % 3 == 1)
+            entity_length[i] *= fe_degree - 1;
+
+    constexpr unsigned int    chunk_size     = pre_list_chunk_size;
+    const unsigned int        n_cell_batches = matrix_free.n_cell_batches();
+    std::vector<unsigned int> first_touch((n_owned + chunk_size - 1) / chunk_size,
+                                          numbers::invalid_unsigned_int);
+    const auto                touch =
+      [&](const unsigned int cell, const unsigned int begin, const unsigned int end) {
+        for(unsigned int j = begin / chunk_size; j <= (end - 1) / chunk_size; ++j)
+          first_touch[j] = std::min(first_touch[j], cell);
+      };
+
+    // reads by the cells, which coincide with the entities they write
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+      for(unsigned int i = 0; i < n_stored; ++i)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+        {
+          const unsigned int idx = compressed_dof_indices[(cell * n_stored + i) * n_lanes + v];
+          if(idx < n_owned)
+            touch(cell, idx, idx + entity_length[i]);
+        }
+
+    // results passed on in the cell loop, including the constrained entries
+    scratch.for_each_range_finished_in_cell_loop(
+      [&](const unsigned int cell, const unsigned int begin, const unsigned int end) {
+        if(end > begin)
+          touch(cell, begin, end);
+      });
+
+    // entries sent to other processes, and those only passed on after the
+    // cell loop without being read by a cell
+    for(const auto & [begin, end] : partitioner->import_indices())
+      for(unsigned int j = begin / chunk_size; end > begin && j <= (end - 1) / chunk_size; ++j)
+        first_touch[j] = n_cell_batches;
+    for(unsigned int & cell : first_touch)
+      if(cell == numbers::invalid_unsigned_int)
+        cell = n_cell_batches;
+
+    std::map<unsigned int, std::vector<unsigned int>> chunks_by_cell;
+    for(unsigned int j = 0; j < first_touch.size(); ++j)
+      chunks_by_cell[first_touch[j]].push_back(j);
+    Helper::convert_map_to_range_list(n_cell_batches + 1,
+                                      chunk_size,
+                                      chunks_by_cell,
+                                      cell_loop_pre_list_index,
+                                      cell_loop_pre_list,
+                                      n_owned);
   }
 
   void
@@ -1833,6 +2023,15 @@ private:
   ExaDG::ScratchMatrixVectorProduct<Number> scratch;
   std::vector<unsigned int>                 scratch_dof_indices;
 
+  // ranges of entries for 'before_loop' in vmult_scratch() by cell batch,
+  // with the entries before the ghost exchange at index n_cell_batches,
+  // empty if the process has fewer than 'min_size_for_pre_list' locally
+  // owned entries, see setup_pre_list()
+  static constexpr unsigned int                      pre_list_chunk_size   = 64;
+  unsigned int                                       min_size_for_pre_list = 100000;
+  std::vector<unsigned int>                          cell_loop_pre_list_index;
+  std::vector<std::pair<unsigned int, unsigned int>> cell_loop_pre_list;
+
   std::vector<dealii::ndarray<unsigned int, n_lanes, 2>> cell_level_index;
 
   Extruded::MappingInfo<dim, Number> mapping_info;
@@ -2299,11 +2498,44 @@ public:
   void
   vmult_scratch(const VectorType & src, const AfterLoop & after_loop) const
   {
+    vmult_scratch(src, nullptr, after_loop);
+  }
+
+  // Variant of vmult_scratch() that also runs 'before_loop(begin, end)' on
+  // the locally owned entries of src, like vmult(), before their first read
+  // in the cell integrals or the data sent to other processes. Each entry
+  // passes through 'before_loop' exactly once.
+  template<typename BeforeLoop, typename AfterLoop>
+  void
+  vmult_scratch(const VectorType & src,
+                const BeforeLoop & before_loop,
+                const AfterLoop &  after_loop) const
+  {
     Timer total_timer;
     if(factor_laplace != 0.)
       timings[0] += 1;
     else
       timings[10] += 1;
+
+    constexpr bool     has_before_loop = !std::is_same_v<BeforeLoop, std::nullptr_t>;
+    const unsigned int n_cell_batches  = dof_indices.size();
+    const auto &       pre_list_index =
+      factor_laplace != 0. ? cell_loop_pre_list_index : cell_loop_mass_pre_list_index;
+    const auto & pre_list = factor_laplace != 0. ? cell_loop_pre_list : cell_loop_mass_pre_list;
+    const auto run_pre_list = [&](const unsigned int index) {
+      if constexpr(has_before_loop)
+        for(unsigned int range = pre_list_index[index]; range < pre_list_index[index + 1]; ++range)
+          before_loop(pre_list[range].first, pre_list[range].second);
+    };
+
+    // entries of the cells whose face data is sent to other processes
+    if constexpr(has_before_loop)
+      if(factor_laplace != 0.)
+      {
+        Timer time;
+        run_pre_list(n_cell_batches);
+        timings[4] += time.wall_time();
+      }
 
     scratch.prepare_loop();
     exchange_face_data(src);
@@ -2311,6 +2543,7 @@ public:
     Timer time;
     scratch.cell_loop(
       [&](const unsigned int cell, Number * scratch_array) {
+        run_pre_list(cell);
         dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
       },
       after_loop);
