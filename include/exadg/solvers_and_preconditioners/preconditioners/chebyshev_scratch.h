@@ -135,7 +135,7 @@ store_float_as_bf16(const Number a, std::uint16_t * store_location)
 /**
  * Load data item from a std::uint16_t array (representing an FP type) into a
  * float/VectorizedArray<float> field, selected by the template argument. This
- * works by a left-shift the loaded uint-16 to the left 16 bits of a 32-bit
+ * works by a left-shift of the loaded uint-16 to the left 16 bits of a 32-bit
  * integer, which is then reinterpreted as float.
  */
 template<typename Number>
