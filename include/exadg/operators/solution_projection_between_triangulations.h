@@ -167,12 +167,12 @@ assemble_projection_rhs(VectorType &                              system_rhs,
   const dealii::Quadrature<1> & quadrature = quadrature_dim.get_tensor_basis()[0];
 
   dealii::FEEvaluation<dim, -1, 0, n_components, Number, dealii::VectorizedArray<Number, 1>>
-    fe_values_source(source_and_target_mapping, source_fe, quadrature, dealii::update_values);
-  dealii::FEEvaluation<dim, -1, 0, n_components, Number, dealii::VectorizedArray<Number, 1>>
     fe_values_target(source_and_target_mapping,
                      target_fe,
                      quadrature,
                      dealii::update_values | dealii::update_JxW_values);
+  dealii::FEEvaluation<dim, -1, 0, n_components, Number, dealii::VectorizedArray<Number, 1>>
+    fe_values_source(source_fe, fe_values_target);
 
   dealii::Vector<Number>                       cell_rhs(target_fe.dofs_per_cell);
   std::vector<dealii::types::global_dof_index> dof_indices(target_fe.dofs_per_cell);
