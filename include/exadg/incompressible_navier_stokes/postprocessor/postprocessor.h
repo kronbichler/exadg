@@ -80,6 +80,11 @@ public:
   void
   setup(Operator const & pde_operator) override;
 
+  // true if an active tool or derived output field uses the dealii::MatrixFree object of the
+  // operator
+  bool
+  requires_matrix_free() const override;
+
   // true if any of the tools evaluated in do_postprocessing() reads the
   // velocity in this time step, without changing the time controls
   bool

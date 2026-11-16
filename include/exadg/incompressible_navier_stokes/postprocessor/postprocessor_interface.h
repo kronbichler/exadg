@@ -51,6 +51,19 @@ public:
    * themselves, in addition to the tools of a base class, must take this
    * into account when overriding the function.
    */
+  /*
+   * Return whether the postprocessing needs a dealii::MatrixFree object of the spatial operator,
+   * see SpatialOperatorBase::set_matrix_free_needed_for_postprocessing(). This is evaluated before
+   * the setup of the operator and the postprocessor. The default returns true. Derived classes
+   * that use dealii::MatrixFree themselves, in addition to the tools of a base class, must take
+   * this into account when overriding the function.
+   */
+  virtual bool
+  requires_matrix_free() const
+  {
+    return true;
+  }
+
   virtual bool
   needs_velocity_vector(double const /*          time */,
                         types::time_step const /*time_step_number*/) const

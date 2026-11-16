@@ -59,6 +59,7 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::TimeIntBDFDualSplittingExtruded(
     iterations_viscous({0, {0, 0}}),
     iterations_penalty({0, 0}),
     iterations_mass({0, 0}),
+    factor_cfl(-1.0),
     extra_pressure_nbc(this->param.order_extrapolation_pressure_nbc,
                        this->param.start_with_low_order)
 {
@@ -79,6 +80,113 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::update_time_integrator_constants()
   // use this function to check the correctness of the time integrator constants
   //    std::cout << "Coefficients extrapolation scheme pressure NBC:" << std::endl;
   //    extra_pressure_nbc.print(this->pcout);
+}
+
+// Same as in TimeIntBDFConsistentSplittingExtruded: the time step size from the CFL factor of
+// the Raviart-Thomas convective operator, without the dealii::MatrixFree operators
+template<int dim, typename Number>
+double
+TimeIntBDFDualSplittingExtruded<dim, Number>::calculate_time_step_size()
+{
+  double time_step = 1.0;
+
+  if(this->param.calculation_of_time_step_size == TimeStepCalculation::UserSpecified)
+  {
+    time_step = calculate_const_time_step(this->param.time_step_size, this->refine_steps_time);
+
+    this->pcout << std::endl << "User specified time step size:" << std::endl << std::endl;
+    print_parameter(this->pcout, "time step size", time_step);
+  }
+  else if(this->param.calculation_of_time_step_size == TimeStepCalculation::CFL)
+  {
+    double time_step_global = this->operator_base->calculate_time_step_cfl_global();
+    time_step_global *= this->cfl;
+
+    this->pcout << std::endl
+                << "Calculation of time step size according to CFL condition:" << std::endl
+                << std::endl;
+    print_parameter(this->pcout, "CFL", this->cfl);
+    print_parameter(this->pcout, "Time step size (global)", time_step_global);
+
+    if(this->adaptive_time_stepping == true)
+    {
+      // if u(x,t=0)=0, this time step size will tend to infinity
+      // Note that in the ALE case there is no possibility to know the grid velocity at this point
+      // and to use it for the calculation of the time step size.
+      AssertThrow(factor_cfl > 0, dealii::ExcNotInitialized());
+      double time_step_adap = dealii::Utilities::truncate_to_n_digits(
+        1.0 / (std::pow(this->param.degree_u, this->param.cfl_exponent_fe_degree_velocity) *
+               factor_cfl),
+        4);
+      time_step_adap *= this->cfl;
+
+      // use adaptive time step size only if it is smaller, otherwise use temporary time step size
+      time_step = std::min(time_step_adap, time_step_global);
+
+      // make sure that the maximum allowable time step size is not exceeded
+      time_step = std::min(time_step, this->param.time_step_size_max);
+
+      print_parameter(this->pcout, "Time step size (adaptive)", time_step);
+    }
+    else
+    {
+      time_step = adjust_time_step_to_hit_end_time(this->param.start_time,
+                                                   this->param.end_time,
+                                                   time_step_global);
+
+      this->pcout << std::endl
+                  << "Adjust time step size to hit end time:" << std::endl
+                  << std::endl;
+      print_parameter(this->pcout, "Time step size", time_step);
+    }
+  }
+  else
+  {
+    AssertThrow(false,
+                dealii::ExcMessage("Specified type of time step calculation is not implemented."));
+  }
+
+  return time_step;
+}
+
+
+
+template<int dim, typename Number>
+double
+TimeIntBDFDualSplittingExtruded<dim, Number>::recalculate_time_step_size() const
+{
+  AssertThrow(this->param.calculation_of_time_step_size == TimeStepCalculation::CFL,
+              dealii::ExcMessage(
+                "Adaptive time step is not implemented for this type of time step calculation."));
+
+  double new_time_step_size;
+  if(this->param.ale_formulation == true)
+  {
+    AssertThrow(false, dealii::ExcNotImplemented());
+  }
+  else
+  {
+    AssertThrow(factor_cfl > 0, dealii::ExcNotInitialized());
+    new_time_step_size = dealii::Utilities::truncate_to_n_digits(
+      1.0 /
+        (std::pow(this->param.degree_u, this->param.cfl_exponent_fe_degree_velocity) * factor_cfl),
+      4);
+  }
+
+  new_time_step_size *= this->cfl;
+
+  // make sure that time step size does not exceed maximum allowable time step size
+  new_time_step_size = std::min(new_time_step_size, this->param.time_step_size_max);
+
+  bool use_limiter = true;
+  if(use_limiter)
+  {
+    double last_time_step_size = this->get_time_step_size();
+    double factor              = this->param.adaptive_time_stepping_limiting_factor;
+    limit_time_step_change(new_time_step_size, last_time_step_size, factor);
+  }
+
+  return new_time_step_size;
 }
 
 template<int dim, typename Number>
@@ -191,8 +299,7 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::allocate_vectors()
                      cell_vectorization_category,
                      dealii::QGauss<1>(pde_operator->get_dof_handler_p().get_fe().degree + 1),
                      this->is_test);
-  laplace_op->set_penalty_parameters(
-    pde_operator->laplace_operator.get_data().kernel_data.IP_factor);
+  laplace_op->set_penalty_parameters(this->param.IP_factor_pressure);
 
   op_rt->verify_other_cell_level_index(laplace_op->get_cell_level_index());
   op_rt->initialize_coupling_pressure(pde_operator->get_dof_handler_p().get_fe(),
@@ -203,7 +310,7 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::allocate_vectors()
     pde_operator->get_dof_handler_p(),
     cell_vectorization_category,
     pde_operator->get_grid().mapping_function,
-    pde_operator->laplace_operator.get_data().kernel_data.IP_factor,
+    this->param.IP_factor_pressure,
     this->is_test);
 
   for(unsigned int i = 0; i < pressure.size(); ++i)
@@ -223,6 +330,9 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::initialize_current_solution()
 
   pde_operator->prescribe_initial_conditions(velocity_np, pressure_np, this->get_time());
   op_rt->copy_mf_to_this_vector(velocity_np, velocity[0]);
+
+  // CFL factor for the time step size of the initial solution, see calculate_time_step_size()
+  factor_cfl = op_rt->evaluate_convective_term(velocity[0], 1.0, this->vec_convective_term[0]);
 }
 
 template<int dim, typename Number>
@@ -332,6 +442,9 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::convective_step()
   {
     if(this->param.ale_formulation)
     {
+      // this uses the dealii::MatrixFree operators, which the operator does not set up for this
+      // time integrator, see OperatorDualSplitting::uses_matrix_free_operators()
+      AssertThrow(false, dealii::ExcNotImplemented());
       for(unsigned int i = 0; i < this->vec_convective_term.size(); ++i)
       {
         // in a general setting, we only know the boundary conditions at time t_{n+1}
@@ -418,7 +531,7 @@ TimeIntBDFDualSplittingExtruded<dim, Number>::evaluate_convective_term()
   {
     if(this->param.ale_formulation == false) // Eulerian case
     {
-      op_rt->evaluate_convective_term(solution_rt, 0.5, this->convective_term_np);
+      factor_cfl = op_rt->evaluate_convective_term(solution_rt, 0.5, this->convective_term_np);
 
       swap_back_one_step(pressure_nbc_rhs);
       op_rt->evaluate_pressure_neumann_from_velocity(

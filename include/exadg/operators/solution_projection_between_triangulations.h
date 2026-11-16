@@ -24,13 +24,16 @@
 
 // C/C++
 #include <algorithm>
+#include <functional>
 
 // deal.II
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/mpi_remote_point_evaluation.h>
 #include <deal.II/base/timer.h>
+#include <deal.II/fe/fe_values.h>
 #include <deal.II/matrix_free/fe_point_evaluation.h>
 #include <deal.II/matrix_free/matrix_free.h>
+#include <deal.II/matrix_free/operators.h>
 #include <deal.II/numerics/vector_tools.h>
 
 // ExaDG
@@ -567,6 +570,285 @@ grid_to_grid_projection(
                                                       target_matrix_free,
                                                       target_vectors_per_dof_handler,
                                                       data);
+}
+
+/**
+ * Variants of the projection without a `dealii::MatrixFree` object for the target space. The
+ * integrals are computed cell by cell with `dealii::FEValues` (or the `dealii::FEEvaluation`
+ * variant based on it), and the mass matrix is inverted either by a solver function provided by the
+ * caller, or, for discontinuous target spaces, cell by cell.
+ */
+template<int dim, typename Number>
+struct ProjectionTargetSpace
+{
+  dealii::DoFHandler<dim> const *           dof_handler = nullptr;
+  dealii::AffineConstraints<Number> const * constraints = nullptr;
+  // quadrature for the integrals of the right-hand side
+  std::shared_ptr<dealii::Quadrature<dim> const> quadrature;
+  // Solver for the global mass matrix M sol = rhs with vectors in the layout of the target
+  // vectors. If empty, the target space must be discontinuous and the mass matrix is inverted
+  // cell by cell.
+  std::function<void(dealii::LinearAlgebra::distributed::Vector<Number> &       sol,
+                     dealii::LinearAlgebra::distributed::Vector<Number> const & rhs)>
+    mass_solver;
+};
+
+/**
+ * Collect the integration points of the target space in the sequence of the locally owned cells
+ * of the `dealii::DoFHandler`.
+ */
+template<int dim>
+std::vector<dealii::Point<dim>>
+collect_integration_points(dealii::Mapping<dim> const &    mapping,
+                           dealii::DoFHandler<dim> const & dof_handler,
+                           dealii::Quadrature<dim> const & quadrature)
+{
+  dealii::FEValues<dim> fe_values(mapping,
+                                  dof_handler.get_fe(),
+                                  quadrature,
+                                  dealii::update_quadrature_points);
+
+  std::vector<dealii::Point<dim>> integration_points;
+  integration_points.reserve(dof_handler.get_triangulation().n_active_cells() * quadrature.size());
+  for(auto const & cell : dof_handler.active_cell_iterators())
+    if(cell->is_locally_owned())
+    {
+      fe_values.reinit(cell);
+      for(unsigned int const q : fe_values.quadrature_point_indices())
+        integration_points.push_back(fe_values.quadrature_point(q));
+    }
+
+  return integration_points;
+}
+
+/**
+ * Right-hand side of the projection with values given in the integration points of
+ * collect_integration_points() above, in the same sequence. The integration uses the
+ * `dealii::FEEvaluation` variant based on `dealii::FEValues` with sum factorization, whose
+ * lexicographic numbering of quadrature points coincides with the one of the tensor-product
+ * quadrature used by collect_integration_points().
+ */
+template<int dim, int n_components, typename Number, typename VectorType>
+void
+assemble_projection_rhs(
+  VectorType &                               system_rhs,
+  dealii::Mapping<dim> const &               mapping,
+  ProjectionTargetSpace<dim, Number> const & target,
+  std::vector<
+    typename dealii::FEPointEvaluation<n_components, dim, dim, Number>::value_type> const &
+    values_source_in_q_points_target)
+{
+  dealii::FiniteElement<dim> const & fe = target.dof_handler->get_fe();
+  AssertThrow(target.quadrature->is_tensor_product(),
+              dealii::ExcMessage("Expected a tensor-product quadrature."));
+  dealii::FEEvaluation<dim, -1, 0, n_components, Number, dealii::VectorizedArray<Number, 1>>
+    fe_eval(mapping,
+            fe,
+            target.quadrature->get_tensor_basis()[0],
+            dealii::update_values | dealii::update_JxW_values);
+  AssertDimension(fe_eval.n_q_points, target.quadrature->size());
+
+  dealii::Vector<Number>                       cell_rhs(fe.dofs_per_cell);
+  std::vector<dealii::types::global_dof_index> dof_indices(fe.dofs_per_cell);
+
+  unsigned int idx_q_point = 0;
+  for(auto const & cell : target.dof_handler->active_cell_iterators())
+    if(cell->is_locally_owned())
+    {
+      fe_eval.reinit(cell);
+      for(unsigned int const q : fe_eval.quadrature_point_indices())
+      {
+        auto const & value = values_source_in_q_points_target[idx_q_point++];
+        if constexpr(n_components == 1)
+          fe_eval.submit_value(value, q);
+        else
+        {
+          dealii::Tensor<1, n_components, dealii::VectorizedArray<Number, 1>> tmp;
+          for(unsigned int c = 0; c < n_components; ++c)
+            tmp[c] = value[c];
+          fe_eval.submit_value(tmp, q);
+        }
+      }
+      fe_eval.integrate(dealii::EvaluationFlags::values);
+      for(unsigned int i = 0; i < cell_rhs.size(); ++i)
+        cell_rhs(fe_eval.get_internal_dof_numbering()[i]) = fe_eval.begin_dof_values()[i][0];
+      cell->get_dof_indices(dof_indices);
+      target.constraints->distribute_local_to_global(cell_rhs, dof_indices, system_rhs);
+    }
+  AssertDimension(idx_q_point, values_source_in_q_points_target.size());
+  system_rhs.compress(dealii::VectorOperation::add);
+}
+
+/**
+ * Solve with the mass matrix of a discontinuous space cell by cell, using the tensor product
+ * structure of the shape functions with `dealii::MatrixFreeOperators::CellwiseInverseMassMatrix`
+ * and integration with fe_degree+1 Gauss points per direction.
+ */
+template<int dim, int n_components, typename Number, typename VectorType>
+void
+apply_cellwise_inverse_mass(VectorType &                    sol,
+                            VectorType const &              rhs,
+                            dealii::Mapping<dim> const &    mapping,
+                            dealii::DoFHandler<dim> const & dof_handler)
+{
+  dealii::FiniteElement<dim> const & fe = dof_handler.get_fe();
+  AssertThrow(fe.n_dofs_per_vertex() == 0 and fe.n_dofs_per_face() == 0,
+              dealii::ExcMessage("The cell-wise inverse of the mass matrix needs a "
+                                 "discontinuous finite element."));
+
+  using VectorizedArrayType = dealii::VectorizedArray<Number, 1>;
+  dealii::FEEvaluation<dim, -1, 0, n_components, Number, VectorizedArrayType> fe_eval(
+    mapping,
+    fe,
+    dealii::QGauss<1>(fe.degree + 1),
+    dealii::update_values | dealii::update_JxW_values);
+  dealii::MatrixFreeOperators::
+    CellwiseInverseMassMatrix<dim, -1, n_components, Number, VectorizedArrayType>
+      inverse_mass(fe_eval);
+
+  std::vector<dealii::types::global_dof_index> dof_indices(fe.dofs_per_cell);
+  dealii::AlignedVector<VectorizedArrayType>   cell_values(fe.dofs_per_cell);
+  for(auto const & cell : dof_handler.active_cell_iterators())
+    if(cell->is_locally_owned())
+    {
+      fe_eval.reinit(cell);
+      cell->get_dof_indices(dof_indices);
+      auto const & numbering = fe_eval.get_internal_dof_numbering();
+      for(unsigned int i = 0; i < fe.dofs_per_cell; ++i)
+        cell_values[i] = rhs(dof_indices[numbering[i]]);
+      inverse_mass.apply(cell_values.data(), cell_values.data());
+      for(unsigned int i = 0; i < fe.dofs_per_cell; ++i)
+        sol(dof_indices[numbering[i]]) = cell_values[i][0];
+    }
+}
+
+/**
+ * Projection of vectors of a single `dealii::DoFHandler` into a target space without
+ * `dealii::MatrixFree`, see `ProjectionTargetSpace`.
+ */
+template<int dim, typename Number, int n_components, typename VectorType>
+void
+project_vectors(std::shared_ptr<dealii::Mapping<dim> const> const & source_mapping,
+                dealii::DoFHandler<dim> const &                     source_dof_handler,
+                std::vector<VectorType *> const &                   source_vectors,
+                dealii::Mapping<dim> const &                        target_mapping,
+                ProjectionTargetSpace<dim, Number> const &          target,
+                std::vector<VectorType *> const &                   target_vectors,
+                GridToGridProjectionData<dim> const &               data)
+{
+  MPI_Comm const             mpi_comm = source_dof_handler.get_mpi_communicator();
+  dealii::ConditionalOStream pcout(std::cout,
+                                   (dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0));
+  pcout << std::scientific << std::setprecision(4);
+  dealii::Timer timer;
+
+  std::shared_ptr<dealii::Utilities::MPI::RemotePointEvaluation<dim>> rpe_source =
+    std::make_shared<dealii::Utilities::MPI::RemotePointEvaluation<dim>>(data.rpe_data);
+  if(not data.grids_and_maps_identical)
+  {
+    std::vector<dealii::Point<dim>> const integration_points_target =
+      collect_integration_points(target_mapping, *target.dof_handler, *target.quadrature);
+    rpe_source->reinit(integration_points_target,
+                       source_dof_handler.get_triangulation(),
+                       *source_mapping);
+    AssertThrow(rpe_source->all_points_found(),
+                dealii::ExcMessage("Could not interpolate source grid vector in target grid."));
+    pcout << "time: RPE reinit         " << timer.wall_time() << " s\n";
+  }
+
+  double time_rhs = 0., time_solve = 0.;
+  for(unsigned int i = 0; i < target_vectors.size(); ++i)
+  {
+    VectorType const & source_vector = *source_vectors.at(i);
+    source_vector.update_ghost_values();
+
+    timer.restart();
+    VectorType system_rhs;
+    system_rhs.reinit(*target_vectors[i]);
+    if(data.grids_and_maps_identical)
+      assemble_projection_rhs<dim, n_components, Number, VectorType>(system_rhs,
+                                                                     source_vector,
+                                                                     source_dof_handler,
+                                                                     target_mapping,
+                                                                     *target.dof_handler,
+                                                                     *target.constraints,
+                                                                     *target.quadrature);
+    else
+      assemble_projection_rhs<dim, n_components, Number, VectorType>(
+        system_rhs,
+        target_mapping,
+        target,
+        dealii::VectorTools::point_values<n_components>(*rpe_source,
+                                                        source_dof_handler,
+                                                        source_vector,
+                                                        dealii::VectorTools::EvaluationFlags::avg));
+    time_rhs += timer.wall_time();
+
+    timer.restart();
+    VectorType sol;
+    sol.reinit(*target_vectors[i]);
+    if(target.mass_solver)
+      target.mass_solver(sol, system_rhs);
+    else
+      apply_cellwise_inverse_mass<dim, n_components, Number, VectorType>(sol,
+                                                                         system_rhs,
+                                                                         target_mapping,
+                                                                         *target.dof_handler);
+    time_solve += timer.wall_time();
+
+    *target_vectors[i] = sol;
+  }
+
+  pcout << "time: projection rhs     " << time_rhs << " s\n";
+  pcout << "time: mass solve         " << time_solve << " s\n";
+}
+
+/**
+ * Same as `do_grid_to_grid_projection()`, but without `dealii::MatrixFree` object for the target
+ * spaces, see `ProjectionTargetSpace`.
+ */
+template<int dim, typename Number, typename VectorType>
+void
+do_grid_to_grid_projection(
+  std::shared_ptr<dealii::Mapping<dim> const> const &     source_mapping,
+  std::vector<dealii::DoFHandler<dim> const *> const &    source_dof_handlers,
+  std::vector<std::vector<VectorType *>> const &          source_vectors_per_dof_handler,
+  dealii::Mapping<dim> const &                            target_mapping,
+  std::vector<ProjectionTargetSpace<dim, Number>> const & targets,
+  std::vector<std::vector<VectorType *>> &                target_vectors_per_dof_handler,
+  GridToGridProjectionData<dim> const &                   data)
+{
+  AssertThrow(source_vectors_per_dof_handler.size() == source_dof_handlers.size() and
+                target_vectors_per_dof_handler.size() == targets.size() and
+                source_dof_handlers.size() == targets.size(),
+              dealii::ExcMessage("Sizes of source and target vectors and spaces must match."));
+
+  for(unsigned int i = 0; i < targets.size(); ++i)
+  {
+    AssertThrow(source_vectors_per_dof_handler[i].size() ==
+                  target_vectors_per_dof_handler[i].size(),
+                dealii::ExcMessage("Vectors of source and target vectors need to have same size."));
+    unsigned int const n_components = targets[i].dof_handler->get_fe().n_components();
+    if(n_components == 1)
+      project_vectors<dim, Number, 1, VectorType>(source_mapping,
+                                                  *source_dof_handlers[i],
+                                                  source_vectors_per_dof_handler[i],
+                                                  target_mapping,
+                                                  targets[i],
+                                                  target_vectors_per_dof_handler[i],
+                                                  data);
+    else if(n_components == dim)
+      project_vectors<dim, Number, dim, VectorType>(source_mapping,
+                                                    *source_dof_handlers[i],
+                                                    source_vectors_per_dof_handler[i],
+                                                    target_mapping,
+                                                    targets[i],
+                                                    target_vectors_per_dof_handler[i],
+                                                    data);
+    else
+      AssertThrow(false,
+                  dealii::ExcMessage("Only scalar and vector-valued elements are supported."));
+  }
 }
 
 } // namespace GridToGridProjection

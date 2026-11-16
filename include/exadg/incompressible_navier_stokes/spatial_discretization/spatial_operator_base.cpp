@@ -39,6 +39,8 @@
 
 // deal.II
 #include <deal.II/dofs/dof_renumbering.h>
+#include <deal.II/dofs/dof_tools.h>
+#include <deal.II/fe/fe_values.h>
 
 namespace ExaDG
 {
@@ -67,6 +69,7 @@ SpatialOperatorBase<dim, Number>::SpatialOperatorBase(
     dof_handler_u(*grid_in->triangulation),
     dof_handler_p(*grid_in->triangulation),
     dof_handler_u_scalar(*grid_in->triangulation),
+    matrix_free_needed_for_postprocessing(true),
     pressure_level_is_undefined(false),
     mpi_comm(mpi_comm_in),
     pcout(std::cout, dealii::Utilities::MPI::this_mpi_process(mpi_comm) == 0),
@@ -543,38 +546,7 @@ SpatialOperatorBase<dim, Number>::initialize_operators(std::string const & dof_i
   mass_operator_data.quad_index = get_quad_index_velocity_standard();
   mass_operator.initialize(*matrix_free, constraint_u, mass_operator_data);
 
-  // inverse mass operator velocity
-  InverseMassOperatorData<Number> inverse_mass_operator_data_velocity;
-  inverse_mass_operator_data_velocity.dof_index  = get_dof_index_velocity();
-  inverse_mass_operator_data_velocity.quad_index = get_quad_index_velocity_standard();
-  inverse_mass_operator_data_velocity.parameters = param.inverse_mass_operator;
-  // avoid invalid settings for HDIV, preserving settings if admissible
-  if(param.spatial_discretization == SpatialDiscretization::HDIV)
-    inverse_mass_operator_data_velocity.parameters.implementation_type =
-      InverseMassType::GlobalKrylovSolver;
-  inverse_mass_velocity.initialize(*matrix_free,
-                                   inverse_mass_operator_data_velocity,
-                                   param.spatial_discretization == SpatialDiscretization::L2 ?
-                                     nullptr :
-                                     &constraint_u);
-
-  // inverse mass operator velocity scalar
-  InverseMassOperatorData<Number> inverse_mass_operator_data_velocity_scalar;
-  inverse_mass_operator_data_velocity_scalar.dof_index  = get_dof_index_velocity_scalar();
-  inverse_mass_operator_data_velocity_scalar.quad_index = get_quad_index_velocity_standard();
-  inverse_mass_operator_data_velocity_scalar.parameters = param.inverse_mass_operator;
-  // always use optimal inverse mass type for velocity scalar
-  const bool cartesian_or_affine_mapping =
-    std::all_of(matrix_free->get_mapping_info().cell_type.begin(),
-                matrix_free->get_mapping_info().cell_type.end(),
-                [](auto g) {
-                  return g <= dealii::internal::MatrixFreeFunctions::GeometryType::affine;
-                });
-  inverse_mass_operator_data_velocity_scalar.parameters.implementation_type =
-    inverse_mass_operator_data_velocity_scalar.get_optimal_inverse_mass_type(
-      matrix_free->get_dof_handler(get_dof_index_velocity_scalar()).get_fe(),
-      cartesian_or_affine_mapping);
-  inverse_mass_velocity_scalar.initialize(*matrix_free, inverse_mass_operator_data_velocity_scalar);
+  initialize_inverse_mass_operators();
 
   // body force operator
   RHSOperatorData<dim> rhs_data;
@@ -643,13 +615,7 @@ SpatialOperatorBase<dim, Number>::initialize_operators(std::string const & dof_i
                                  convective_kernel);
 
   // viscous operator
-  viscous_kernel_data.IP_factor                    = param.IP_factor_viscous;
-  viscous_kernel_data.viscosity                    = param.viscosity;
-  viscous_kernel_data.formulation_viscous_term     = param.formulation_viscous_term;
-  viscous_kernel_data.penalty_term_div_formulation = param.penalty_term_div_formulation;
-  viscous_kernel_data.IP_formulation               = param.IP_formulation_viscous;
-  viscous_kernel_data.viscosity_is_variable        = param.viscosity_is_variable();
-  viscous_kernel_data.variable_normal_vector       = param.neumann_with_variable_normal_vector;
+  fill_viscous_kernel_data();
 
   bool const use_velocity_own_storage_viscous_kernel = param.viscous_problem() and
                                                        param.viscosity_is_variable() and
@@ -805,8 +771,171 @@ SpatialOperatorBase<dim, Number>::initialize_calculators_for_derived_quantities(
 
 template<int dim, typename Number>
 void
+SpatialOperatorBase<dim, Number>::fill_viscous_kernel_data()
+{
+  viscous_kernel_data.IP_factor                    = param.IP_factor_viscous;
+  viscous_kernel_data.viscosity                    = param.viscosity;
+  viscous_kernel_data.formulation_viscous_term     = param.formulation_viscous_term;
+  viscous_kernel_data.penalty_term_div_formulation = param.penalty_term_div_formulation;
+  viscous_kernel_data.IP_formulation               = param.IP_formulation_viscous;
+  viscous_kernel_data.viscosity_is_variable        = param.viscosity_is_variable();
+  viscous_kernel_data.variable_normal_vector       = param.neumann_with_variable_normal_vector;
+}
+
+template<int dim, typename Number>
+void
+SpatialOperatorBase<dim, Number>::initialize_inverse_mass_operators()
+{
+  // inverse mass operator velocity
+  InverseMassOperatorData<Number> inverse_mass_operator_data_velocity;
+  inverse_mass_operator_data_velocity.dof_index  = get_dof_index_velocity();
+  inverse_mass_operator_data_velocity.quad_index = get_quad_index_velocity_standard();
+  inverse_mass_operator_data_velocity.parameters = param.inverse_mass_operator;
+  // avoid invalid settings for HDIV, preserving settings if admissible
+  if(param.spatial_discretization == SpatialDiscretization::HDIV)
+    inverse_mass_operator_data_velocity.parameters.implementation_type =
+      InverseMassType::GlobalKrylovSolver;
+  inverse_mass_velocity.initialize(*matrix_free,
+                                   inverse_mass_operator_data_velocity,
+                                   param.spatial_discretization == SpatialDiscretization::L2 ?
+                                     nullptr :
+                                     &constraint_u);
+
+  // inverse mass operator velocity scalar
+  InverseMassOperatorData<Number> inverse_mass_operator_data_velocity_scalar;
+  inverse_mass_operator_data_velocity_scalar.dof_index  = get_dof_index_velocity_scalar();
+  inverse_mass_operator_data_velocity_scalar.quad_index = get_quad_index_velocity_standard();
+  inverse_mass_operator_data_velocity_scalar.parameters = param.inverse_mass_operator;
+  // always use optimal inverse mass type for velocity scalar
+  const bool cartesian_or_affine_mapping =
+    std::all_of(matrix_free->get_mapping_info().cell_type.begin(),
+                matrix_free->get_mapping_info().cell_type.end(),
+                [](auto g) {
+                  return g <= dealii::internal::MatrixFreeFunctions::GeometryType::affine;
+                });
+  inverse_mass_operator_data_velocity_scalar.parameters.implementation_type =
+    inverse_mass_operator_data_velocity_scalar.get_optimal_inverse_mass_type(
+      matrix_free->get_dof_handler(get_dof_index_velocity_scalar()).get_fe(),
+      cartesian_or_affine_mapping);
+  inverse_mass_velocity_scalar.initialize(*matrix_free, inverse_mass_operator_data_velocity_scalar);
+}
+
+template<int dim, typename Number>
+void
+SpatialOperatorBase<dim, Number>::fill_matrix_free_data_postprocessing(
+  MatrixFreeData<dim, Number> & matrix_free_data) const
+{
+  // values and gradients in cells and on faces, as needed by the calculators of derived
+  // quantities, the inverse mass operators, and the postprocessing tools
+  matrix_free_data.append_mapping_flags(MassKernel<dim, Number>::get_mapping_flags());
+  matrix_free_data.append_mapping_flags(
+    Operators::ViscousKernel<dim, Number>::get_mapping_flags(true, true));
+  MappingFlags flags_points;
+  flags_points.cells = dealii::update_quadrature_points;
+  matrix_free_data.append_mapping_flags(flags_points);
+
+  matrix_free_data.insert_dof_handler(&dof_handler_u, field + dof_index_u);
+  matrix_free_data.insert_dof_handler(&dof_handler_p, field + dof_index_p);
+  matrix_free_data.insert_dof_handler(&dof_handler_u_scalar, field + dof_index_u_scalar);
+
+  matrix_free_data.insert_constraint(&constraint_u, field + dof_index_u);
+  matrix_free_data.insert_constraint(&constraint_p, field + dof_index_p);
+  matrix_free_data.insert_constraint(&constraint_u_scalar, field + dof_index_u_scalar);
+
+  // only the standard quadrature of the velocity
+  std::shared_ptr<dealii::Quadrature<dim>> quadrature_u =
+    create_quadrature<dim>(param.grid.element_type, param.degree_u + 1);
+  matrix_free_data.insert_quadrature(*quadrature_u, field + quad_index_u);
+}
+
+template<int dim, typename Number>
+void
+SpatialOperatorBase<dim, Number>::setup_without_matrix_free_operators()
+{
+  pcout << std::endl
+        << "Setup incompressible Navier-Stokes operator without dealii::MatrixFree operators ..."
+        << std::endl
+        << std::flush;
+
+  AssertThrow(not param.ale_formulation,
+              dealii::ExcMessage("The setup without dealii::MatrixFree operators does not "
+                                 "support the ALE formulation."));
+
+  fill_viscous_kernel_data();
+
+  if(matrix_free_needed_for_postprocessing)
+  {
+    std::shared_ptr<dealii::MatrixFree<dim, Number>> mf =
+      std::make_shared<dealii::MatrixFree<dim, Number>>();
+    std::shared_ptr<MatrixFreeData<dim, Number>> mf_data =
+      std::make_shared<MatrixFreeData<dim, Number>>();
+    fill_matrix_free_data_postprocessing(*mf_data);
+    mf->reinit(*get_mapping(),
+               mf_data->get_dof_handler_vector(),
+               mf_data->get_constraint_vector(),
+               mf_data->get_quadrature_vector(),
+               mf_data->data);
+    matrix_free      = mf;
+    matrix_free_data = mf_data;
+
+    initialize_inverse_mass_operators();
+
+    // the viscosity calculator refers to the viscous kernel
+    viscous_kernel = std::make_shared<Operators::ViscousKernel<dim, Number>>();
+    viscous_kernel->reinit(*matrix_free,
+                           viscous_kernel_data,
+                           get_dof_index_velocity(),
+                           get_quad_index_velocity_standard(),
+                           false /* compute_penalty_parameter */,
+                           false /* use_velocity_own_storage */);
+
+    initialize_calculators_for_derived_quantities();
+
+    pcout << "  Reduced dealii::MatrixFree object for postprocessing: "
+          << dealii::Utilities::MPI::sum(matrix_free->memory_consumption(), mpi_comm) / 1e9 << " GB"
+          << std::endl;
+  }
+  else
+  {
+    auto const create_partitioner = [&](dealii::DoFHandler<dim> const & dof_handler) {
+      return std::make_shared<dealii::Utilities::MPI::Partitioner const>(
+        dof_handler.locally_owned_dofs(),
+        dealii::DoFTools::extract_locally_relevant_dofs(dof_handler),
+        mpi_comm);
+    };
+    partitioner_u        = create_partitioner(dof_handler_u);
+    partitioner_u_scalar = create_partitioner(dof_handler_u_scalar);
+    partitioner_p        = create_partitioner(dof_handler_p);
+  }
+
+  pcout << std::endl << "... done!" << std::endl << std::flush;
+}
+
+template<int dim, typename Number>
+void
+SpatialOperatorBase<dim, Number>::set_matrix_free_needed_for_postprocessing(bool const needed)
+{
+  matrix_free_needed_for_postprocessing = needed;
+}
+
+template<int dim, typename Number>
+void
+SpatialOperatorBase<dim, Number>::set_velocity_mass_solver(
+  std::function<void(VectorType & dst, VectorType const & rhs)> const & mass_solver)
+{
+  velocity_mass_solver = mass_solver;
+}
+
+template<int dim, typename Number>
+void
 SpatialOperatorBase<dim, Number>::setup()
 {
+  if(not uses_matrix_free_operators())
+  {
+    setup_without_matrix_free_operators();
+    return;
+  }
+
   // initialize MatrixFree and MatrixFreeData
   std::shared_ptr<dealii::MatrixFree<dim, Number>> mf =
     std::make_shared<dealii::MatrixFree<dim, Number>>();
@@ -877,6 +1006,11 @@ template<int dim, typename Number>
 dealii::MatrixFree<dim, Number> const &
 SpatialOperatorBase<dim, Number>::get_matrix_free() const
 {
+  AssertThrow(matrix_free.get() != nullptr,
+              dealii::ExcMessage("No dealii::MatrixFree object available. The operators "
+                                 "without dealii::MatrixFree operators only create one if the "
+                                 "postprocessing requests it, see "
+                                 "PostProcessorInterface::requires_matrix_free()."));
   return *matrix_free;
 }
 
@@ -1054,21 +1188,39 @@ template<int dim, typename Number>
 void
 SpatialOperatorBase<dim, Number>::initialize_vector_velocity(VectorType & src) const
 {
-  matrix_free->initialize_dof_vector(src, get_dof_index_velocity());
+  if(matrix_free)
+    matrix_free->initialize_dof_vector(src, get_dof_index_velocity());
+  else
+  {
+    AssertThrow(partitioner_u.get() != nullptr, dealii::ExcNotInitialized());
+    src.reinit(partitioner_u);
+  }
 }
 
 template<int dim, typename Number>
 void
 SpatialOperatorBase<dim, Number>::initialize_vector_velocity_scalar(VectorType & src) const
 {
-  matrix_free->initialize_dof_vector(src, get_dof_index_velocity_scalar());
+  if(matrix_free)
+    matrix_free->initialize_dof_vector(src, get_dof_index_velocity_scalar());
+  else
+  {
+    AssertThrow(partitioner_u_scalar.get() != nullptr, dealii::ExcNotInitialized());
+    src.reinit(partitioner_u_scalar);
+  }
 }
 
 template<int dim, typename Number>
 void
 SpatialOperatorBase<dim, Number>::initialize_vector_pressure(VectorType & src) const
 {
-  matrix_free->initialize_dof_vector(src, get_dof_index_pressure());
+  if(matrix_free)
+    matrix_free->initialize_dof_vector(src, get_dof_index_pressure());
+  else
+  {
+    AssertThrow(partitioner_p.get() != nullptr, dealii::ExcNotInitialized());
+    src.reinit(partitioner_p);
+  }
 }
 
 template<int dim, typename Number>
@@ -1351,6 +1503,31 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
   projection_data.rpe_data.tolerance              = param.restart_data.rpe_tolerance_unit_cell;
   projection_data.rpe_data.enforce_unique_mapping = param.restart_data.rpe_enforce_unique_mapping;
 
+  // Without dealii::MatrixFree operators, the projections use dealii::FEValues, the mass solver
+  // for the velocity provided by the time integrator, and cell-wise inverse mass matrices for
+  // discontinuous spaces.
+  bool const project_without_matrix_free = not uses_matrix_free_operators();
+  if(project_without_matrix_free)
+    AssertThrow(param.spatial_discretization == SpatialDiscretization::HDIV and
+                  velocity_mass_solver,
+                dealii::ExcMessage("The restart without dealii::MatrixFree operators needs the "
+                                   "HDIV discretization and a velocity mass solver, see "
+                                   "set_velocity_mass_solver()."));
+  dealii::AffineConstraints<Number> empty_constraints;
+  empty_constraints.close();
+  auto const make_target = [&](dealii::DoFHandler<dim> const &           dof_handler,
+                               dealii::AffineConstraints<Number> const & constraints,
+                               unsigned int const                        n_q_points_1d,
+                               bool const                                use_velocity_mass_solver) {
+    GridToGridProjection::ProjectionTargetSpace<dim, Number> target;
+    target.dof_handler = &dof_handler;
+    target.constraints = &constraints;
+    target.quadrature  = create_quadrature<dim>(param.grid.element_type, n_q_points_1d);
+    if(use_velocity_mass_solver)
+      target.mass_solver = velocity_mass_solver;
+    return target;
+  };
+
   // Overwrite the velocity checkpoint `DoFHandler` and vectors in case we require an intermediate
   // step for consistency. Data structures have to stay in scope for pointers to remain valid for
   // projection and export to vtu.
@@ -1363,8 +1540,7 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
     // an intermediate step for the velocity as the mapped grid and DoFs define the field. First,
     // project the saved state in the undeformed, but potentially refined grid, using
     // `FE_DGQArbitraryNodes` to reduce projection costs if the spatial resolution is identical.
-    dealii::Triangulation<dim> const & triangulation =
-      matrix_free->get_dof_handler().get_triangulation();
+    dealii::Triangulation<dim> const & triangulation = dof_handler_u.get_triangulation();
     initialize_dof_handler_restart(param.degree_u,
                                    dim /* n_components */,
                                    dof_handler_u_restart_intermediate,
@@ -1413,14 +1589,35 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
 
       this->pcout << "\n"
                   << "PROJECTION IN UNDEFORMED GRID\n\n";
-      ExaDG::GridToGridProjection::grid_to_grid_projection<dim, Number, VectorType>(
-        checkpoint_mapping,
-        source_dof_handlers,
-        source_vectors_per_dof_handler,
-        target_mapping,
-        target_dof_handlers,
-        target_vectors_per_dof_handler,
-        projection_data);
+      if(project_without_matrix_free)
+      {
+        // both target spaces are discontinuous, use the same quadrature and (empty)
+        // constraints as grid_to_grid_projection()
+        std::vector<GridToGridProjection::ProjectionTargetSpace<dim, Number>> targets;
+        for(dealii::DoFHandler<dim> const * dof_handler : target_dof_handlers)
+          targets.push_back(
+            make_target(*dof_handler,
+                        empty_constraints,
+                        dof_handler->get_fe().degree + projection_data.additional_quadrature_points,
+                        false));
+        ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
+          checkpoint_mapping,
+          source_dof_handlers,
+          source_vectors_per_dof_handler,
+          *target_mapping,
+          targets,
+          target_vectors_per_dof_handler,
+          projection_data);
+      }
+      else
+        ExaDG::GridToGridProjection::grid_to_grid_projection<dim, Number, VectorType>(
+          checkpoint_mapping,
+          source_dof_handlers,
+          source_vectors_per_dof_handler,
+          target_mapping,
+          target_dof_handlers,
+          target_vectors_per_dof_handler,
+          projection_data);
     }
 
     // Perform the grid-to-grid projection on the deformed grid to the final velocity space,
@@ -1446,14 +1643,24 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
       std::vector<dealii::DoFHandler<dim> const *> target_dof_handlers = {
         &this->get_dof_handler_u()};
 
-      ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
-        checkpoint_mapping,
-        source_dof_handlers,
-        source_vectors_per_dof_handler,
-        target_dof_handlers,
-        *matrix_free,
-        target_vectors_per_dof_handler,
-        projection_data);
+      if(project_without_matrix_free)
+        ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
+          checkpoint_mapping,
+          source_dof_handlers,
+          source_vectors_per_dof_handler,
+          *this->get_mapping(),
+          {make_target(dof_handler_u, constraint_u, param.degree_u + 1, true)},
+          target_vectors_per_dof_handler,
+          projection_data);
+      else
+        ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
+          checkpoint_mapping,
+          source_dof_handlers,
+          source_vectors_per_dof_handler,
+          target_dof_handlers,
+          *matrix_free,
+          target_vectors_per_dof_handler,
+          projection_data);
 
       // Set pointers to velocity vectors for plotting.
       checkpoint_vectors[0 /* velocity */]      = source_vectors_per_dof_handler[0];
@@ -1465,13 +1672,16 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
     // Using `SpatialDiscretization::L2` or projecting in the deformed configuration, we can
     // perform the grid-to-grid projection straight away only adapting the mapping of the existing
     // `MatrixFree` object
+    if(project_without_matrix_free)
+      AssertThrow(not param.restart_data.requires_mapping_reset(),
+                  dealii::ExcMessage("The restart projection on the undeformed grid needs the "
+                                     "dealii::MatrixFree operators here."));
     if(param.restart_data.requires_mapping_reset())
     {
       // Attaching manifolds, we assume that we at least refine once. We do not support coarsening
       // (undoing the refinement without the manifold) and subsequent refinement.
-      dealii::Triangulation<dim> const & triangulation =
-        matrix_free->get_dof_handler().get_triangulation();
-      std::vector<dealii::types::manifold_id> manifold_ids = triangulation.get_manifold_ids();
+      dealii::Triangulation<dim> const &      triangulation = dof_handler_u.get_triangulation();
+      std::vector<dealii::types::manifold_id> manifold_ids  = triangulation.get_manifold_ids();
       AssertThrow(manifold_ids.size() == 1 and manifold_ids[0] == dealii::numbers::flat_manifold_id,
                   dealii::ExcMessage("Combination of manifolds and grid-to-grid projection "
                                      "in unmapped grid at restart not supported."));
@@ -1486,14 +1696,25 @@ SpatialOperatorBase<dim, Number>::deserialize_vectors(std::vector<VectorType *> 
       matrix_free_mutable->update_mapping(*default_mapping);
     }
 
-    ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
-      checkpoint_mapping,
-      checkpoint_dof_handlers,
-      checkpoint_vectors,
-      dof_handlers,
-      *matrix_free,
-      vectors_per_dof_handler,
-      projection_data);
+    if(project_without_matrix_free)
+      ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
+        checkpoint_mapping,
+        checkpoint_dof_handlers,
+        checkpoint_vectors,
+        *this->get_mapping(),
+        {make_target(dof_handler_u, constraint_u, param.degree_u + 1, true),
+         make_target(dof_handler_p, constraint_p, param.get_degree_p(param.degree_u) + 1, false)},
+        vectors_per_dof_handler,
+        projection_data);
+    else
+      ExaDG::GridToGridProjection::do_grid_to_grid_projection<dim, Number, VectorType>(
+        checkpoint_mapping,
+        checkpoint_dof_handlers,
+        checkpoint_vectors,
+        dof_handlers,
+        *matrix_free,
+        vectors_per_dof_handler,
+        projection_data);
 
     // Restore the mapping in `MatrixFree` to continue with the requested mapping after restart.
     if(param.restart_data.requires_mapping_reset())
@@ -1666,6 +1887,36 @@ template<int dim, typename Number>
 double
 SpatialOperatorBase<dim, Number>::calculate_time_step_cfl_global() const
 {
+  if(not uses_matrix_free_operators())
+  {
+    // Same as calculate_time_step_cfl_local() with a constant velocity field and the condition
+    // type VelocityComponents, but with dealii::FEValues on the standard velocity quadrature
+    std::shared_ptr<dealii::Quadrature<dim>> quadrature =
+      create_quadrature<dim>(param.grid.element_type, param.degree_u + 1);
+    dealii::FEValues<dim> fe_values(*get_mapping(),
+                                    dof_handler_u.get_fe(),
+                                    *quadrature,
+                                    dealii::update_inverse_jacobians);
+    double const cfl_p = 1.0 / std::pow(param.degree_u, param.cfl_exponent_fe_degree_velocity);
+    dealii::Tensor<1, dim> u_x;
+    for(unsigned int d = 0; d < dim; ++d)
+      u_x[d] = param.max_velocity;
+    double time_step = std::numeric_limits<double>::max();
+    for(auto const & cell : dof_handler_u.active_cell_iterators())
+      if(cell->is_locally_owned())
+      {
+        fe_values.reinit(cell);
+        for(unsigned int const q : fe_values.quadrature_point_indices())
+        {
+          dealii::Tensor<2, dim> const inverse_jacobian = fe_values.inverse_jacobian(q);
+          dealii::Tensor<1, dim> const ut_xi            = inverse_jacobian * u_x;
+          for(unsigned int d = 0; d < dim; ++d)
+            time_step = std::min(time_step, cfl_p / std::abs(ut_xi[d]));
+        }
+      }
+    return dealii::Utilities::MPI::min(time_step, mpi_comm);
+  }
+
   std::shared_ptr<dealii::Function<dim>> const velocity_field =
     std::make_shared<dealii::Functions::ConstantFunction<dim>>(param.max_velocity, dim);
 

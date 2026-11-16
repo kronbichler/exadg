@@ -40,6 +40,11 @@ struct MyPostProcessorData
   PostProcessorData<dim>          pp_data;
   MeanVelocityCalculatorData<dim> mean_velocity_data;
   LinePlotDataStatistics<dim>     line_plot_data;
+
+  // Whether the flow rate is computed with the dealii::MatrixFree-based MeanVelocityCalculator,
+  // which is the case for all operators except the consistent splitting extruded one, which
+  // integrates the velocity of its momentum operator directly.
+  bool flow_rate_with_matrix_free = true;
 };
 
 template<int dim, typename Number>
@@ -101,6 +106,13 @@ public:
                                              *consistent_splitting_operator->momentum_operator);
     else
       line_plot_calculator_statistics->setup(my_pp_data.line_plot_data);
+  }
+
+  bool
+  requires_matrix_free() const override
+  {
+    return Base::requires_matrix_free() or
+           (my_pp_data.mean_velocity_data.calculate and my_pp_data.flow_rate_with_matrix_free);
   }
 
   bool

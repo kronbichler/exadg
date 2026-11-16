@@ -63,6 +63,15 @@ public:
   {
   }
 
+  // The time integrator TimeIntBDFConsistentSplittingExtruded uses its own operators, so do not
+  // set up the generic operators and their dealii::MatrixFree object, see
+  // SpatialOperatorBase::uses_matrix_free_operators().
+  bool
+  uses_matrix_free_operators() const final
+  {
+    return false;
+  }
+
   std::shared_ptr<const RTOperator::RaviartThomasOperator<dim, Number>> momentum_operator;
   dealii::LinearAlgebra::distributed::Vector<Number> const *            velocity_vector;
 };

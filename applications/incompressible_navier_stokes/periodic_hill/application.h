@@ -679,9 +679,7 @@ private:
     double const abs_tol_lin            = convergence_study ? 1.0e-18 : 1.0e-12;
     double const rel_tol_lin_ppe        = convergence_study ? 1.0e-09 : 5.0e-06;
     double const rel_tol_lin_projection = convergence_study ? 1.0e-09 : 1.0e-06;
-    double rel_tol_lin_momentum         = convergence_study ? 1.0e-09 : 5.0e-10;
-    if(char const * tol = std::getenv("EXADG_MOMENTUM_REL_TOL"))
-      rel_tol_lin_momentum = std::atof(tol);
+    double const rel_tol_lin_momentum   = convergence_study ? 1.0e-09 : 5.0e-10;
     double const rel_tol_lin_mass       = convergence_study ? 1.0e-09 : 1.0e-04;
 
     // pressure Poisson equation
@@ -1225,6 +1223,8 @@ private:
 
     MyPostProcessorData<dim> my_pp_data;
     my_pp_data.pp_data = pp_data;
+    my_pp_data.flow_rate_with_matrix_free =
+      this->param.temporal_discretization != TemporalDiscretization::BDFConsistentSplittingExtruded;
 
     // line plot data: calculate statistics along lines
 

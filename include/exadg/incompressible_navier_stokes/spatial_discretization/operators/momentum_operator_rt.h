@@ -796,7 +796,8 @@ public:
   // The parameter `factor_convective` can be set to (1.0) for the convective
   // form of the convective term, 0.5 for the skew-symmetric form and to 0.0
   // for the divergence form.
-  void
+  // Returns the same CFL factor as evaluate_convective_and_divergence_term().
+  Number
   evaluate_convective_term(const VectorType & src,
                            const Number       factor_convective,
                            VectorType &       dst) const
@@ -813,6 +814,7 @@ public:
                 dst.begin() + cell_loop_pre_list[range].second,
                 Number());
 
+    Number cfl_factor = 0.;
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
       for(unsigned int range = cell_loop_mass_pre_list_index[cell];
@@ -822,27 +824,31 @@ public:
                   dst.begin() + cell_loop_mass_pre_list[range].second,
                   Number());
 
-      const unsigned int degree = shape_info.data[0].fe_degree;
+      VectorizedArray<Number> convective_cfl = 0.;
+      const unsigned int      degree         = shape_info.data[0].fe_degree;
       if(degree == 2)
-        do_convective_on_cell<2>(cell, src, factor_convective, dst);
+        convective_cfl = do_convective_on_cell<2>(cell, src, factor_convective, dst);
       else if(degree == 3)
-        do_convective_on_cell<3>(cell, src, factor_convective, dst);
+        convective_cfl = do_convective_on_cell<3>(cell, src, factor_convective, dst);
       else if(degree == 4)
-        do_convective_on_cell<4>(cell, src, factor_convective, dst);
+        convective_cfl = do_convective_on_cell<4>(cell, src, factor_convective, dst);
 #ifndef DEBUG
       else if(degree == 5)
-        do_convective_on_cell<5>(cell, src, factor_convective, dst);
+        convective_cfl = do_convective_on_cell<5>(cell, src, factor_convective, dst);
       else if(degree == 6)
-        do_convective_on_cell<6>(cell, src, factor_convective, dst);
+        convective_cfl = do_convective_on_cell<6>(cell, src, factor_convective, dst);
       else if(degree == 7)
-        do_convective_on_cell<7>(cell, src, factor_convective, dst);
+        convective_cfl = do_convective_on_cell<7>(cell, src, factor_convective, dst);
       else if(degree == 8)
-        do_convective_on_cell<8>(cell, src, factor_convective, dst);
+        convective_cfl = do_convective_on_cell<8>(cell, src, factor_convective, dst);
       else if(degree == 9)
-        do_convective_on_cell<9>(cell, src, factor_convective, dst);
+        convective_cfl = do_convective_on_cell<9>(cell, src, factor_convective, dst);
 #endif
       else
         AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+
+      for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+        cfl_factor = std::max(cfl_factor, convective_cfl[v]);
     }
 
     single_exchange.signal_done_reading();
@@ -850,6 +856,8 @@ public:
     src.zero_out_ghost_values();
     dst.compress_finish(VectorOperation::add);
     single_exchange.wait_until_source_vector_free();
+
+    return Utilities::MPI::max(cfl_factor, dst.get_mpi_communicator());
   }
 
   Number
@@ -4323,7 +4331,7 @@ private:
   }
 
   template<int degree>
-  void
+  VectorizedArray<Number>
   do_convective_on_cell(const unsigned int cell,
                         const VectorType & src,
                         const Number       factor_convective,
@@ -4334,8 +4342,9 @@ private:
     const auto &           shape_data    = convective_shape_info.data;
 
     // compute_cell() overwrites the values at the quadrature points by the
-    // test values, see do_convective_and_divergence_on_cell()
-    VectorizedArray<Number> quad_values[dim * n_points];
+    // test values, followed by the CFL velocity, see
+    // do_convective_and_divergence_on_cell()
+    VectorizedArray<Number> quad_values[dim * n_points + 1];
     VectorizedArray<Number> face_data[2 * dim * (dim + 1) * Utilities::pow(n_q_points_1d, dim - 1)];
     VectorizedArray<Number> dof_values[dim * Utilities::pow(degree, dim - 1) * (degree + 1)];
     read_cell_values<degree, n_q_points_1d>(src.begin(),
@@ -4355,6 +4364,7 @@ private:
                                                   n_active_entries_per_cell_batch(cell),
                                                   quad_values,
                                                   dst.begin());
+    return quad_values[dim * n_points];
   }
 
   // The parameter 'last_stage' truncates the kernel for benchmarking, see
@@ -4728,6 +4738,15 @@ private:
 
           if(cell_operation == CellOperation::convective)
           {
+            {
+              // scaled velocity = inv_jac * val_real = 1/det(jac) * val_ref, as for
+              // convective_and_divergence below
+              Tensor<1, dim, VectorizedArray<Number>> scaled_velocity;
+              for(unsigned int d = 0; d < dim; ++d)
+                scaled_velocity[d] = val[d];
+              cfl_velocity =
+                std::max(cfl_velocity, scaled_velocity.norm_square() * (inv_jac_det * inv_jac_det));
+            }
             VectorizedArray<Number> factor = inv_jac_det * inv_jac_det;
             VectorizedArray<Number> tmp[2] = {grad_real[0][0] * t0 + grad_real[0][1] * t1,
                                               grad_real[1][0] * t0 + grad_real[1][1] * t1};
@@ -4908,6 +4927,16 @@ private:
 
             if(cell_operation == CellOperation::convective)
             {
+              {
+                // scaled velocity, as for convective_and_divergence below
+                const VectorizedArray<Number>           inv_jac_det_3d = inv_jac_det * h_z_inverse;
+                Tensor<1, dim, VectorizedArray<Number>> scaled_velocity;
+                for(unsigned int d = 0; d < dim; ++d)
+                  scaled_velocity[d] = val[d];
+                cfl_velocity =
+                  std::max(cfl_velocity,
+                           scaled_velocity.norm_square() * (inv_jac_det_3d * inv_jac_det_3d));
+              }
               const VectorizedArray<Number> factor =
                 inv_jac_det * inv_jac_det * h_z_inverse * h_z_inverse;
               VectorizedArray<Number> tmp[3];
@@ -5138,7 +5167,10 @@ private:
                                                           (qy * nn + i0 * n_q_points_2d) * dim + d);
     }
 
-    if(cell_operation == CellOperation::convective_and_divergence)
+    // the convective operations append the CFL velocity to the test values, so the array
+    // must have one more entry
+    if(cell_operation == CellOperation::convective_and_divergence ||
+       cell_operation == CellOperation::convective)
       out_values[dim * n_q_points] = std::sqrt(cfl_velocity);
   }
 

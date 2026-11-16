@@ -97,6 +97,12 @@ private:
   void
   setup_derived() final;
 
+  double
+  calculate_time_step_size() override;
+
+  double
+  recalculate_time_step_size() const override;
+
   void
   get_vectors_serialization(std::vector<VectorType const *> & vectors_velocity,
                             std::vector<VectorType const *> & vectors_pressure) const final;
@@ -202,6 +208,10 @@ private:
 
   std::pair<unsigned int /* calls */, unsigned long long /* iteration counts */> iterations_penalty;
   std::pair<unsigned int /* calls */, unsigned long long /* iteration counts */> iterations_mass;
+
+  // maximum of |J^{-1} u| over the quadrature points, from the convective term of the
+  // Raviart-Thomas operator, for the CFL condition
+  double factor_cfl;
 
   // time integrator constants: extrapolation scheme
   ExtrapolationConstants extra_pressure_nbc;

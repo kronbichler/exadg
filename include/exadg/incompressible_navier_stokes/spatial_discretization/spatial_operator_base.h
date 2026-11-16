@@ -121,6 +121,38 @@ public:
         std::shared_ptr<MatrixFreeData<dim, Number> const>     matrix_free_data,
         std::string const &                                    dof_index_temperature = "");
 
+  /*
+   * Return whether the time integration uses the generic operators of this class, which are all
+   * built on the dealii::MatrixFree object. Time integrators with their own specialized operators
+   * (the extruded variants) override this function to return false. Then, setup() creates
+   * neither the operators nor the main dealii::MatrixFree object, the vectors get their parallel
+   * layout from the DoFHandler objects, and the functions needed for setup and restart run without
+   * dealii::MatrixFree. A reduced dealii::MatrixFree object for postprocessing tools is only built
+   * if set_matrix_free_needed_for_postprocessing() was called with true before setup().
+   */
+  virtual bool
+  uses_matrix_free_operators() const
+  {
+    return true;
+  }
+
+  /*
+   * Specify whether the postprocessing needs a dealii::MatrixFree object, see
+   * PostProcessorInterface::requires_matrix_free(). Only relevant if uses_matrix_free_operators()
+   * returns false, and must be called before setup().
+   */
+  void
+  set_matrix_free_needed_for_postprocessing(bool const needed);
+
+  /*
+   * Without the generic operators, the projections at restart need a solver for the mass matrix
+   * of the velocity space, which the time integrator provides with its own operator. The function
+   * solves M dst = rhs for vectors in the layout of initialize_vector_velocity().
+   */
+  void
+  set_velocity_mass_solver(
+    std::function<void(VectorType & dst, VectorType const & rhs)> const & mass_solver);
+
 protected:
   /*
    * This function initializes operators, preconditioners, and solvers related to the solution of
@@ -138,6 +170,22 @@ private:
    */
   virtual void
   setup_derived() = 0;
+
+  // setup() for the case uses_matrix_free_operators() == false
+  void
+  setup_without_matrix_free_operators();
+
+  // contents of the reduced dealii::MatrixFree object for postprocessing
+  void
+  fill_matrix_free_data_postprocessing(MatrixFreeData<dim, Number> & matrix_free_data) const;
+
+  // set the viscous kernel data from the parameters
+  void
+  fill_viscous_kernel_data();
+
+  // inverse mass operators of the velocity and the scalar velocity space
+  void
+  initialize_inverse_mass_operators();
 
 public:
   /*
@@ -583,6 +631,15 @@ private:
   // object `matrix_free` is pointing to. This variable is needed for ALE formulations or for
   // grid-to-grid projections on an undeformed grid.
   std::shared_ptr<dealii::MatrixFree<dim, Number>> matrix_free_mutable;
+
+  // Variables for the case uses_matrix_free_operators() == false: whether to build a reduced
+  // dealii::MatrixFree object for postprocessing, the parallel layout of the vectors in case no
+  // dealii::MatrixFree object exists, and the mass solver for the velocity space at restart.
+  bool                                                       matrix_free_needed_for_postprocessing;
+  std::shared_ptr<dealii::Utilities::MPI::Partitioner const> partitioner_u;
+  std::shared_ptr<dealii::Utilities::MPI::Partitioner const> partitioner_u_scalar;
+  std::shared_ptr<dealii::Utilities::MPI::Partitioner const> partitioner_p;
+  std::function<void(VectorType & dst, VectorType const & rhs)> velocity_mass_solver;
 
   bool pressure_level_is_undefined;
 

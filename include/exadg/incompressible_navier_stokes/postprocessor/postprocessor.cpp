@@ -86,31 +86,38 @@ PostProcessor<dim, Number>::setup(Operator const & pde_operator)
                            *navier_stokes_operator->get_mapping(),
                            pp_data.error_data_p);
 
-  lift_and_drag_calculator.setup(navier_stokes_operator->get_dof_handler_u(),
-                                 navier_stokes_operator->get_matrix_free(),
-                                 navier_stokes_operator->get_dof_index_velocity(),
-                                 navier_stokes_operator->get_dof_index_pressure(),
-                                 navier_stokes_operator->get_quad_index_velocity_standard(),
-                                 pp_data.lift_and_drag_data);
+  // The following tools use the dealii::MatrixFree object of the operator, which only exists
+  // if requires_matrix_free() says so for operators without dealii::MatrixFree operators, so
+  // set them up only when active (their time control stays inactive otherwise).
+  if(pp_data.lift_and_drag_data.time_control_data.is_active)
+    lift_and_drag_calculator.setup(navier_stokes_operator->get_dof_handler_u(),
+                                   navier_stokes_operator->get_matrix_free(),
+                                   navier_stokes_operator->get_dof_index_velocity(),
+                                   navier_stokes_operator->get_dof_index_pressure(),
+                                   navier_stokes_operator->get_quad_index_velocity_standard(),
+                                   pp_data.lift_and_drag_data);
 
   pressure_difference_calculator.setup(navier_stokes_operator->get_dof_handler_p(),
                                        *navier_stokes_operator->get_mapping(),
                                        pp_data.pressure_difference_data);
 
-  div_and_mass_error_calculator.setup(navier_stokes_operator->get_matrix_free(),
-                                      navier_stokes_operator->get_dof_index_velocity(),
-                                      navier_stokes_operator->get_quad_index_velocity_standard(),
-                                      pp_data.mass_data);
+  if(pp_data.mass_data.time_control_data.is_active)
+    div_and_mass_error_calculator.setup(navier_stokes_operator->get_matrix_free(),
+                                        navier_stokes_operator->get_dof_index_velocity(),
+                                        navier_stokes_operator->get_quad_index_velocity_standard(),
+                                        pp_data.mass_data);
 
-  kinetic_energy_calculator.setup(*navier_stokes_operator,
-                                  navier_stokes_operator->get_matrix_free(),
-                                  navier_stokes_operator->get_dof_index_velocity(),
-                                  navier_stokes_operator->get_quad_index_velocity_standard(),
-                                  pp_data.kinetic_energy_data);
+  if(pp_data.kinetic_energy_data.time_control_data.is_active)
+    kinetic_energy_calculator.setup(*navier_stokes_operator,
+                                    navier_stokes_operator->get_matrix_free(),
+                                    navier_stokes_operator->get_dof_index_velocity(),
+                                    navier_stokes_operator->get_quad_index_velocity_standard(),
+                                    pp_data.kinetic_energy_data);
 
-  kinetic_energy_spectrum_calculator.setup(navier_stokes_operator->get_matrix_free(),
-                                           navier_stokes_operator->get_dof_handler_u(),
-                                           pp_data.kinetic_energy_spectrum_data);
+  if(pp_data.kinetic_energy_spectrum_data.time_control_data.is_active)
+    kinetic_energy_spectrum_calculator.setup(navier_stokes_operator->get_matrix_free(),
+                                             navier_stokes_operator->get_dof_handler_u(),
+                                             pp_data.kinetic_energy_spectrum_data);
 
   particle_calculator.setup(navier_stokes_operator->get_dof_handler_u(),
                             *navier_stokes_operator->get_mapping(),
@@ -120,6 +127,23 @@ PostProcessor<dim, Number>::setup(Operator const & pde_operator)
                              navier_stokes_operator->get_dof_handler_p(),
                              *navier_stokes_operator->get_mapping(),
                              pp_data.line_plot_data);
+}
+
+template<int dim, typename Number>
+bool
+PostProcessor<dim, Number>::requires_matrix_free() const
+{
+  OutputData const & output = pp_data.output_data;
+  bool const         derived_fields_in_output =
+    output.time_control_data.is_active and
+    (output.write_vorticity or output.write_vorticity_magnitude or output.write_streamfunction or
+     output.write_divergence or output.write_shear_rate or output.write_viscosity or
+     output.write_velocity_magnitude or output.write_q_criterion or output.write_cfl);
+
+  return derived_fields_in_output or pp_data.lift_and_drag_data.time_control_data.is_active or
+         pp_data.mass_data.time_control_data.is_active or
+         pp_data.kinetic_energy_data.time_control_data.is_active or
+         pp_data.kinetic_energy_spectrum_data.time_control_data.is_active;
 }
 
 template<int dim, typename Number>

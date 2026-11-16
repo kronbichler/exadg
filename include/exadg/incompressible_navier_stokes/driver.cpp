@@ -180,13 +180,20 @@ Driver<dim, Number>::setup()
     AssertThrow(false, dealii::ExcMessage("Not implemented."));
   }
 
+  // The postprocessor is created before the setup of the operator, because operators without
+  // dealii::MatrixFree operators only create a dealii::MatrixFree object if the postprocessing
+  // needs one.
+  if(not is_throughput_study)
+  {
+    postprocessor = application->create_postprocessor();
+    pde_operator->set_matrix_free_needed_for_postprocessing(postprocessor->requires_matrix_free());
+  }
+
   // setup Navier-Stokes operator
   pde_operator->setup();
 
   if(not is_throughput_study)
   {
-    postprocessor = application->create_postprocessor();
-
     if(application->get_parameters().solver_type == SolverType::Unsteady)
     {
       time_integrator = create_time_integrator<dim, Number>(

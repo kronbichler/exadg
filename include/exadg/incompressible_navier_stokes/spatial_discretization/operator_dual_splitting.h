@@ -140,6 +140,15 @@ public:
     return this->viscous_kernel_data;
   }
 
+  // The extruded variant of the time integrator, TimeIntBDFDualSplittingExtruded, uses its own
+  // operators, so do not set up the generic operators and their dealii::MatrixFree object, see
+  // SpatialOperatorBase::uses_matrix_free_operators().
+  bool
+  uses_matrix_free_operators() const final
+  {
+    return this->param.temporal_discretization != TemporalDiscretization::BDFDualSplittingExtruded;
+  }
+
 private:
   /*
    * rhs pressure Poisson equation

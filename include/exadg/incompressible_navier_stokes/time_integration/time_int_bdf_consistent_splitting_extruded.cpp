@@ -370,6 +370,35 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   op_rt_float->set_parameters(0.0, 1.0);
   op_rt_float->compute_diagonal(diagonal_laplace);
 
+  // Solver for the mass matrix of the velocity used by the projections at restart, as the
+  // operator does not set up its dealii::MatrixFree operators, see
+  // SpatialOperatorBase::set_velocity_mass_solver(). The vectors are in the layout of
+  // initialize_vector_velocity(), so copy to the vectors of the Raviart-Thomas operator and back.
+  pde_operator->set_velocity_mass_solver([this](VectorType & dst, VectorType const & rhs) {
+    VectorType rhs_this, solution_this;
+    op_rt->initialize_dof_vector(rhs_this);
+    op_rt->initialize_dof_vector(solution_this);
+    op_rt->copy_mf_to_this_vector(rhs, rhs_this);
+
+    dealii::DiagonalMatrix<VectorType> preconditioner;
+    preconditioner.get_vector().reinit(rhs_this, true);
+    for(unsigned int i = 0; i < diagonal_mass.locally_owned_size(); ++i)
+      preconditioner.get_vector().local_element(i) = 1. / diagonal_mass.local_element(i);
+
+    SolverData const &           solver_data = this->param.restart_data.solver_data;
+    dealii::ReductionControl     control(solver_data.max_iter,
+                                     solver_data.abs_tol,
+                                     solver_data.rel_tol);
+    dealii::SolverCG<VectorType> solver_cg(control);
+    op_rt->set_parameters(1.0, 0.0);
+    solver_cg.solve(*op_rt, solution_this, rhs_this, preconditioner);
+    this->pcout << "CG iterations of mass solve with Raviart-Thomas operator: "
+                << control.last_step() << std::endl;
+
+    dst = 0.;
+    op_rt->copy_this_to_mf_vector(solution_this, dst);
+  });
+
   for(VectorType & vector : velocity)
     op_rt->initialize_dof_vector(vector);
 
@@ -429,8 +458,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
                      cell_vectorization_category,
                      dealii::QGauss<1>(pde_operator->get_dof_handler_p().get_fe().degree + 1),
                      this->is_test);
-  laplace_op->set_penalty_parameters(
-    pde_operator->laplace_operator.get_data().kernel_data.IP_factor);
+  laplace_op->set_penalty_parameters(this->param.IP_factor_pressure);
 
   op_rt->verify_other_cell_level_index(laplace_op->get_cell_level_index());
   op_rt->initialize_coupling_pressure(pde_operator->get_dof_handler_p().get_fe(),
@@ -445,7 +473,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
       pde_operator->get_dof_handler_p(),
       cell_vectorization_category,
       pde_operator->get_grid().mapping_function,
-      pde_operator->laplace_operator.get_data().kernel_data.IP_factor,
+      this->param.IP_factor_pressure,
       this->is_test);
   else
     poisson_preconditioner = std::make_shared<LaplaceOperator::PoissonPreconditionerMG<dim, float>>(
@@ -455,7 +483,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
       pde_operator->get_grid().coarse_triangulations,
       pde_operator->get_grid().coarse_mappings,
       pde_operator->get_grid().mapping_function,
-      pde_operator->laplace_operator.get_data().kernel_data.IP_factor,
+      this->param.IP_factor_pressure,
       this->is_test);
 
   for(unsigned int i = 0; i < pressure.size(); ++i)
