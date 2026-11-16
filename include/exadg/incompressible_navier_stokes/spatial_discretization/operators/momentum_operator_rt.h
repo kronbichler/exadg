@@ -689,8 +689,9 @@ public:
                            total_time);
 
       // time of the whole product per call, for each variant
-      const std::array<std::string, 3> names = {{"vmult with functions", "vmult", "vmult_scratch"}};
-      for(unsigned int k = 0; k < 3; ++k)
+      const std::array<std::string, 4> names = {
+        {"vmult with functions", "vmult", "vmult_scratch", "vmult with rhs"}};
+      for(unsigned int k = 0; k < 4; ++k)
         if(product_timings[k][0] > 0)
           Helper::print_time(product_timings[k][1] / product_timings[k][0],
                              names[k] + " (" +
@@ -1216,6 +1217,156 @@ public:
       timings[13] += time.wall_time();
       timings[14] += total_timer.wall_time();
     }
+  }
+
+  // Fused version of evaluate_momentum_rhs() and vmult(): adds to dst the
+  // right-hand side of the momentum equation (with the same arguments as in
+  // evaluate_momentum_rhs()) and the product of the operator with src, with
+  // a single cell loop. The right-hand side integrand at the quadrature points
+  // is added to the one of the operator, so that both share the integration
+  // and the write into dst. There are two functions to run before the loop
+  // on ranges of locally owned entries:
+  // - 'before_loop_src' runs before the first read of an entry of src, like
+  //   'before_loop' in vmult(), including the face integrals of neighbors,
+  // - 'before_loop_dst' runs before the first access to an entry of dst or
+  //   velocity_old by the cell integrals, like in vmult_before_on_dst(),
+  //   which is usually much later.
+  // For every entry, 'before_loop_src' runs before 'before_loop_dst'.
+  // 'after_loop' runs once the entries of dst are final.
+  void
+  vmult_add_with_momentum_rhs(
+    VectorType &                                                        dst,
+    const VectorType &                                                  src,
+    const VectorType &                                                  pressure,
+    const VectorType &                                                  velocity_old,
+    const Number                                                        velocity_scale,
+    const std::function<void(const unsigned int, const unsigned int)> & before_loop_src,
+    const std::function<void(const unsigned int, const unsigned int)> & before_loop_dst,
+    const std::function<void(const unsigned int, const unsigned int)> & after_loop,
+    const std::shared_ptr<dealii::Function<dim>>                        source_function = {}) const
+  {
+    AssertThrow(factor_laplace != 0.,
+                ExcMessage("The fused product with the right-hand side needs the "
+                           "Laplace term"));
+    AssertDimension(pressure_shape_info.data[0].n_q_points_1d, shape_info.data[0].n_q_points_1d);
+    AssertDimension(pressure_shape_info.data[0].fe_degree, shape_info.data[1].fe_degree);
+
+    Timer total_timer;
+    timings[0] += 1;
+    Timer time;
+
+    const unsigned int n_cell_batches = dof_indices.size();
+
+    // the entries exported to other processes (in the first pre list and
+    // the mass list for the MPI entries) must be final before the ghost
+    // exchange of velocity_old starts
+    for(unsigned int range = cell_loop_pre_list_index[n_cell_batches];
+        range < cell_loop_pre_list_index[n_cell_batches + 1];
+        ++range)
+      before_loop_src(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
+
+    const unsigned int n_partners = single_exchange.partners.size();
+    check_source_vector_is_shared(src);
+    single_exchange.start_receives(mpi_recv_buffer.data(),
+                                   src.get_mpi_communicator(),
+                                   mpi_requests.data());
+    Assert(src.has_ghost_elements() == false, ExcInternalError());
+
+    for(unsigned int range = cell_loop_pre_list_index[n_cell_batches + 1];
+        range < cell_loop_pre_list_index[n_cell_batches + 2];
+        ++range)
+      before_loop_src(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
+
+    timings[4] += time.wall_time();
+    time.restart();
+
+    dispatch_single_exchange_pack_and_send(src);
+    timings[1] += time.wall_time();
+    time.restart();
+
+    for(unsigned int range = cell_loop_mass_pre_list_index[n_cell_batches];
+        range < cell_loop_mass_pre_list_index[n_cell_batches + 1];
+        ++range)
+      before_loop_dst(cell_loop_mass_pre_list[range].first, cell_loop_mass_pre_list[range].second);
+    velocity_old.update_ghost_values_start(1);
+
+    if(n_partners > 0)
+    {
+      const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+      AssertThrowMPI(ierr);
+    }
+    single_exchange.unpack_and_complete(mpi_recv_buffer.data(), const_cast<Number *>(src.begin()));
+    velocity_old.update_ghost_values_finish();
+    timings[3] += time.wall_time();
+
+    time.restart();
+
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      for(unsigned int range = cell_loop_pre_list_index[cell];
+          range < cell_loop_pre_list_index[cell + 1];
+          ++range)
+        before_loop_src(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
+      for(unsigned int range = cell_loop_mass_pre_list_index[cell];
+          range < cell_loop_mass_pre_list_index[cell + 1];
+          ++range)
+        before_loop_dst(cell_loop_mass_pre_list[range].first,
+                        cell_loop_mass_pre_list[range].second);
+
+      if(degree == 2)
+        do_cell_operation_with_momentum_rhs<2>(
+          cell, src, pressure, velocity_old, velocity_scale, source_function, dst);
+      else if(degree == 3)
+        do_cell_operation_with_momentum_rhs<3>(
+          cell, src, pressure, velocity_old, velocity_scale, source_function, dst);
+      else if(degree == 4)
+        do_cell_operation_with_momentum_rhs<4>(
+          cell, src, pressure, velocity_old, velocity_scale, source_function, dst);
+#ifndef DEBUG
+      else if(degree == 5)
+        do_cell_operation_with_momentum_rhs<5>(
+          cell, src, pressure, velocity_old, velocity_scale, source_function, dst);
+      else if(degree == 6)
+        do_cell_operation_with_momentum_rhs<6>(
+          cell, src, pressure, velocity_old, velocity_scale, source_function, dst);
+      else if(degree == 7)
+        do_cell_operation_with_momentum_rhs<7>(
+          cell, src, pressure, velocity_old, velocity_scale, source_function, dst);
+      else if(degree == 8)
+        do_cell_operation_with_momentum_rhs<8>(
+          cell, src, pressure, velocity_old, velocity_scale, source_function, dst);
+      else if(degree == 9)
+        do_cell_operation_with_momentum_rhs<9>(
+          cell, src, pressure, velocity_old, velocity_scale, source_function, dst);
+#endif
+      else
+        AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+
+      for(unsigned int range = cell_loop_post_list_index[cell];
+          range < cell_loop_post_list_index[cell + 1];
+          ++range)
+        after_loop(cell_loop_post_list[range].first, cell_loop_post_list[range].second);
+    }
+    timings[7] += time.wall_time();
+
+    time.restart();
+    single_exchange.signal_done_reading();
+    dst.compress_start(0, VectorOperation::add);
+    src.zero_out_ghost_values();
+    velocity_old.zero_out_ghost_values();
+    dst.compress_finish(VectorOperation::add);
+    wait_for_readers();
+
+    for(unsigned int range = cell_loop_post_list_index[n_cell_batches];
+        range < cell_loop_post_list_index[n_cell_batches + 1];
+        ++range)
+      after_loop(cell_loop_post_list[range].first, cell_loop_post_list[range].second);
+
+    timings[8] += time.wall_time();
+    timings[9] += total_timer.wall_time();
+    product_timings[3][0] += 1;
+    product_timings[3][1] += total_timer.wall_time();
   }
 
   // Variant of the vmult() function with 'before_loop' and 'after_loop' for
@@ -1974,7 +2125,7 @@ private:
   // vmult_scratch(), and the time waiting for the processes reading the
   // source vector in shared memory, at the end of the products (part of the
   // compress timer) and before the cell loop of vmult_scratch()
-  mutable std::array<std::array<double, 2>, 3> product_timings            = {};
+  mutable std::array<std::array<double, 2>, 4> product_timings            = {};
   mutable double                               time_wait_readers          = 0;
   mutable double                               time_wait_readers_deferred = 0;
 
@@ -6471,13 +6622,79 @@ private:
                           const std::shared_ptr<dealii::Function<dim>> & rhs_function,
                           VectorType &                                   rhs) const
   {
+    constexpr unsigned int  n_q_points_1d = degree + 1;
+    constexpr unsigned int  n_points      = Utilities::pow(n_q_points_1d, dim);
+    VectorizedArray<Number> quad_values[dim * n_points];
+    read_cell_values<degree, n_q_points_1d>(velocity_old.begin(), dof_indices[cell], quad_values);
+    compute_momentum_rhs_integrand<degree>(
+      cell, pressure, velocity_scale, rhs_function, quad_values);
+
+    // (v \cdot normal, p)_{dK cap \Gamma_D} does not contribute, because the
+    // normal component is subject to (homogeneous) Dirichlet boundary
+    // conditions for H(div) spaces
+    integrate_cell_scatter<degree, n_q_points_1d>(dof_indices[cell],
+                                                  n_active_entries_per_cell_batch(cell),
+                                                  quad_values,
+                                                  rhs.begin());
+  }
+
+  // Cell operation of vmult_add_with_momentum_rhs(): the operator applied to
+  // src as in do_cell_operation(), plus the right-hand side integrand of
+  // do_momentum_rhs_on_cell() at the quadrature points before integration
+  template<int degree>
+  void
+  do_cell_operation_with_momentum_rhs(const unsigned int                             cell,
+                                      const VectorType &                             src,
+                                      const VectorType &                             pressure,
+                                      const VectorType &                             velocity_old,
+                                      const Number                                   velocity_scale,
+                                      const std::shared_ptr<dealii::Function<dim>> & rhs_function,
+                                      VectorType &                                   dst) const
+  {
+    constexpr unsigned int n_q_points_1d = degree + 1;
+    constexpr unsigned int n_points      = Utilities::pow(n_q_points_1d, dim);
+    const auto &           shape_data    = shape_info.data;
+
+    VectorizedArray<Number> quad_values[dim * n_points], out_values[dim * n_points];
+    read_cell_values<degree, n_q_points_1d>(src.begin(), dof_indices[cell], quad_values);
+    compute_cell<CellOperation::helmholtz, n_q_points_1d>(shape_data,
+                                                          cell,
+                                                          quad_values,
+                                                          out_values);
+    for(unsigned int f = 0; f < 2 * dim; ++f)
+      compute_face<degree, true>(shape_data, src, cell, f, quad_values, out_values);
+
+    // the values of src are not needed any more, so reuse the array
+    read_cell_values<degree, n_q_points_1d>(velocity_old.begin(), dof_indices[cell], quad_values);
+    compute_momentum_rhs_integrand<degree>(
+      cell, pressure, velocity_scale, rhs_function, quad_values);
+    for(unsigned int i = 0; i < dim * n_points; ++i)
+      out_values[i] += quad_values[i];
+
+    integrate_cell_scatter<degree, n_q_points_1d>(dof_indices[cell],
+                                                  n_active_entries_per_cell_batch(cell),
+                                                  out_values,
+                                                  dst.begin());
+  }
+
+  // Transform the values of the old velocity at the quadrature points in
+  // 'quad_values' into the integrand of the momentum right-hand side,
+  // including the pressure gradient and the body force, see
+  // do_momentum_rhs_on_cell()
+  template<int degree>
+  void
+  compute_momentum_rhs_integrand(const unsigned int                             cell,
+                                 const VectorType &                             pressure,
+                                 const Number                                   velocity_scale,
+                                 const std::shared_ptr<dealii::Function<dim>> & rhs_function,
+                                 VectorizedArray<Number> *                      quad_values) const
+  {
     constexpr unsigned int n_q_points_1d   = degree + 1;
     constexpr unsigned int n_points        = Utilities::pow(n_q_points_1d, dim);
     const auto &           shape_data      = shape_info.data;
     const auto &           shape_data_pres = pressure_shape_info.data[0].shape_values_eo;
 
-    VectorizedArray<Number> quad_values[dim * n_points], pressure_values[n_points];
-    read_cell_values<degree, n_q_points_1d>(velocity_old.begin(), dof_indices[cell], quad_values);
+    VectorizedArray<Number> pressure_values[n_points];
 
     const std::array<unsigned int, n_lanes> pressure_indices      = (*pressure_dof_indices)[cell];
     bool                                    all_indices_available = true;
@@ -6640,14 +6857,6 @@ private:
                                                     pressure_values + i1 * nn * nn + i0 * nn,
                                                     quad_values + (i1 * nn + i0) * nn * dim + 0);
     }
-
-    // (v \cdot normal, p)_{dK cap \Gamma_D} does not contribute, because the
-    // normal component is subject to (homogeneous) Dirichlet boundary
-    // conditions for H(div) spaces
-    integrate_cell_scatter<degree, n_q_points_1d>(dof_indices[cell],
-                                                  n_active_entries_per_cell_batch(cell),
-                                                  quad_values,
-                                                  rhs.begin());
   }
 
   template<int degree>

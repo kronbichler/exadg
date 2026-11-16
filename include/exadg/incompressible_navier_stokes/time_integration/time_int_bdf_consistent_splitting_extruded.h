@@ -281,9 +281,26 @@ private:
   Utilities::StatisticalQuantity stat_momentum_rhs_norm;
   Utilities::StatisticalQuantity stat_momentum_residual_start;
   Utilities::StatisticalQuantity stat_momentum_residual_stop;
+  // sqrt(sum_j c_j^2 r_end(n-1-j)^2) / r_start(n) with the extrapolation
+  // factors c_j of the initial guess, see momentum_step()
+  Utilities::StatisticalQuantity stat_momentum_solver_error_share;
+  std::vector<double>            momentum_residual_end_history;
+
+  // Compute the right-hand side and the residual of the initial guess in
+  // extrapolation mode with one cell loop (disabled by the environment
+  // variable EXADG_NO_FUSED_MOMENTUM_RHS). Every 'momentum_rhs_norm_interval'
+  // steps (EXADG_MOMENTUM_RHS_NORM_INTERVAL), the separate computation
+  // updates the norm of the right-hand side 'momentum_rhs_norm_last' used for
+  // the solver tolerance. With EXADG_CHECK_FUSED_MOMENTUM_RHS, each fused
+  // step is compared against the separate computation.
+  bool                           fused_momentum_rhs         = true;
+  unsigned int                   momentum_rhs_norm_interval = 16;
+  double                         momentum_rhs_norm_last     = 0.;
+  bool                           check_fused_momentum_rhs   = false;
   Utilities::StatisticalQuantity stat_momentum_time_rhs;
   Utilities::StatisticalQuantity stat_momentum_time_projection;
   Utilities::StatisticalQuantity stat_momentum_time_dp_residual;
+  Utilities::StatisticalQuantity stat_momentum_time_rhs_residual_fused;
   Utilities::StatisticalQuantity stat_momentum_time_solve_chebyshev;
   Utilities::StatisticalQuantity stat_momentum_time_solve_cg;
 
@@ -295,6 +312,27 @@ private:
   bool                   momentum_solver_in_extrapolation_mode;
   std::vector<double>    previous_time_steps;
   ExtrapolationConstants extra_initial_guess;
+
+  // Diagnostic of alternative initial guesses for the momentum solver, see
+  // initial_guess_diagnostic(): run every 'ig_diagnostic_interval' time
+  // steps (0 = disabled, set by the environment variable
+  // EXADG_INITIAL_GUESS_DIAGNOSTIC), with the last solutions in single
+  // precision (newest first) and their times
+  void
+  initial_guess_diagnostic(std::vector<Number> const & factors_initial_guess,
+                           double const                rhs_norm);
+  void
+  initial_guess_diagnostic_record_solution();
+
+  unsigned int                 ig_diagnostic_interval = 0;
+  unsigned int                 ig_diagnostic_n_filled = 0;
+  std::vector<VectorTypeFloat> ig_diagnostic_history;
+  std::vector<double>          ig_diagnostic_times;
+  std::vector<VectorTypeFloat> ig_diagnostic_matvec;
+  // per candidate (extrapolation orders 1 to n, projection with 4 to n
+  // vectors): ratio of the achieved residual to the one of the current
+  // initial guess
+  std::vector<Utilities::StatisticalQuantity> ig_diagnostic_ratio;
 };
 
 } // namespace IncNS

@@ -315,6 +315,22 @@ public:
     apply(false, solution, rhs, false);
   }
 
+  // Variant of step() where the matrix-vector product of the first
+  // iteration is computed by 'first_product(after_loop)' instead of
+  // matrix.vmult_scratch(solution, after_loop), e.g. to modify solution
+  // within the product before its entries are read. The function must call
+  // 'after_loop' like vmult_scratch() and leave the final content of the
+  // entries of solution passed to 'after_loop', which is the initial guess
+  // of the iteration.
+  template<typename FirstProduct>
+  void
+  step_with_first_product(VectorType &         solution,
+                          const VectorType &   rhs,
+                          const FirstProduct & first_product) const
+  {
+    apply(false, solution, rhs, false, &first_product);
+  }
+
   // Run the Chebyshev iteration with zero initial guess and return the norm
   // of the residual before the last update of the solution, like
   // dealii::PreconditionChebyshev::vmult_with_last_residual_norm()
@@ -327,12 +343,17 @@ public:
   AdditionalData data;
 
 private:
+  template<typename FirstProduct = std::nullptr_t>
   double
-  apply(const bool         zero_initial_guess,
-        VectorType &       solution,
-        const VectorType & rhs,
-        const bool         compute_final_norm) const
+  apply(const bool           zero_initial_guess,
+        VectorType &         solution,
+        const VectorType &   rhs,
+        const bool           compute_final_norm,
+        const FirstProduct * first_product = nullptr) const
   {
+    constexpr bool has_first_product = !std::is_same_v<FirstProduct, std::nullptr_t>;
+    if constexpr(has_first_product)
+      AssertThrow(!zero_initial_guess, dealii::ExcNotImplemented());
     const Number * rhs_ptr = rhs.begin();
     const Number * diagonal =
       data.preconditioner ? data.preconditioner->get_vector().begin() : nullptr;
@@ -395,6 +416,16 @@ private:
             if constexpr(decltype(norm_tag)::value)
               residual_sqr += sum;
           };
+        // the first iteration with nonzero initial guess, computed by the
+        // given function
+        if constexpr(has_first_product)
+        {
+          if constexpr(decltype(first_tag)::value)
+          {
+            (*first_product)(after_loop);
+            return;
+          }
+        }
         if constexpr(can_fuse_first_step && decltype(first_tag)::value)
           if(with_first_step)
           {

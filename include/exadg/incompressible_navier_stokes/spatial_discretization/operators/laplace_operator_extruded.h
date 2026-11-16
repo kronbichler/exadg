@@ -797,6 +797,87 @@ public:
       degree + 1>::do_backward(1, shape_data.shape_values_eo, false, values, values);
   }
 
+  // Read the nodal values of a single cell, given by the cell batch and
+  // lane, from src (with ghost values) into out in lexicographic order,
+  // without the hanging-node interpolation, entity by entity with
+  // contiguous runs in src. The lanes must not have hanging nodes.
+  template<int degree>
+  void
+  read_cell_values_scalar(const unsigned int cell,
+                          const unsigned int lane,
+                          const VectorType & src,
+                          Number *           out) const
+  {
+    constexpr unsigned int n_stored = Utilities::pow(degree == 1 ? 2 : 3, dim);
+    if(scalar_entity_start.empty())
+      setup_scalar_read<degree>();
+    const unsigned int * indices = compressed_dof_indices.data() + cell * n_stored * n_lanes + lane;
+    const Number *       src_ptr = src.begin();
+    for(unsigned int i = 0; i < n_stored; ++i)
+    {
+      const unsigned int index = indices[i * n_lanes];
+      const unsigned int begin = scalar_entity_start[i], end = scalar_entity_start[i + 1];
+      if(index == numbers::invalid_unsigned_int)
+        for(unsigned int k = begin; k < end; ++k)
+          out[scalar_entity_node[k]] = 0;
+      else
+        for(unsigned int k = begin; k < end; ++k)
+          out[scalar_entity_node[k]] = src_ptr[index + k - begin];
+    }
+  }
+
+  // Set up the node of each entry of the entities for
+  // read_cell_values_scalar(), by reading a vector holding its own indices
+  // with the compressed read
+  template<int degree>
+  void
+  setup_scalar_read() const
+  {
+    constexpr unsigned int    n_stored      = Utilities::pow(degree == 1 ? 2 : 3, dim);
+    constexpr unsigned int    dofs_per_cell = Utilities::pow(degree + 1, dim);
+    std::vector<unsigned int> length(n_stored, 1);
+    if(degree > 1)
+      for(unsigned int i = 0; i < n_stored; ++i)
+        for(unsigned int d = 0, j = i; d < dim; ++d, j /= 3)
+          if(j % 3 == 1)
+            length[i] *= degree - 1;
+    scalar_entity_start.assign(n_stored + 1, 0);
+    for(unsigned int i = 0; i < n_stored; ++i)
+      scalar_entity_start[i + 1] = scalar_entity_start[i] + length[i];
+    AssertDimension(scalar_entity_start.back(), dofs_per_cell);
+    scalar_entity_node.assign(dofs_per_cell, numbers::invalid_unsigned_int);
+    if constexpr(degree <= 2)
+    {
+      for(unsigned int i = 0; i < n_stored; ++i)
+        scalar_entity_node[i] = i;
+    }
+    else
+    {
+      const unsigned int max_length = Utilities::pow(degree - 1, dim);
+      VectorType         indices_as_values;
+      indices_as_values.reinit(n_stored * max_length);
+      for(unsigned int k = 0; k < n_stored * max_length; ++k)
+        indices_as_values(k) = k;
+      std::vector<unsigned int> indices(n_stored * n_lanes);
+      for(unsigned int i = 0; i < n_stored; ++i)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          indices[i * n_lanes + v] = i * max_length;
+      const std::vector<unsigned char> unconstrained(n_stored, 1);
+      VectorizedArray<Number>          values[dofs_per_cell];
+      read_dof_values_compressed<degree, degree + 1, 1>(
+        indices_as_values, indices, unconstrained, 0, {}, true, values);
+      for(unsigned int node = 0; node < dofs_per_cell; ++node)
+      {
+        const unsigned int value = static_cast<unsigned int>(values[node][0]);
+        const unsigned int i = value / max_length, k = value % max_length;
+        AssertIndexRange(k, length[i]);
+        scalar_entity_node[scalar_entity_start[i] + k] = node;
+      }
+    }
+    for(const unsigned int node : scalar_entity_node)
+      AssertThrow(node != numbers::invalid_unsigned_int, ExcInternalError());
+  }
+
   const std::vector<unsigned int> &
   get_compressed_dof_indices() const
   {
@@ -2005,8 +2086,13 @@ private:
 private:
   ObserverPointer<const DoFHandler<dim>> dof_handler;
   MatrixFree<dim, Number>                matrix_free;
-  std::vector<unsigned int>              compressed_dof_indices;
-  std::vector<unsigned char>             all_indices_unconstrained;
+  // node of each entry of the 3^dim entities, starting at
+  // scalar_entity_start[i] for entity i, see setup_scalar_read()
+  mutable std::vector<unsigned int> scalar_entity_start;
+  mutable std::vector<unsigned int> scalar_entity_node;
+
+  std::vector<unsigned int>  compressed_dof_indices;
+  std::vector<unsigned char> all_indices_unconstrained;
 
   // hanging-node data: the constraint kind of all lanes of a cell batch and
   // a flag whether a batch contains any hanging node, both empty if the mesh
@@ -2521,8 +2607,8 @@ public:
     const unsigned int n_cell_batches  = dof_indices.size();
     const auto &       pre_list_index =
       factor_laplace != 0. ? cell_loop_pre_list_index : cell_loop_mass_pre_list_index;
-    const auto & pre_list = factor_laplace != 0. ? cell_loop_pre_list : cell_loop_mass_pre_list;
-    const auto run_pre_list = [&](const unsigned int index) {
+    const auto & pre_list     = factor_laplace != 0. ? cell_loop_pre_list : cell_loop_mass_pre_list;
+    const auto   run_pre_list = [&](const unsigned int index) {
       if constexpr(has_before_loop)
         for(unsigned int range = pre_list_index[index]; range < pre_list_index[index + 1]; ++range)
           before_loop(pre_list[range].first, pre_list[range].second);
@@ -2561,6 +2647,240 @@ public:
       timings[13] += time.wall_time();
       timings[14] += total_timer.wall_time();
     }
+  }
+
+  // Variant of vmult_scratch() that first adds the prolongation of the FE
+  // vector fe_correction to src, like prolongate_and_add(), within the
+  // loop: the cell batches whose face data is sent to other processes are
+  // prolongated before the exchange, all other cell batches right before
+  // the first cell batch reading them, i.e., the batch itself or one with
+  // a face neighbor in it. The result is the same as prolongate_and_add()
+  // followed by vmult_scratch().
+  template<typename AfterLoop>
+  void
+  vmult_scratch_with_prolongation(VectorType &                           src,
+                                  const VectorType &                     fe_correction,
+                                  const LaplaceOperatorFE<dim, Number> & fe_operator,
+                                  const AfterLoop &                      after_loop) const
+  {
+    AssertThrow(factor_laplace != 0., ExcNotImplemented());
+    const unsigned int n_cell_batches = dof_indices.size();
+    if(!prolongation_setup_done)
+    {
+      prolongation_setup_done = true;
+      // batches of arbitrary cells ordered by the consumers, unless the FE
+      // level has hanging nodes, where the lane-wise prolongation of the
+      // cell batches is used
+      use_prolongation_batches =
+        Utilities::MPI::max(fe_operator.has_hanging_nodes() ? 1 : 0, MPI_COMM_WORLD) == 0 &&
+        std::getenv("EXADG_PROLONGATION_LANE_WISE") == nullptr;
+      if(use_prolongation_batches)
+        setup_prolongation_batches(fe_operator);
+      else
+        setup_prolongation_lists();
+    }
+    if(use_prolongation_batches)
+    {
+      vmult_scratch_with_prolongation_batches(src, fe_correction, after_loop);
+      return;
+    }
+
+    Timer total_timer;
+    timings[0] += 1;
+    const unsigned int degree                = shape_info.data[0].fe_degree;
+    const auto         run_prolongation_list = [&](const unsigned int index) {
+      for(unsigned int i = prolongation_list_index[index]; i < prolongation_list_index[index + 1];
+          ++i)
+        dispatch_prolongate(degree,
+                            prolongation_list[i].first,
+                            prolongation_list[i].second,
+                            fe_correction,
+                            fe_operator,
+                            src);
+    };
+
+    fe_correction.update_ghost_values();
+    {
+      Timer time;
+      run_prolongation_list(n_cell_batches);
+      timings[4] += time.wall_time();
+    }
+
+    scratch.prepare_loop();
+    exchange_face_data(src);
+
+    Timer time;
+    scratch.cell_loop(
+      [&](const unsigned int cell, Number * scratch_array) {
+        run_prolongation_list(cell);
+        dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
+      },
+      after_loop);
+    scratch.finish_loop(after_loop, {});
+    fe_correction.zero_out_ghost_values();
+
+    timings[7] += time.wall_time();
+    timings[8] += time.wall_time();
+    timings[9] += total_timer.wall_time();
+  }
+
+  // Part of vmult_scratch_with_prolongation() with the batches of
+  // setup_prolongation_batches()
+  template<typename AfterLoop>
+  void
+  vmult_scratch_with_prolongation_batches(VectorType &       src,
+                                          const VectorType & fe_correction,
+                                          const AfterLoop &  after_loop) const
+  {
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    if(degree == 1)
+      vmult_scratch_with_prolongation_batches<1>(src, fe_correction, after_loop);
+    else if(degree == 2)
+      vmult_scratch_with_prolongation_batches<2>(src, fe_correction, after_loop);
+    else if(degree == 3)
+      vmult_scratch_with_prolongation_batches<3>(src, fe_correction, after_loop);
+    else if(degree == 4)
+      vmult_scratch_with_prolongation_batches<4>(src, fe_correction, after_loop);
+#ifndef DEBUG
+    else if(degree == 5)
+      vmult_scratch_with_prolongation_batches<5>(src, fe_correction, after_loop);
+    else if(degree == 6)
+      vmult_scratch_with_prolongation_batches<6>(src, fe_correction, after_loop);
+    else if(degree == 7)
+      vmult_scratch_with_prolongation_batches<7>(src, fe_correction, after_loop);
+    else if(degree == 8)
+      vmult_scratch_with_prolongation_batches<8>(src, fe_correction, after_loop);
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  template<int degree, typename AfterLoop>
+  void
+  vmult_scratch_with_prolongation_batches(VectorType &       src,
+                                          const VectorType & fe_correction,
+                                          const AfterLoop &  after_loop) const
+  {
+    Timer              total_timer;
+    const unsigned int n_cell_batches = dof_indices.size();
+    timings[0] += 1;
+
+    fe_correction.update_ghost_values();
+    scratch.prepare_loop();
+    const auto pack_hook = [&](const unsigned int group) {
+      do_prolongate_on_batch<degree>(group, fe_correction, src);
+    };
+    exchange_face_data(src, &pack_hook);
+
+    Timer time;
+    scratch.cell_loop(
+      [&](const unsigned int cell, Number * scratch_array) {
+        for(unsigned int p = prolongation_batch_index[cell]; p < prolongation_batch_index[cell + 1];
+            ++p)
+          do_prolongate_on_batch<degree>(p, fe_correction, src);
+        dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
+      },
+      after_loop);
+    scratch.finish_loop(after_loop, {});
+    fe_correction.zero_out_ghost_values();
+
+    timings[7] += time.wall_time();
+    timings[8] += time.wall_time();
+    timings[9] += total_timer.wall_time();
+    (void)n_cell_batches;
+  }
+
+  // For benchmarking the kernels of the prolongation from the FE vector
+  // fe_correction (with ghost values) into dg, run over all cells in the
+  // order of the cell batches: variant 0 per cell batch as in
+  // prolongate_and_add(), variant 1 with the FE indices gathered into a
+  // separate array as needed for batches of arbitrary cells, variant 2 with
+  // a scalar read per cell and a contiguous update of the DG values
+  void
+  benchmark_prolongation_kernel(const unsigned int                     variant,
+                                const VectorType &                     fe_correction,
+                                const LaplaceOperatorFE<dim, Number> & fe_operator,
+                                VectorType &                           dg) const
+  {
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    if(degree == 2)
+      benchmark_prolongation_kernel<2>(variant, fe_correction, fe_operator, dg);
+    else if(degree == 3)
+      benchmark_prolongation_kernel<3>(variant, fe_correction, fe_operator, dg);
+    else if(degree == 4)
+      benchmark_prolongation_kernel<4>(variant, fe_correction, fe_operator, dg);
+#ifndef DEBUG
+    else if(degree == 5)
+      benchmark_prolongation_kernel<5>(variant, fe_correction, fe_operator, dg);
+    else if(degree == 6)
+      benchmark_prolongation_kernel<6>(variant, fe_correction, fe_operator, dg);
+    else if(degree == 7)
+      benchmark_prolongation_kernel<7>(variant, fe_correction, fe_operator, dg);
+    else if(degree == 8)
+      benchmark_prolongation_kernel<8>(variant, fe_correction, fe_operator, dg);
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  template<int degree>
+  void
+  benchmark_prolongation_kernel(const unsigned int                     variant,
+                                const VectorType &                     fe_correction,
+                                const LaplaceOperatorFE<dim, Number> & fe_operator,
+                                VectorType &                           dg) const
+  {
+    constexpr unsigned int dofs_per_cell  = Utilities::pow(degree + 1, dim);
+    constexpr unsigned int n_stored       = Utilities::pow(3, dim);
+    const unsigned int     n_cell_batches = dof_indices.size();
+    if(variant == 0)
+      for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+        do_prolongate<degree>(cell, fe_correction, fe_operator, dg);
+    else if(variant == 1)
+    {
+      if constexpr(degree > 2)
+      {
+        if(benchmark_fe_indices.empty())
+        {
+          benchmark_fe_indices = fe_operator.get_compressed_dof_indices();
+          benchmark_fe_unconstrained.assign(n_cell_batches * n_stored, 1);
+          for(unsigned int c = 0; c < n_cell_batches; ++c)
+            for(unsigned int i = 0; i < n_stored; ++i)
+              for(unsigned int v = 0; v < n_lanes; ++v)
+                if(benchmark_fe_indices[(c * n_stored + i) * n_lanes + v] ==
+                   numbers::invalid_unsigned_int)
+                  benchmark_fe_unconstrained[c * n_stored + i] = 0;
+          benchmark_dg_starts = dof_indices;
+        }
+        for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+        {
+          VectorizedArray<Number> values[dofs_per_cell];
+          LaplaceOperatorFE<dim, Number>::
+            template read_dof_values_compressed<degree, degree + 1, 1>(fe_correction,
+                                                                       benchmark_fe_indices,
+                                                                       benchmark_fe_unconstrained,
+                                                                       cell,
+                                                                       {},
+                                                                       true,
+                                                                       values);
+          vectorized_transpose_and_store(
+            true, dofs_per_cell, values, benchmark_dg_starts[cell].data(), dg.begin());
+        }
+      }
+      else
+        AssertThrow(false, ExcNotImplemented());
+    }
+    else
+      for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+        for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+        {
+          alignas(64) Number values[dofs_per_cell];
+          fe_operator.template read_cell_values_scalar<degree>(cell, v, fe_correction, values);
+          Number * DEAL_II_RESTRICT dst = dg.begin() + dof_indices[cell][v];
+          DEAL_II_OPENMP_SIMD_PRAGMA
+          for(unsigned int i = 0; i < dofs_per_cell; ++i)
+            dst[i] += values[i];
+        }
   }
 
   void
@@ -2720,15 +3040,22 @@ public:
   }
 
   void
-  evaluate_add_divergence_body_force(const double                  time,
-                                     const dealii::Function<dim> & rhs_function,
-                                     VectorType &                  dst) const
+  evaluate_add_divergence_body_force(
+    const double                                                        time,
+    const dealii::Function<dim> &                                       rhs_function,
+    const std::function<void(const unsigned int, const unsigned int)> & before_loop,
+    VectorType &                                                        dst) const
   {
     const unsigned int n_cell_batches = dof_indices.size();
     const_cast<dealii::Function<dim> &>(rhs_function).set_time(time);
 
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
+      for(unsigned int range = cell_loop_mass_pre_list_index[cell];
+          range < cell_loop_mass_pre_list_index[cell + 1];
+          ++range)
+        before_loop(cell_loop_mass_pre_list[range].first, cell_loop_mass_pre_list[range].second);
+
       const unsigned int degree = shape_info.data[0].fe_degree;
       if(degree == 1)
         do_body_force_on_cell<1>(cell, rhs_function, dst);
@@ -2828,6 +3155,31 @@ private:
   Number factor_laplace;
 
   AlignedVector<std::array<VectorizedArray<Number>, 2 * dim>> penalty_parameters;
+
+  // prolongation batches of arbitrary cells, see
+  // setup_prolongation_batches(): FE indices in the layout of the FE
+  // operator, DG start indices, index into the masks (or invalid), and
+  // the range of batches run before each cell batch (the batches before
+  // prolongation_batch_index[0] are run with the packing of face data)
+  mutable bool                                           prolongation_setup_done  = false;
+  mutable bool                                           use_prolongation_batches = false;
+  mutable std::vector<unsigned int>                      prolongation_fe_indices;
+  mutable std::vector<unsigned char>                     prolongation_fe_unconstrained;
+  mutable std::vector<std::array<unsigned int, n_lanes>> prolongation_dg_starts;
+  mutable std::vector<unsigned int>                      prolongation_mask_index;
+  mutable AlignedVector<VectorizedArray<Number>>         prolongation_masks;
+  mutable std::vector<unsigned int>                      prolongation_batch_index;
+
+  // index arrays of benchmark_prolongation_kernel(), variant 1
+  mutable std::vector<unsigned int>                      benchmark_fe_indices;
+  mutable std::vector<unsigned char>                     benchmark_fe_unconstrained;
+  mutable std::vector<std::array<unsigned int, n_lanes>> benchmark_dg_starts;
+
+  // cell batches with the bit mask of their lanes to prolongate before the
+  // cell batch with the given index or, at index n_cell_batches, before the
+  // exchange of face data, see setup_prolongation_lists()
+  mutable std::vector<unsigned int>                          prolongation_list_index;
+  mutable std::vector<std::pair<unsigned int, unsigned int>> prolongation_list;
 
   std::vector<unsigned int>                          cell_loop_pre_list_index;
   std::vector<std::pair<unsigned int, unsigned int>> cell_loop_pre_list;
@@ -3254,11 +3606,353 @@ private:
 
 
 
-  template<int nn>
+  // Prolongate the lanes given by the bit mask 'lanes' of a cell batch
   void
-  vmult_pack_and_send_data(const VectorType & src) const
+  dispatch_prolongate(const unsigned int                     degree,
+                      const unsigned int                     cell,
+                      const unsigned int                     lanes,
+                      const VectorType &                     fe_correction,
+                      const LaplaceOperatorFE<dim, Number> & fe_operator,
+                      VectorType &                           dg_solution) const
+  {
+    if(degree == 1)
+      do_prolongate_lanes<1>(cell, lanes, fe_correction, fe_operator, dg_solution);
+    else if(degree == 2)
+      do_prolongate_lanes<2>(cell, lanes, fe_correction, fe_operator, dg_solution);
+    else if(degree == 3)
+      do_prolongate_lanes<3>(cell, lanes, fe_correction, fe_operator, dg_solution);
+    else if(degree == 4)
+      do_prolongate_lanes<4>(cell, lanes, fe_correction, fe_operator, dg_solution);
+#ifndef DEBUG
+    else if(degree == 5)
+      do_prolongate_lanes<5>(cell, lanes, fe_correction, fe_operator, dg_solution);
+    else if(degree == 6)
+      do_prolongate_lanes<6>(cell, lanes, fe_correction, fe_operator, dg_solution);
+    else if(degree == 7)
+      do_prolongate_lanes<7>(cell, lanes, fe_correction, fe_operator, dg_solution);
+    else if(degree == 8)
+      do_prolongate_lanes<8>(cell, lanes, fe_correction, fe_operator, dg_solution);
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  // Variant of do_prolongate() for the lanes given by a bit mask, using the
+  // vectorized store if all active lanes are selected
+  template<int degree>
+  void
+  do_prolongate_lanes(const unsigned int                     cell,
+                      const unsigned int                     lanes,
+                      const VectorType &                     fe_correction,
+                      const LaplaceOperatorFE<dim, Number> & fe_operator,
+                      VectorType &                           dg_solution) const
+  {
+    const unsigned int n_active = n_active_entries_per_cell_batch(cell);
+    if(lanes == (1u << n_active) - 1u || (n_active == 32 && lanes == ~0u))
+    {
+      do_prolongate<degree>(cell, fe_correction, fe_operator, dg_solution);
+      return;
+    }
+    constexpr unsigned int  dofs_per_cell = Utilities::pow(degree + 1, dim);
+    VectorizedArray<Number> values_dofs[dofs_per_cell];
+    fe_operator.template read_dof_values<degree>(cell, fe_correction, values_dofs);
+    for(unsigned int v = 0; v < n_active; ++v)
+      if(lanes & (1u << v))
+      {
+        Number * dst = dg_solution.begin() + dof_indices[cell][v];
+        for(unsigned int i = 0; i < dofs_per_cell; ++i)
+          dst[i] += values_dofs[i][v];
+      }
+  }
+
+  // Set up the lists of cell batches to prolongate in
+  // vmult_scratch_with_prolongation(): the batches with face data sent to
+  // other processes at index n_cell_batches (before the exchange), all
+  // others at the first cell batch reading them via the cell or face
+  // integrals
+  void
+  setup_prolongation_lists() const
+  {
+    static_assert(n_lanes <= 32, "Lane mask must fit into 32 bits");
+    const unsigned int        n_cell_batches = dof_indices.size();
+    std::vector<unsigned int> first_reader(n_cell_batches, numbers::invalid_unsigned_int);
+    std::vector<unsigned int> sent_lanes(n_cell_batches, 0);
+    for(const unsigned int cell_lane : send_data_cell_index)
+      sent_lanes[cell_lane / n_lanes] |= 1u << (cell_lane % n_lanes);
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      if(first_reader[cell] == numbers::invalid_unsigned_int)
+        first_reader[cell] = cell;
+      for(unsigned int face = 0; face < 2 * dim; ++face)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+        {
+          const unsigned int neighbor = neighbor_cells[cell][face][v];
+          if(neighbor != numbers::invalid_unsigned_int &&
+             first_reader[neighbor / n_lanes] == numbers::invalid_unsigned_int)
+            first_reader[neighbor / n_lanes] = cell;
+        }
+    }
+
+    // the lanes with face data sent to other processes before the
+    // exchange, the remaining lanes before the first reader
+    std::vector<std::vector<std::pair<unsigned int, unsigned int>>> lists(n_cell_batches + 1);
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      const unsigned int n_active = n_active_entries_per_cell_batch(cell);
+      const unsigned int active   = n_active == 32 ? ~0u : (1u << n_active) - 1u;
+      if(sent_lanes[cell] != 0)
+        lists[n_cell_batches].emplace_back(cell, sent_lanes[cell]);
+      if((active & ~sent_lanes[cell]) != 0)
+        lists[first_reader[cell]].emplace_back(cell, active & ~sent_lanes[cell]);
+    }
+    prolongation_list_index.assign(n_cell_batches + 2, 0);
+    prolongation_list.clear();
+    for(unsigned int i = 0; i <= n_cell_batches; ++i)
+    {
+      prolongation_list.insert(prolongation_list.end(), lists[i].begin(), lists[i].end());
+      prolongation_list_index[i + 1] = prolongation_list.size();
+    }
+
+    // share of cells prolongated before the exchange, for information
+    unsigned int n_cells = 0, n_sent = 0, n_batches_sent = 0;
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      n_cells += n_active_entries_per_cell_batch(cell);
+      n_sent += __builtin_popcount(sent_lanes[cell]);
+      n_batches_sent += sent_lanes[cell] != 0;
+    }
+    const auto cells        = Utilities::MPI::sum(n_cells, MPI_COMM_WORLD);
+    const auto sent         = Utilities::MPI::sum(n_sent, MPI_COMM_WORLD);
+    const auto batches      = Utilities::MPI::sum(n_cell_batches, MPI_COMM_WORLD);
+    const auto batches_sent = Utilities::MPI::sum(n_batches_sent, MPI_COMM_WORLD);
+    if(!is_test && Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+      std::cout << "DG prolongation within the smoother: " << 100. * sent / cells
+                << "% of cells (in " << 100. * batches_sent / batches
+                << "% of cell batches) prolongated before the face exchange" << std::endl;
+  }
+
+  // Prolongate the cells of the prolongation batch p from the FE vector
+  // fe_correction (with ghost values) into dg, see
+  // setup_prolongation_batches()
+  template<int degree>
+  void
+  do_prolongate_on_batch(const unsigned int p,
+                         const VectorType & fe_correction,
+                         VectorType &       dg) const
+  {
+    constexpr unsigned int  dofs_per_cell = Utilities::pow(degree + 1, dim);
+    VectorizedArray<Number> values[dofs_per_cell];
+    if constexpr(degree <= 2)
+    {
+      const unsigned int *  indices = prolongation_fe_indices.data() + p * dofs_per_cell * n_lanes;
+      const unsigned char * unconstrained =
+        prolongation_fe_unconstrained.data() + p * dofs_per_cell;
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        if(unconstrained[i])
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            values[i][v] = fe_correction.local_element(indices[i * n_lanes + v]);
+        else
+        {
+          values[i] = 0.;
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            if(indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+              values[i][v] = fe_correction.local_element(indices[i * n_lanes + v]);
+        }
+    }
+    else
+      LaplaceOperatorFE<dim, Number>::template read_dof_values_compressed<degree, degree + 1, 1>(
+        fe_correction, prolongation_fe_indices, prolongation_fe_unconstrained, p, {}, true, values);
+    const unsigned int mask = prolongation_mask_index[p];
+    if(mask != numbers::invalid_unsigned_int)
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        values[i] *= prolongation_masks[mask];
+    vectorized_transpose_and_store(
+      true, dofs_per_cell, values, prolongation_dg_starts[p].data(), dg.begin());
+  }
+
+  // Set up the prolongation batches of vmult_scratch_with_prolongation():
+  // batches of arbitrary cells, given by cell batch and lane, with their FE
+  // indices gathered from the FE operator. First, one batch per group of
+  // faces packed for other processes, in the order of
+  // vmult_pack_and_send_data(), run right before the group is read; a cell
+  // already prolongated in an earlier group is masked out with a factor 0.
+  // Then the remaining cells in the order of the first cell batch reading
+  // them via the cell or face integrals, in batches run before that cell
+  // batch and filled with cells read up to 'look-ahead' cell batches later.
+  // Unused lanes repeat the first lane with a factor 0.
+  void
+  setup_prolongation_batches(const LaplaceOperatorFE<dim, Number> & fe_operator) const
+  {
+    const unsigned int                n_cell_batches = dof_indices.size();
+    const unsigned int                degree         = shape_info.data[0].fe_degree;
+    const unsigned int                n_stored = Utilities::pow(degree <= 2 ? degree + 1 : 3, dim);
+    const std::vector<unsigned int> & fe_indices = fe_operator.get_compressed_dof_indices();
+    unsigned int                      look_ahead = 2;
+    if(const char * value = std::getenv("EXADG_PROLONGATION_LOOKAHEAD"))
+      look_ahead = std::atoi(value);
+
+    prolongation_fe_indices.clear();
+    prolongation_dg_starts.clear();
+    prolongation_mask_index.clear();
+    prolongation_masks.clear();
+    const auto add_batch = [&](const std::vector<unsigned int> & cells,
+                               const std::vector<bool> &         active) {
+      AssertThrow(!cells.empty() && cells.size() <= n_lanes, ExcInternalError());
+      std::array<unsigned int, n_lanes> starts;
+      VectorizedArray<Number>           mask      = 1.;
+      bool                              need_mask = false;
+      for(unsigned int v = 0; v < n_lanes; ++v)
+      {
+        const unsigned int cell_lane = cells[v < cells.size() ? v : 0];
+        const bool         is_active = v < cells.size() && active[v];
+        starts[v]                    = dof_indices[cell_lane / n_lanes][cell_lane % n_lanes];
+        if(!is_active)
+        {
+          mask[v]   = 0.;
+          need_mask = true;
+        }
+      }
+      const unsigned int p = prolongation_dg_starts.size();
+      prolongation_dg_starts.push_back(starts);
+      prolongation_fe_indices.resize((p + 1) * n_stored * n_lanes);
+      for(unsigned int i = 0; i < n_stored; ++i)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+        {
+          const unsigned int cell_lane = cells[v < cells.size() ? v : 0];
+          prolongation_fe_indices[(p * n_stored + i) * n_lanes + v] =
+            fe_indices[((cell_lane / n_lanes) * n_stored + i) * n_lanes + cell_lane % n_lanes];
+        }
+      if(need_mask)
+      {
+        prolongation_mask_index.push_back(prolongation_masks.size());
+        prolongation_masks.push_back(mask);
+      }
+      else
+        prolongation_mask_index.push_back(numbers::invalid_unsigned_int);
+    };
+
+    // groups of the packing loop
+    std::vector<char> done(n_cell_batches * n_lanes, 0);
+    unsigned int      n_pack_lanes = 0, n_pack_repeated = 0;
+    if(factor_laplace != 0. && Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) > 1)
+    {
+      unsigned int offset = 0;
+      for(unsigned int p = 0; p < send_data_process.size(); ++p)
+      {
+        const unsigned int my_faces = send_data_process[p].second;
+        for(unsigned int count = offset; count < offset + my_faces;)
+        {
+          // same grouping as in vmult_pack_and_send_data()
+          const unsigned int face    = send_data_face_index[count];
+          unsigned int       n_faces = 1;
+          if(count + n_lanes <= offset + my_faces &&
+             send_data_face_index[count + n_lanes - 1] == face)
+            n_faces = n_lanes;
+          else
+            while(count + n_faces < offset + my_faces &&
+                  send_data_face_index[count + n_faces] == face)
+              ++n_faces;
+          std::vector<unsigned int> cells;
+          std::vector<bool>         active;
+          for(unsigned int v = 0; v < n_faces; ++v, ++count)
+          {
+            const unsigned int cell_lane = send_data_cell_index[count];
+            cells.push_back(cell_lane);
+            active.push_back(!done[cell_lane]);
+            n_pack_repeated += done[cell_lane];
+            done[cell_lane] = 1;
+          }
+          n_pack_lanes += n_faces;
+          add_batch(cells, active);
+        }
+        offset += my_faces;
+      }
+    }
+    const unsigned int n_pack_batches = prolongation_dg_starts.size();
+
+    // first reader of each remaining cell
+    std::vector<unsigned int> first_reader(n_cell_batches * n_lanes, numbers::invalid_unsigned_int);
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+        first_reader[cell * n_lanes + v] = std::min(first_reader[cell * n_lanes + v], cell);
+      for(unsigned int face = 0; face < 2 * dim; ++face)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+        {
+          const unsigned int neighbor = neighbor_cells[cell][face][v];
+          if(neighbor != numbers::invalid_unsigned_int)
+            first_reader[neighbor] = std::min(first_reader[neighbor], cell);
+        }
+    }
+    std::vector<std::pair<unsigned int, unsigned int>> order;
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+      for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+        if(!done[cell * n_lanes + v])
+          order.emplace_back(first_reader[cell * n_lanes + v], cell * n_lanes + v);
+    std::sort(order.begin(), order.end());
+
+    // batches in the loop, run before the first reader of their first cell
+    std::vector<unsigned int> batch_slot;
+    unsigned int              n_partial = 0;
+    for(unsigned int i = 0; i < order.size();)
+    {
+      const unsigned int        reader = order[i].first;
+      std::vector<unsigned int> cells;
+      while(i < order.size() && cells.size() < n_lanes && order[i].first <= reader + look_ahead)
+        cells.push_back(order[i++].second);
+      n_partial += cells.size() < n_lanes;
+      add_batch(cells, std::vector<bool>(cells.size(), true));
+      batch_slot.push_back(reader);
+    }
+    prolongation_batch_index.assign(n_cell_batches + 1, n_pack_batches);
+    {
+      std::vector<unsigned int> count(n_cell_batches + 1, 0);
+      for(const unsigned int slot : batch_slot)
+        ++count[slot + 1];
+      for(unsigned int c = 0; c < n_cell_batches; ++c)
+        prolongation_batch_index[c + 1] = prolongation_batch_index[c] + count[c + 1];
+      // the batches are created in the order of their slot
+      for(unsigned int b = 1; b < batch_slot.size(); ++b)
+        AssertThrow(batch_slot[b] >= batch_slot[b - 1], ExcInternalError());
+    }
+
+    prolongation_fe_unconstrained.assign(prolongation_dg_starts.size() * n_stored, 1);
+    for(unsigned int p = 0; p < prolongation_dg_starts.size(); ++p)
+      for(unsigned int i = 0; i < n_stored; ++i)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          if(prolongation_fe_indices[(p * n_stored + i) * n_lanes + v] ==
+             numbers::invalid_unsigned_int)
+            prolongation_fe_unconstrained[p * n_stored + i] = 0;
+
+    // statistics
+    unsigned int n_cells = 0;
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+      n_cells += n_active_entries_per_cell_batch(cell);
+    const auto sum = [](const unsigned int value) {
+      return Utilities::MPI::sum(value, MPI_COMM_WORLD);
+    };
+    const unsigned int cells_total = sum(n_cells), pack_lanes = sum(n_pack_lanes),
+                       pack_repeated = sum(n_pack_repeated), pack_batches = sum(n_pack_batches),
+                       loop_batches = sum(batch_slot.size()), partial = sum(n_partial),
+                       batches_total = sum(n_cell_batches);
+    if(!is_test && Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+      std::cout << "DG prolongation batches within the smoother: " << pack_batches
+                << " with packed faces (" << pack_lanes << " lanes, " << pack_repeated
+                << " repeated cells), " << loop_batches << " in the loop (" << partial
+                << " partial, look-ahead " << look_ahead << "), for " << cells_total << " cells in "
+                << batches_total << " cell batches" << std::endl;
+  }
+
+  // Pack the face data sent to other processes and send it. If given,
+  // 'pack_hook(group)' is called before the cells of each group of faces
+  // read together are read, with the groups numbered over all processes in
+  // the order of this loop (see setup_prolongation_batches()).
+  template<int nn, typename PackHook = std::nullptr_t>
+  void
+  vmult_pack_and_send_data(const VectorType & src, const PackHook * pack_hook = nullptr) const
   {
     constexpr int data_per_face = 2 * Utilities::pow(nn, dim - 1);
+    unsigned int  group         = 0;
 
     std::array<VectorizedArray<Number>, 2 * nn * nn> tmp_vec;
 
@@ -3299,6 +3993,9 @@ private:
         {
           dof_indices_vec[v] = dof_indices_vec[0];
         }
+        if constexpr(!std::is_same_v<PackHook, std::nullptr_t>)
+          (*pack_hook)(group);
+        ++group;
         read_face_values<nn>(src.begin(), face, dof_indices_vec, tmp_vec.data());
 
         // copy to dedicated data field
@@ -3325,8 +4022,9 @@ private:
 
   // Send and receive the data of src on the faces to other processes
   // needed for the face integrals
+  template<typename PackHook = std::nullptr_t>
   void
-  exchange_face_data(const VectorType & src) const
+  exchange_face_data(const VectorType & src, const PackHook * pack_hook = nullptr) const
   {
     Timer time;
     // only do the data exchange for face integral if we have Laplacian contribution
@@ -3353,22 +4051,22 @@ private:
       AssertDimension(offset * data_per_face, import_values.size());
 
       if(nn == 2)
-        vmult_pack_and_send_data<2>(src);
+        vmult_pack_and_send_data<2>(src, pack_hook);
       else if(nn == 3)
-        vmult_pack_and_send_data<3>(src);
+        vmult_pack_and_send_data<3>(src, pack_hook);
       else if(nn == 4)
-        vmult_pack_and_send_data<4>(src);
+        vmult_pack_and_send_data<4>(src, pack_hook);
 #ifndef DEBUG
       else if(nn == 5)
-        vmult_pack_and_send_data<5>(src);
+        vmult_pack_and_send_data<5>(src, pack_hook);
       else if(nn == 6)
-        vmult_pack_and_send_data<6>(src);
+        vmult_pack_and_send_data<6>(src, pack_hook);
       else if(nn == 7)
-        vmult_pack_and_send_data<7>(src);
+        vmult_pack_and_send_data<7>(src, pack_hook);
       else if(nn == 8)
-        vmult_pack_and_send_data<8>(src);
+        vmult_pack_and_send_data<8>(src, pack_hook);
       else if(nn == 9)
-        vmult_pack_and_send_data<9>(src);
+        vmult_pack_and_send_data<9>(src, pack_hook);
 #endif
       else
         AssertThrow(false, ExcNotImplemented());
