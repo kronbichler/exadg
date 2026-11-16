@@ -1,0 +1,140 @@
+Raviart-Thomas degree 2, double, 96 cells, 2208 unconstrained DoFs
+ factor mass 1, factor Laplace 0
+  interior DoFs, cells away from walls (576)    : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (576)           : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (288)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+ factor mass 0, factor Laplace 1
+  interior DoFs, cells away from walls (576)    : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (576)           : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (288)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+ factor mass 2.5, factor Laplace 0.3
+  interior DoFs, cells away from walls (576)    : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (576)           : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (288)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+
+Raviart-Thomas degree 2, float, 96 cells, 2208 unconstrained DoFs
+ factor mass 1, factor Laplace 0
+  interior DoFs, cells away from walls (576)    : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (576)           : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (288)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+ factor mass 0, factor Laplace 1
+  interior DoFs, cells away from walls (576)    : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (576)           : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (288)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+ factor mass 2.5, factor Laplace 0.3
+  interior DoFs, cells away from walls (576)    : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (576)           : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (288)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (384)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+
+Raviart-Thomas degree 3, double, 96 cells, 7560 unconstrained DoFs
+ factor mass 1, factor Laplace 0
+  interior DoFs, cells away from walls (2592)   : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (2592)          : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (648)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+ factor mass 0, factor Laplace 1
+  interior DoFs, cells away from walls (2592)   : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (2592)          : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (648)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+ factor mass 2.5, factor Laplace 0.3
+  interior DoFs, cells away from walls (2592)   : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (2592)          : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (648)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+
+Raviart-Thomas degree 3, float, 96 cells, 7560 unconstrained DoFs
+ factor mass 1, factor Laplace 0
+  interior DoFs, cells away from walls (2592)   : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (2592)          : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (648)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+ factor mass 0, factor Laplace 1
+  interior DoFs, cells away from walls (2592)   : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (2592)          : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (648)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+ factor mass 2.5, factor Laplace 0.3
+  interior DoFs, cells away from walls (2592)   : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  interior DoFs, cells at walls (2592)          : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal x (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal y (648)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+  face DoFs, normal z (864)                     : OK
+    ratio diagonal / reference in [1.000, 1.000]
+

@@ -23,12 +23,14 @@
 
 #include <deal.II/base/floating_point_comparator.h>
 #include <deal.II/base/memory_space_data.h>
+#include <deal.II/base/timer.h>
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/fe/fe.h>
 #include <deal.II/fe/fe_nothing.h>
 #include <deal.II/fe/fe_raviart_thomas.h>
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/lac/affine_constraints.h>
+#include <deal.II/matrix_free/evaluation_kernels.h>
 #include <deal.II/matrix_free/matrix_free.h>
 #include <deal.II/matrix_free/tensor_product_kernels.h>
 
@@ -4123,11 +4125,9 @@ private:
                     const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dst_indices,
                     Number *                                                    dst) const
   {
-    constexpr unsigned int dofs_per_component = Utilities::pow(degree, dim - 1) * (degree + 1);
-    constexpr unsigned int dofs_per_cell      = dim * dofs_per_component;
-    constexpr unsigned int n_q_points_1d      = degree + 1;
-    constexpr unsigned int n_points           = Utilities::pow(n_q_points_1d, dim);
-    const auto &           shape_data         = shape_info.data;
+    constexpr unsigned int n_q_points_1d = degree + 1;
+    constexpr unsigned int n_points      = Utilities::pow(n_q_points_1d, dim);
+    const auto &           shape_data    = shape_info.data;
 
     VectorizedArray<Number> quad_values[dim * n_points], out_values[dim * n_points];
     if(compute_exterior)
@@ -4165,107 +4165,552 @@ private:
                                                     dst);
     }
     else
+      compute_diagonal_cell<degree>(cell, dst_indices, dst);
+  }
+
+  // Compute the diagonal of the operator on a cell batch and add it into
+  // 'dst' at the positions given by 'dst_indices'.
+  //
+  // A DoF of component d only produces the value and the three derivatives
+  // of component d, w = (u_d, du_d/dx, du_d/dy, du_d/dz) in reference
+  // coordinates, and each of them is a product of 1D functions. At each
+  // quadrature point, the cell integrand is a symmetric bilinear form in w,
+  // whose 4x4 matrix is obtained by applying helmholtz_point_operation() to
+  // the four unit vectors. As the geometry of the extruded mesh only depends
+  // on the position in the xy plane, the forms are computed for the points
+  // in the xy plane with unit weight in z direction, and the z direction
+  // enters via 1D integrals. The diagonal then follows from a sum
+  // factorization of the forms against products of 1D shape functions.
+  //
+  // The face integrals are treated in the same way, with the exterior value
+  // set to zero on interior faces (the DoFs of the neighbor are not
+  // involved) and to the mirrored interior value on boundary faces, as in the
+  // matrix-vector product. The DoFs of the normal component on the faces are
+  // shared between the two adjacent cells, and their diagonal entry includes
+  // the face integrals with the trial function on one side and the test
+  // function on the other side. These cross terms are computed by the cell
+  // that sees the face as its face 2*d+1 (in the upper direction), for both
+  // orders of trial and test side.
+  template<int degree>
+  void
+  compute_diagonal_cell(const unsigned int                                          cell,
+                        const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dst_indices,
+                        Number *                                                    dst) const
+  {
+    static_assert(dim == 3, "Only implemented for 3D");
+    using VA                                  = VectorizedArray<Number>;
+    constexpr unsigned int nq                 = degree + 1;
+    constexpr unsigned int n_n                = degree + 1;
+    constexpr unsigned int n_t                = degree;
+    constexpr unsigned int dofs_per_component = n_t * n_t * n_n;
+    const auto &           shape_data         = shape_info.data;
+    const Number           h_z                = mapping_info.h_z;
+    const Number           h_z_inverse        = mapping_info.h_z_inverse;
+    const bool             with_laplace       = this->factor_laplace != 0;
+
+    // 1D tables of the normal (b = 0) and tangential (b = 1) shape
+    // functions: products at the quadrature points (c = 0: phi_i * phi_i,
+    // c = 1: phi_i * phi_i', c = 2: phi_i' * phi_i'), values and derivatives
+    // at the two ends of the unit interval, and the integrals of the
+    // products in z direction including the quadrature weights
+    Number products[2][3][n_n * nq];
+    Number values[2][n_n * nq], derivatives[2][n_n * nq];
+    Number trace_value[2][2][n_n], trace_derivative[2][2][n_n];
+    Number z_integral[2][3][n_n];
+    for(unsigned int b = 0; b < 2; ++b)
     {
-      // TODO: Do we include the cross terms between the two cells that
-      // share face DoFs (as the RT space is continuous in normal direction),
-      // and the associated Dirichlet values? Check this carefully.
-      VectorizedArray<Number> diagonal[dofs_per_cell];
-      for(unsigned int d = 0; d < dim; ++d)
-        for(unsigned int i = 0; i < dofs_per_component; ++i)
+      const unsigned int n_dofs = b == 0 ? n_n : n_t;
+      AssertDimension(shape_data[b].shape_values.size(), n_dofs * nq);
+      for(unsigned int i = 0; i < n_dofs; ++i)
+      {
+        for(unsigned int q = 0; q < nq; ++q)
         {
+          const Number v             = shape_data[b].shape_values[i * nq + q];
+          const Number g             = shape_data[b].shape_gradients[i * nq + q];
+          values[b][i * nq + q]      = v;
+          derivatives[b][i * nq + q] = g;
+          products[b][0][i * nq + q] = v * v;
+          products[b][1][i * nq + q] = v * g;
+          products[b][2][i * nq + q] = g * g;
+        }
+        for(unsigned int c = 0; c < 3; ++c)
+        {
+          Number sum = 0;
+          for(unsigned int q = 0; q < nq; ++q)
+            sum += mapping_info.quad_weights_z[q] * products[b][c][i * nq + q];
+          z_integral[b][c][i] = sum;
+        }
+        // interpolation to the ends in the same way as in compute_face()
+        for(unsigned int side = 0; side < 2; ++side)
+        {
+          Number value = 0, derivative = 0;
+          for(unsigned int q = 0; q < nq; ++q)
           {
-            internal::EvaluatorTensorProductAnisotropic<dim, degree, n_q_points_1d, true> eval;
-            for(unsigned int j = 0; j < dofs_per_component; ++j)
-              out_values[j] = 0;
-            out_values[i] = 1;
-            if(d == 0)
-            {
-              // always put the data last for the component in question,
-              // the rest will be zero
-              VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
-              eval.template normal<0>(shape_data[0], out_values, values);
-              eval.template tangential<1, 0>(shape_data[1], values, values);
-              if constexpr(dim > 2)
-                eval.template tangential<2, 0>(shape_data[1], values, values);
-            }
-            else if(d == 1)
-            {
-              VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
-              eval.template normal<1>(shape_data[0], out_values, values);
-              eval.template tangential<0, 1>(shape_data[1], values, values);
-              if constexpr(dim > 2)
-                eval.template tangential<2, 1>(shape_data[1], values, values);
-            }
-            else if(d == 2)
-            {
-              VectorizedArray<Number> * values = quad_values + (dim - 1) * n_points;
-
-              eval.template normal<2>(shape_data[0], out_values, values);
-              eval.template tangential<0, 2>(shape_data[1], values, values);
-              eval.template tangential<1, 2>(shape_data[1], values, values);
-            }
+            value += interpolate_quad_to_boundary[side][q][0] * values[b][i * nq + q];
+            derivative += interpolate_quad_to_boundary[side][q][1] * values[b][i * nq + q];
           }
+          trace_value[b][side][i]      = value;
+          trace_derivative[b][side][i] = derivative;
+        }
+      }
+    }
+    // product of type c of the trace values at one end
+    const auto trace_product = [&](const unsigned int b,
+                                   const unsigned int side,
+                                   const unsigned int c,
+                                   const unsigned int i) {
+      const Number v = trace_value[b][side][i];
+      const Number g = trace_derivative[b][side][i];
+      return c == 0 ? v * v : (c == 1 ? v * g : g * g);
+    };
 
-          for(unsigned int i = 0; i < n_points; ++i)
+    // number of the 1D basis and number of DoFs in direction k for
+    // component d
+    const auto basis  = [](const unsigned int d, const unsigned int k) { return k == d ? 0U : 1U; };
+    const auto n_dofs = [](const unsigned int d, const unsigned int k) {
+      return k == d ? n_n : n_t;
+    };
+    const auto index = [&](const unsigned int d,
+                           const unsigned int i0,
+                           const unsigned int i1,
+                           const unsigned int i2) {
+      return d * dofs_per_component + (i2 * n_dofs(d, 1) + i1) * n_dofs(d, 0) + i0;
+    };
+
+    VA diagonal[dim * dofs_per_component];
+    for(unsigned int i = 0; i < dim * dofs_per_component; ++i)
+      diagonal[i] = Number(0);
+
+    // ---------------- cell integrals ----------------
+    std::array<unsigned int, n_lanes> shifted_data_indices, shifted_data_indices_gr;
+    for(unsigned int v = 0; v < n_lanes; ++v)
+    {
+      shifted_data_indices[v]    = mapping_info.mapping_data_index[cell][v] * 4;
+      shifted_data_indices_gr[v] = mapping_info.mapping_data_index[cell][v] * 6;
+    }
+
+    // pairs (a, b) with a <= b of the entries of w = (value, d/dx, d/dy,
+    // d/dz), only the first one (value, value) for the mass matrix
+    constexpr unsigned int pairs[10][2] = {
+      {0, 0}, {0, 1}, {0, 2}, {0, 3}, {1, 1}, {1, 2}, {1, 3}, {2, 2}, {2, 3}, {3, 3}};
+    const unsigned int n_pairs = with_laplace ? 10 : 1;
+
+    for(unsigned int d = 0; d < dim; ++d)
+    {
+      // restricted forms at the points of the xy plane, with the
+      // off-diagonal entries counted twice
+      VA form[10][nq * nq];
+      for(unsigned int q1 = 0; q1 < nq * nq; ++q1)
+      {
+        const PointGeometryXY geometry =
+          load_point_geometry(mapping_info, shifted_data_indices, shifted_data_indices_gr, q1);
+        VA response[4][4];
+        for(unsigned int b = 0; b < (with_laplace ? 4 : 1); ++b)
+        {
+          VA val[3], grad[3][3];
+          for(unsigned int e = 0; e < 3; ++e)
           {
-            quad_values[i * dim + d] = quad_values[(dim - 1) * n_points + i];
-            for(unsigned int e = 0; e < dim; ++e)
-              if(e != d)
-                quad_values[i * dim + e] = 0;
+            val[e] = Number(0);
+            for(unsigned int f = 0; f < 3; ++f)
+              grad[e][f] = Number(0);
           }
-
-          if(factor_laplace != 0)
-          {
-            compute_cell<CellOperation::helmholtz, n_q_points_1d>(shape_data,
-                                                                  cell,
-                                                                  quad_values,
-                                                                  out_values);
-            for(unsigned int f = 0; f < 2 * dim; ++f)
-              compute_face<degree, false>(shape_data, src, cell, f, quad_values, out_values);
-          }
+          if(b == 0)
+            val[d] = Number(1);
           else
-            compute_cell_mass<n_q_points_1d>(cell, this->factor_mass, quad_values, out_values);
+            grad[d][b - 1] = Number(1);
+          VA test_value[3], test_grad[3][3];
+          helmholtz_point_operation(geometry,
+                                    mapping_info.quad_weights_xy[q1],
+                                    Number(1),
+                                    h_z,
+                                    h_z_inverse,
+                                    val,
+                                    grad,
+                                    test_value,
+                                    test_grad);
+          response[0][b] = test_value[d];
+          for(unsigned int e = 0; e < 3; ++e)
+            response[1 + e][b] = test_grad[e][d];
+        }
+        for(unsigned int p = 0; p < n_pairs; ++p)
+        {
+          const unsigned int a = pairs[p][0], b = pairs[p][1];
+          form[p][q1] = a == b ? response[a][a] : response[a][b] + response[b][a];
+        }
+      }
 
-          for(unsigned int i = 0; i < n_points; ++i)
-            quad_values[i] = out_values[i * dim + d];
+      // contract with the 1D products: x direction, y direction, and the
+      // z integrals
+      const unsigned int n0 = n_dofs(d, 0), n1 = n_dofs(d, 1), n2 = n_dofs(d, 2);
+      for(unsigned int p = 0; p < n_pairs; ++p)
+      {
+        unsigned int c[3];
+        for(unsigned int k = 0; k < 3; ++k)
+          c[k] = (pairs[p][0] == k + 1) + (pairs[p][1] == k + 1);
+        const Number * table_x = products[basis(d, 0)][c[0]];
+        const Number * table_y = products[basis(d, 1)][c[1]];
+        const Number * table_z = z_integral[basis(d, 2)][c[2]];
 
+        VA tmp[n_n * nq];
+        for(unsigned int i0 = 0; i0 < n0; ++i0)
+          for(unsigned int qy = 0; qy < nq; ++qy)
           {
-            internal::EvaluatorTensorProductAnisotropic<dim, degree, n_q_points_1d, false> eval;
-            VectorizedArray<Number> * values = quad_values;
+            VA sum = table_x[i0 * nq] * form[p][qy * nq];
+            for(unsigned int qx = 1; qx < nq; ++qx)
+              sum += table_x[i0 * nq + qx] * form[p][qy * nq + qx];
+            tmp[i0 * nq + qy] = sum;
+          }
+        for(unsigned int i1 = 0; i1 < n1; ++i1)
+          for(unsigned int i0 = 0; i0 < n0; ++i0)
+          {
+            VA sum = table_y[i1 * nq] * tmp[i0 * nq];
+            for(unsigned int qy = 1; qy < nq; ++qy)
+              sum += table_y[i1 * nq + qy] * tmp[i0 * nq + qy];
+            for(unsigned int i2 = 0; i2 < n2; ++i2)
+              diagonal[index(d, i0, i1, i2)] += table_z[i2] * sum;
+          }
+      }
+    }
 
-            if(d == 0)
+    if(with_laplace)
+    {
+      // ---------------- one-sided face integrals ----------------
+      for(unsigned int f = 0; f < 2 * dim; ++f)
+      {
+        const unsigned int face_direction = f / 2;
+        const unsigned int side           = f % 2;
+
+        VA boundary_mask;
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          boundary_mask[v] =
+            neighbor_cells[cell][f][v] == numbers::invalid_unsigned_int ? Number(-1) : Number(0);
+        const VA sigmaF = penalty_parameters[cell][f] * this->factor_laplace;
+
+        if(face_direction < 2)
+        {
+          // in-plane tangential direction
+          const unsigned int        t                = 1 - face_direction;
+          const FaceGeometryIndices indices          = get_face_geometry_indices(cell, f);
+          constexpr unsigned int    face_pairs[6][2] = {
+            {0, 0}, {0, 1}, {0, 2}, {1, 1}, {1, 2}, {2, 2}};
+          for(unsigned int d = 0; d < dim; ++d)
+          {
+            // forms of (value, d/dx, d/dy) at the points along the
+            // tangential direction, unit weight in z direction
+            VA form[6][nq];
+            for(unsigned int q1 = 0; q1 < nq; ++q1)
             {
-              if constexpr(dim > 2)
-                eval.template tangential<2, 0>(shape_data[1], values, values);
-              eval.template tangential<1, 0>(shape_data[1], values, values);
-              eval.template normal<0>(shape_data[0], values, values);
-              diagonal[i] = values[i];
+              const FaceGeometryXY geometry =
+                load_face_geometry<false>(indices, face_direction, q1);
+              const VA integrate_factor =
+                mapping_info.quad_weights_z[q1] * geometry.area_element_xy;
+              VA response[3][3];
+              for(unsigned int b = 0; b < 3; ++b)
+              {
+                VA val[2][3], grad[2][3][2];
+                for(unsigned int s = 0; s < 2; ++s)
+                  for(unsigned int e = 0; e < 3; ++e)
+                  {
+                    val[s][e]     = Number(0);
+                    grad[s][e][0] = Number(0);
+                    grad[s][e][1] = Number(0);
+                  }
+                if(b == 0)
+                  val[0][d] = Number(1);
+                else
+                  grad[0][d][b - 1] = Number(1);
+                viscous_face_point_operation_xy<false, true, false>(
+                  geometry,
+                  integrate_factor,
+                  sigmaF,
+                  boundary_mask,
+                  h_z,
+                  h_z_inverse,
+                  val,
+                  grad,
+                  [&](const unsigned int, const VA * test_value, const VA(*test_grad)[2]) {
+                    response[0][b] = test_value[d];
+                    response[1][b] = test_grad[d][0];
+                    response[2][b] = test_grad[d][1];
+                  });
+              }
+              for(unsigned int p = 0; p < 6; ++p)
+              {
+                const unsigned int a = face_pairs[p][0], b = face_pairs[p][1];
+                form[p][q1] = a == b ? response[a][a] : response[a][b] + response[b][a];
+              }
             }
 
-            if(d == 1)
+            const unsigned int n_normal = n_dofs(d, face_direction);
+            const unsigned int n_tang   = n_dofs(d, t);
+            const unsigned int n2       = n_dofs(d, 2);
+            for(unsigned int p = 0; p < 6; ++p)
             {
-              if constexpr(dim > 2)
-                eval.template tangential<2, 1>(shape_data[1], values, values);
-              eval.template tangential<0, 1>(shape_data[1], values, values);
-              eval.template normal<1>(shape_data[0], values, values);
-              diagonal[dofs_per_component + i] = values[i];
-            }
-
-            if(d == 2)
-            {
-              eval.template tangential<1, 2>(shape_data[1], values, values);
-              eval.template tangential<0, 2>(shape_data[1], values, values);
-              eval.template normal<2>(shape_data[0], values, values);
-              diagonal[2 * dofs_per_component + i] = values[i];
+              unsigned int c[2];
+              for(unsigned int k = 0; k < 2; ++k)
+                c[k] = (face_pairs[p][0] == k + 1) + (face_pairs[p][1] == k + 1);
+              const Number * table_t = products[basis(d, t)][c[t]];
+              const Number * table_z = z_integral[basis(d, 2)][0];
+              for(unsigned int it = 0; it < n_tang; ++it)
+              {
+                VA sum = table_t[it * nq] * form[p][0];
+                for(unsigned int q1 = 1; q1 < nq; ++q1)
+                  sum += table_t[it * nq + q1] * form[p][q1];
+                for(unsigned int in = 0; in < n_normal; ++in)
+                {
+                  const VA factor =
+                    trace_product(basis(d, face_direction), side, c[face_direction], in) * sum;
+                  for(unsigned int i2 = 0; i2 < n2; ++i2)
+                    diagonal[face_direction == 0 ? index(d, in, it, i2) : index(d, it, in, i2)] +=
+                      table_z[i2] * factor;
+                }
+              }
             }
           }
         }
-      distribute_local_to_global_rt_compressed<dim, degree>(diagonal,
-                                                            n_active_entries_per_cell_batch(cell),
-                                                            dst_indices,
-                                                            dst);
+        else
+        {
+          const Number normal_sign = side ? 1 : -1;
+          for(unsigned int d = 0; d < dim; ++d)
+          {
+            // forms of (value, d/dz) at the points of the xy plane
+            VA form[3][nq * nq];
+            for(unsigned int q = 0; q < nq * nq; ++q)
+            {
+              Tensor<2, 2, VA> jac_xy;
+              vectorized_load_and_transpose(4,
+                                            &mapping_info.jacobians_xy[q][0][0],
+                                            shifted_data_indices.data(),
+                                            &jac_xy[0][0]);
+              VA response[2][2];
+              for(unsigned int b = 0; b < 2; ++b)
+              {
+                VA val[2][3], grad[2][3];
+                for(unsigned int s = 0; s < 2; ++s)
+                  for(unsigned int e = 0; e < 3; ++e)
+                  {
+                    val[s][e]  = Number(0);
+                    grad[s][e] = Number(0);
+                  }
+                if(b == 0)
+                  val[0][d] = Number(1);
+                else
+                  grad[0][d] = Number(1);
+                VA test_value[3], test_grad[3];
+                viscous_face_point_operation_z<false>(jac_xy,
+                                                      mapping_info.quad_weights_xy[q],
+                                                      normal_sign,
+                                                      sigmaF,
+                                                      h_z_inverse,
+                                                      val,
+                                                      grad,
+                                                      test_value,
+                                                      test_grad);
+                response[0][b] = test_value[d];
+                response[1][b] = test_grad[d];
+              }
+              form[0][q] = response[0][0];
+              form[1][q] = response[0][1] + response[1][0];
+              form[2][q] = response[1][1];
+            }
+
+            const unsigned int n0 = n_dofs(d, 0), n1 = n_dofs(d, 1), n2 = n_dofs(d, 2);
+            const Number *     table_x = products[basis(d, 0)][0];
+            const Number *     table_y = products[basis(d, 1)][0];
+            for(unsigned int p = 0; p < 3; ++p)
+            {
+              VA tmp[n_n * nq];
+              for(unsigned int i0 = 0; i0 < n0; ++i0)
+                for(unsigned int qy = 0; qy < nq; ++qy)
+                {
+                  VA sum = table_x[i0 * nq] * form[p][qy * nq];
+                  for(unsigned int qx = 1; qx < nq; ++qx)
+                    sum += table_x[i0 * nq + qx] * form[p][qy * nq + qx];
+                  tmp[i0 * nq + qy] = sum;
+                }
+              for(unsigned int i1 = 0; i1 < n1; ++i1)
+                for(unsigned int i0 = 0; i0 < n0; ++i0)
+                {
+                  VA sum = table_y[i1 * nq] * tmp[i0 * nq];
+                  for(unsigned int qy = 1; qy < nq; ++qy)
+                    sum += table_y[i1 * nq + qy] * tmp[i0 * nq + qy];
+                  for(unsigned int i2 = 0; i2 < n2; ++i2)
+                    diagonal[index(d, i0, i1, i2)] += trace_product(basis(d, 2), side, p, i2) * sum;
+                }
+            }
+          }
+        }
+      }
+
+      // ---------------- cross terms of shared face DoFs ----------------
+      // Values and derivatives of the shared normal shape function: on this
+      // cell the function at the upper end (index n_t), on the neighbor the
+      // one at the lower end (index 0). As in compute_face(), the value and
+      // the tangential derivatives are the ones of this cell on both sides.
+      const Number value_shared     = trace_value[0][1][n_t];
+      const Number derivative_minus = trace_derivative[0][1][n_t];
+      const Number derivative_plus  = trace_derivative[0][0][0];
+      for(unsigned int face_direction = 0; face_direction < dim; ++face_direction)
+      {
+        const unsigned int f = 2 * face_direction + 1;
+        const unsigned int d = face_direction;
+
+        VA interior_face;
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          interior_face[v] =
+            neighbor_cells[cell][f][v] == numbers::invalid_unsigned_int ? Number(0) : Number(1);
+        const VA sigmaF = penalty_parameters[cell][f] * this->factor_laplace;
+
+        if(face_direction < 2)
+        {
+          const unsigned int        t       = 1 - face_direction;
+          const FaceGeometryIndices indices = get_face_geometry_indices(cell, f);
+          VA                        cross[n_t];
+          for(unsigned int it = 0; it < n_t; ++it)
+            cross[it] = Number(0);
+          for(unsigned int q1 = 0; q1 < nq; ++q1)
+          {
+            const FaceGeometryXY geometry = load_face_geometry<true>(indices, face_direction, q1);
+            const VA integrate_factor = mapping_info.quad_weights_z[q1] * geometry.area_element_xy;
+
+            // response[s * 3 + a][s' * 3 + b]: entry a = (value, d/dx, d/dy)
+            // tested on side s for the unit input b on side s'
+            VA response[6][6];
+            for(unsigned int b = 0; b < 6; ++b)
+            {
+              VA val[2][3], grad[2][3][2];
+              for(unsigned int s = 0; s < 2; ++s)
+                for(unsigned int e = 0; e < 3; ++e)
+                {
+                  val[s][e]     = Number(0);
+                  grad[s][e][0] = Number(0);
+                  grad[s][e][1] = Number(0);
+                }
+              if(b % 3 == 0)
+                val[b / 3][d] = Number(1);
+              else
+                grad[b / 3][d][b % 3 - 1] = Number(1);
+              viscous_face_point_operation_xy<true, false, true>(
+                geometry,
+                integrate_factor,
+                sigmaF,
+                VA(Number(0)),
+                h_z,
+                h_z_inverse,
+                val,
+                grad,
+                [&](const unsigned int s, const VA * test_value, const VA(*test_grad)[2]) {
+                  response[s * 3][b]     = test_value[d];
+                  response[s * 3 + 1][b] = test_grad[d][0];
+                  response[s * 3 + 2][b] = test_grad[d][1];
+                });
+            }
+
+            for(unsigned int it = 0; it < n_t; ++it)
+            {
+              const Number phi  = values[1][it * nq + q1];
+              const Number dphi = derivatives[1][it * nq + q1];
+              Number       w_minus[3], w_plus[3];
+              w_minus[0] = w_plus[0] = value_shared * phi;
+              w_minus[1 + t] = w_plus[1 + t] = value_shared * dphi;
+              w_minus[1 + face_direction]    = derivative_minus * phi;
+              w_plus[1 + face_direction]     = derivative_plus * phi;
+              VA sum                         = Number(0);
+              for(unsigned int a = 0; a < 3; ++a)
+                for(unsigned int b = 0; b < 3; ++b)
+                  sum += (w_minus[a] * w_plus[b]) * response[a][3 + b] +
+                         (w_plus[a] * w_minus[b]) * response[3 + a][b];
+              cross[it] += sum;
+            }
+          }
+          const Number * table_z = z_integral[1][0];
+          for(unsigned int it = 0; it < n_t; ++it)
+            for(unsigned int i2 = 0; i2 < n_t; ++i2)
+              diagonal[face_direction == 0 ? index(d, n_t, it, i2) : index(d, it, n_t, i2)] +=
+                interior_face * table_z[i2] * cross[it];
+        }
+        else
+        {
+          // the geometry and its derivatives are the same on both sides
+          VA cross[nq * nq];
+          for(unsigned int q = 0; q < nq * nq; ++q)
+          {
+            Tensor<2, 2, VA> jac_xy;
+            vectorized_load_and_transpose(4,
+                                          &mapping_info.jacobians_xy[q][0][0],
+                                          shifted_data_indices.data(),
+                                          &jac_xy[0][0]);
+            // response[s * 2 + a][s' * 2 + b]: entry a = (value, d/dz)
+            // tested on side s for the unit input b on side s'
+            VA response[4][4];
+            for(unsigned int b = 0; b < 4; ++b)
+            {
+              VA val[2][3], grad[2][3];
+              for(unsigned int s = 0; s < 2; ++s)
+                for(unsigned int e = 0; e < 3; ++e)
+                {
+                  val[s][e]  = Number(0);
+                  grad[s][e] = Number(0);
+                }
+              if(b % 2 == 0)
+                val[b / 2][d] = Number(1);
+              else
+                grad[b / 2][d] = Number(1);
+              VA test_value[3], test_grad[3];
+              viscous_face_point_operation_z<true>(jac_xy,
+                                                   mapping_info.quad_weights_xy[q],
+                                                   Number(1),
+                                                   sigmaF,
+                                                   h_z_inverse,
+                                                   val,
+                                                   grad,
+                                                   test_value,
+                                                   test_grad);
+              // side 1 is tested with the negative value and the same
+              // derivative, see compute_face()
+              response[0][b] = test_value[d];
+              response[1][b] = test_grad[d];
+              response[2][b] = -test_value[d];
+              response[3][b] = test_grad[d];
+            }
+            const Number w_minus[2] = {value_shared, derivative_minus};
+            const Number w_plus[2]  = {value_shared, derivative_plus};
+            VA           sum        = Number(0);
+            for(unsigned int a = 0; a < 2; ++a)
+              for(unsigned int b = 0; b < 2; ++b)
+                sum += (w_minus[a] * w_plus[b]) * response[a][2 + b] +
+                       (w_plus[a] * w_minus[b]) * response[2 + a][b];
+            cross[q] = sum;
+          }
+          const Number * table_x = products[1][0];
+          const Number * table_y = products[1][0];
+          VA             tmp[n_t * nq];
+          for(unsigned int i0 = 0; i0 < n_t; ++i0)
+            for(unsigned int qy = 0; qy < nq; ++qy)
+            {
+              VA sum = table_x[i0 * nq] * cross[qy * nq];
+              for(unsigned int qx = 1; qx < nq; ++qx)
+                sum += table_x[i0 * nq + qx] * cross[qy * nq + qx];
+              tmp[i0 * nq + qy] = sum;
+            }
+          for(unsigned int i1 = 0; i1 < n_t; ++i1)
+            for(unsigned int i0 = 0; i0 < n_t; ++i0)
+            {
+              VA sum = table_y[i1 * nq] * tmp[i0 * nq];
+              for(unsigned int qy = 1; qy < nq; ++qy)
+                sum += table_y[i1 * nq + qy] * tmp[i0 * nq + qy];
+              diagonal[index(d, i0, i1, n_t)] += interior_face * sum;
+            }
+        }
+      }
     }
+
+    distribute_local_to_global_rt_compressed<dim, degree>(diagonal,
+                                                          n_active_entries_per_cell_batch(cell),
+                                                          dst_indices,
+                                                          dst);
   }
+
 
   template<int degree>
   void
@@ -4544,6 +4989,199 @@ private:
                                                      out + i2 * n_t * n_t + i0);
   }
 
+  // Geometry of the extruded mapping at a quadrature point in the xy plane,
+  // which is the same for all points in z direction
+  struct PointGeometryXY
+  {
+    Tensor<2, 2, VectorizedArray<Number>>               jac_xy;
+    Tensor<2, 2, VectorizedArray<Number>>               inv_jac_xy; // J^{-T}
+    Tensor<1, 3, Tensor<1, 2, VectorizedArray<Number>>> jac_grad_xy;
+    VectorizedArray<Number>                             inv_jac_det;
+    // J^{-T} * jac_grad * J^{-1}, contracted to the vector that gives the
+    // derivative of det(J^{-1}) in the Piola transformation
+    VectorizedArray<Number> jac_grad_rank1[2];
+  };
+
+  static DEAL_II_ALWAYS_INLINE PointGeometryXY
+  load_point_geometry(const Extruded::MappingInfo<dim, Number> & mapping_info,
+                      const std::array<unsigned int, n_lanes> &  shifted_data_indices,
+                      const std::array<unsigned int, n_lanes> &  shifted_data_indices_gr,
+                      const unsigned int                         q1)
+  {
+    PointGeometryXY geometry;
+    vectorized_load_and_transpose(4,
+                                  &mapping_info.jacobians_xy[q1][0][0],
+                                  shifted_data_indices.data(),
+                                  &geometry.jac_xy[0][0]);
+    geometry.inv_jac_det = Number(1.0) / determinant(geometry.jac_xy);
+    geometry.inv_jac_xy  = transpose(invert(geometry.jac_xy));
+    vectorized_load_and_transpose(6,
+                                  &mapping_info.jacobian_grads[q1][0][0],
+                                  shifted_data_indices_gr.data(),
+                                  &geometry.jac_grad_xy[0][0]);
+
+    // Prepare for -(J^{-T} * jac_grad * J^{-1} * J * values *
+    // det(J^{-1})), which can be expressed as a rank-1 update tmp[d] *
+    // tmp4[e], where tmp = J * values and tmp4 = (J^{-T} * jac_grad *
+    // J^{-1})
+    const auto &            inv_jac_xy  = geometry.inv_jac_xy;
+    const auto &            jac_grad_xy = geometry.jac_grad_xy;
+    VectorizedArray<Number> tmp[2];
+    for(unsigned int d = 0; d < 2; ++d)
+      tmp[d] =
+        (inv_jac_xy[0][d] * jac_grad_xy[d][0] + inv_jac_xy[1][d] * jac_grad_xy[d][1] +
+         inv_jac_xy[0][1 - d] * jac_grad_xy[2][0] + inv_jac_xy[1][1 - d] * jac_grad_xy[2][1]);
+    for(unsigned int d = 0; d < 2; ++d)
+      geometry.jac_grad_rank1[d] = (tmp[0] * inv_jac_xy[d][0] + tmp[1] * inv_jac_xy[d][1]);
+    return geometry;
+  }
+
+  // Contravariant Piola transformation of the values and gradients of the
+  // velocity at a quadrature point in 3D, from the reference coordinates
+  // (grad[d][e]: derivative of component d in direction e) to the real
+  // coordinates. The factor det(J^{-1}) is not applied, see the callers.
+  static DEAL_II_ALWAYS_INLINE void
+  piola_transform_point(const PointGeometryXY &                   geometry,
+                        const Number                              h_z,
+                        const Number                              h_z_inverse,
+                        const VectorizedArray<Number>             val[3],
+                        const VectorizedArray<Number>             grad[3][3],
+                        Tensor<1, dim, VectorizedArray<Number>> & val_real,
+                        VectorizedArray<Number>                   grad_real[3][3])
+  {
+    const auto & jac_xy         = geometry.jac_xy;
+    const auto & inv_jac_xy     = geometry.inv_jac_xy;
+    const auto & jac_grad_xy    = geometry.jac_grad_xy;
+    const auto & jac_grad_rank1 = geometry.jac_grad_rank1;
+
+    val_real[0] = jac_xy[0][0] * val[0] + jac_xy[0][1] * val[1];
+    val_real[1] = jac_xy[1][0] * val[0] + jac_xy[1][1] * val[1];
+    val_real[2] = h_z * val[2];
+
+    for(unsigned int d = 0; d < 2; ++d)
+    {
+      // (J * grad_quad) * J^-1 * det(J^-1), part in braces
+      VectorizedArray<Number> tmp[3];
+      for(unsigned int e = 0; e < 3; ++e)
+        tmp[e] = (jac_xy[d][0] * grad[0][e] + jac_xy[d][1] * grad[1][e]);
+
+      // Add (jac_grad * values) * J^{-1} * det(J^{-1}), combine terms
+      // outside braces with gradient part from above
+      tmp[0] += jac_grad_xy[0][d] * val[0];
+      tmp[0] += jac_grad_xy[2][d] * val[1];
+      tmp[1] += jac_grad_xy[1][d] * val[1];
+      tmp[1] += jac_grad_xy[2][d] * val[0];
+
+      for(unsigned int e = 0; e < 2; ++e)
+        grad_real[d][e] = (tmp[0] * inv_jac_xy[e][0] + tmp[1] * inv_jac_xy[e][1]);
+
+      for(unsigned int e = 0; e < 2; ++e)
+        grad_real[d][e] -= jac_grad_rank1[e] * val_real[d];
+
+      const VectorizedArray<Number> tmp_z_grad2 =
+        (inv_jac_xy[d][0] * grad[2][0] + inv_jac_xy[d][1] * grad[2][1]);
+
+      grad_real[2][d] = (tmp_z_grad2 - jac_grad_rank1[d] * val[2]) * h_z;
+      grad_real[d][2] = h_z_inverse * tmp[2];
+    }
+    grad_real[2][2] = grad[2][2];
+  }
+
+  // Transpose of piola_transform_point(): multiply the values and gradients
+  // in real coordinates by the test functions, giving the terms tested by
+  // the values (test_value[d]) and the derivatives (test_grad[e][d] for
+  // the derivative in direction e of component d) of the test functions in
+  // reference coordinates. For the test function part, the Jacobian
+  // determinant that is part of the integration factor cancels with the
+  // inverse Jacobian determinant present in the factor of the derivative.
+  static DEAL_II_ALWAYS_INLINE void
+  piola_transform_point_transpose(const PointGeometryXY &                         geometry,
+                                  const Number                                    h_z,
+                                  const Number                                    h_z_inverse,
+                                  const Tensor<1, dim, VectorizedArray<Number>> & val_real,
+                                  const VectorizedArray<Number>                   grad_real[3][3],
+                                  VectorizedArray<Number>                         test_value[3],
+                                  VectorizedArray<Number>                         test_grad[3][3])
+  {
+    const auto & jac_xy         = geometry.jac_xy;
+    const auto & inv_jac_xy     = geometry.inv_jac_xy;
+    const auto & jac_grad_xy    = geometry.jac_grad_xy;
+    const auto & jac_grad_rank1 = geometry.jac_grad_rank1;
+
+    // J * (J^{-1} * (grad_in * factor))
+    VectorizedArray<Number> tmp[2][3];
+    for(unsigned int d = 0; d < 2; ++d)
+      for(unsigned int e = 0; e < 3; ++e)
+        tmp[d][e] = (inv_jac_xy[0][d] * grad_real[e][0] + inv_jac_xy[1][d] * grad_real[e][1]);
+
+    for(unsigned int d = 0; d < 2; ++d)
+    {
+      test_grad[d][0] = (jac_xy[0][0] * tmp[d][0] + jac_xy[1][0] * tmp[d][1]);
+      test_grad[d][1] = (jac_xy[0][1] * tmp[d][0] + jac_xy[1][1] * tmp[d][1]);
+      test_grad[d][2] = h_z * tmp[d][2];
+    }
+    test_grad[2][0] = (jac_xy[0][0] * (grad_real[0][2] * h_z_inverse) +
+                       jac_xy[1][0] * (grad_real[1][2] * h_z_inverse));
+    test_grad[2][1] = (jac_xy[0][1] * (grad_real[0][2] * h_z_inverse) +
+                       jac_xy[1][1] * (grad_real[1][2] * h_z_inverse));
+    test_grad[2][2] = grad_real[2][2];
+
+    // jac_grad * (J^{-1} * (grad_in * factor)), re-use part in braces as
+    // 'tmp' from above
+    for(unsigned int d = 0; d < 2; ++d)
+      test_value[d] = (tmp[d][0] * jac_grad_xy[d][0] + tmp[d][1] * jac_grad_xy[d][1] +
+                       tmp[1 - d][0] * jac_grad_xy[2][0] + tmp[1 - d][1] * jac_grad_xy[2][1]);
+
+    //   -(grad_in * factor) * J * (J^{-T} * jac_grad * J^{-1})
+    // = -(grad_in * factor) * J * ( \------- tmp4 ---------/ )
+    for(unsigned int d = 0; d < 2; ++d)
+    {
+      VectorizedArray<Number> tmp2 =
+        (grad_real[d][0] * jac_grad_rank1[0] + grad_real[d][1] * jac_grad_rank1[1]);
+      for(unsigned int e = 0; e < 2; ++e)
+        test_value[e] += jac_xy[d][e] * (val_real[d] - tmp2);
+    }
+    test_value[2] = h_z * (val_real[2] - grad_real[2][0] * jac_grad_rank1[0] -
+                           grad_real[2][1] * jac_grad_rank1[1]);
+  }
+
+  // The cell term of the Helmholtz operator (mass plus Laplacian) at a
+  // quadrature point in 3D: from the values and gradients of the trial
+  // function in reference coordinates to the terms tested by the values and
+  // gradients of the test functions in reference coordinates, see
+  // piola_transform_point_transpose() for the format. The quadrature weight
+  // is weight_xy * weight_z. This function is shared between the
+  // matrix-vector product and the computation of the diagonal.
+  DEAL_II_ALWAYS_INLINE void
+  helmholtz_point_operation(const PointGeometryXY &       geometry,
+                            const Number                  weight_xy,
+                            const Number                  weight_z,
+                            const Number                  h_z,
+                            const Number                  h_z_inverse,
+                            const VectorizedArray<Number> val[3],
+                            const VectorizedArray<Number> grad[3][3],
+                            VectorizedArray<Number>       test_value[3],
+                            VectorizedArray<Number>       test_grad[3][3]) const
+  {
+    Tensor<1, dim, VectorizedArray<Number>> val_real;
+    VectorizedArray<Number>                 grad_real[3][3];
+    piola_transform_point(geometry, h_z, h_z_inverse, val, grad, val_real, grad_real);
+
+    const VectorizedArray<Number> factor_deriv =
+      (weight_xy * geometry.inv_jac_det * this->factor_laplace * h_z_inverse) * weight_z;
+    const VectorizedArray<Number> factor_ma =
+      (weight_xy * h_z_inverse * geometry.inv_jac_det * this->factor_mass) * weight_z;
+
+    for(unsigned int d = 0; d < 3; ++d)
+      for(unsigned int e = 0; e < 3; ++e)
+        grad_real[d][e] *= factor_deriv;
+    for(unsigned int d = 0; d < 3; ++d)
+      val_real[d] *= factor_ma;
+
+    piola_transform_point_transpose(
+      geometry, h_z, h_z_inverse, val_real, grad_real, test_value, test_grad);
+  }
+
   template<CellOperation cell_operation, int n_q_points_1d>
   void
   compute_cell(
@@ -4662,33 +5300,13 @@ private:
 
       for(unsigned int qx = 0; qx < nn; ++qx, ++q1)
       {
-        Tensor<2, 2, VectorizedArray<Number>> jac_xy;
-        vectorized_load_and_transpose(4,
-                                      &mapping_info.jacobians_xy[q1][0][0],
-                                      shifted_data_indices.data(),
-                                      &jac_xy[0][0]);
-        const VectorizedArray<Number>               inv_jac_det = Number(1.0) / determinant(jac_xy);
-        const Tensor<2, 2, VectorizedArray<Number>> inv_jac_xy  = transpose(invert(jac_xy));
-        Tensor<1, 3, Tensor<1, 2, VectorizedArray<Number>>> jac_grad_xy;
-        vectorized_load_and_transpose(6,
-                                      &mapping_info.jacobian_grads[q1][0][0],
-                                      shifted_data_indices_gr.data(),
-                                      &jac_grad_xy[0][0]);
-
-        // Prepare for -(J^{-T} * jac_grad * J^{-1} * J * values *
-        // det(J^{-1})), which can be expressed as a rank-1 update tmp[d] *
-        // tmp4[e], where tmp = J * values and tmp4 = (J^{-T} * jac_grad *
-        // J^{-1})
-        VectorizedArray<Number> jac_grad_rank1[2];
-        {
-          VectorizedArray<Number> tmp[2];
-          for(unsigned int d = 0; d < 2; ++d)
-            tmp[d] =
-              (inv_jac_xy[0][d] * jac_grad_xy[d][0] + inv_jac_xy[1][d] * jac_grad_xy[d][1] +
-               inv_jac_xy[0][1 - d] * jac_grad_xy[2][0] + inv_jac_xy[1][1 - d] * jac_grad_xy[2][1]);
-          for(unsigned int d = 0; d < 2; ++d)
-            jac_grad_rank1[d] = (tmp[0] * inv_jac_xy[d][0] + tmp[1] * inv_jac_xy[d][1]);
-        }
+        const PointGeometryXY geometry =
+          load_point_geometry(mapping_info, shifted_data_indices, shifted_data_indices_gr, q1);
+        const auto & jac_xy         = geometry.jac_xy;
+        const auto & inv_jac_det    = geometry.inv_jac_det;
+        const auto & inv_jac_xy     = geometry.inv_jac_xy;
+        const auto & jac_grad_xy    = geometry.jac_grad_xy;
+        const auto & jac_grad_rank1 = geometry.jac_grad_rank1;
 
         if constexpr(dim == 2)
         {
@@ -4888,42 +5506,35 @@ private:
               {grad_x[ix + 1], grad_y[iy + 1], grad_z[iz + 1]},
               {grad_x[ix + 2], grad_y[iy + 2], grad_z[iz + 2]}};
 
-            Tensor<1, dim, VectorizedArray<Number>> val_real;
-            val_real[0] = jac_xy[0][0] * val[0] + jac_xy[0][1] * val[1];
-            val_real[1] = jac_xy[1][0] * val[0] + jac_xy[1][1] * val[1];
-            val_real[2] = h_z * val[2];
-
             const Number weight_z = mapping_info.quad_weights_z[qz];
 
-            VectorizedArray<Number> grad_real[dim][dim];
-            for(unsigned int d = 0; d < 2; ++d)
+            // The Helmholtz operator is done by a function shared with the
+            // computation of the diagonal
+            if constexpr(cell_operation == CellOperation::helmholtz)
             {
-              // (J * grad_quad) * J^-1 * det(J^-1), part in braces
-              VectorizedArray<Number> tmp[dim];
-              for(unsigned int e = 0; e < dim; ++e)
-                tmp[e] = (jac_xy[d][0] * grad[0][e] + jac_xy[d][1] * grad[1][e]);
-
-              // Add (jac_grad * values) * J^{-1} * det(J^{-1}),
-              // combine terms outside braces with gradient part from
-              // above
-              tmp[0] += jac_grad_xy[0][d] * val[0];
-              tmp[0] += jac_grad_xy[2][d] * val[1];
-              tmp[1] += jac_grad_xy[1][d] * val[1];
-              tmp[1] += jac_grad_xy[2][d] * val[0];
-
-              for(unsigned int e = 0; e < 2; ++e)
-                grad_real[d][e] = (tmp[0] * inv_jac_xy[e][0] + tmp[1] * inv_jac_xy[e][1]);
-
-              for(unsigned int e = 0; e < 2; ++e)
-                grad_real[d][e] -= jac_grad_rank1[e] * val_real[d];
-
-              const VectorizedArray<Number> tmp_z_grad2 =
-                (inv_jac_xy[d][0] * grad[2][0] + inv_jac_xy[d][1] * grad[2][1]);
-
-              grad_real[2][d] = (tmp_z_grad2 - jac_grad_rank1[d] * val[2]) * h_z;
-              grad_real[d][2] = h_z_inverse * tmp[2];
+              VectorizedArray<Number> test_value[dim], test_grad[dim][dim];
+              helmholtz_point_operation(geometry,
+                                        mapping_info.quad_weights_xy[q1],
+                                        weight_z,
+                                        h_z,
+                                        h_z_inverse,
+                                        val,
+                                        grad,
+                                        test_value,
+                                        test_grad);
+              for(unsigned int d = 0; d < dim; ++d)
+              {
+                grad_x[ix + d]          = test_grad[0][d];
+                grad_y[iy + d]          = test_grad[1][d];
+                grad_z[iz + d]          = test_grad[2][d];
+                out_values[q * dim + d] = test_value[d];
+              }
+              continue;
             }
-            grad_real[2][2] = grad[2][2];
+
+            Tensor<1, dim, VectorizedArray<Number>> val_real;
+            VectorizedArray<Number>                 grad_real[dim][dim];
+            piola_transform_point(geometry, h_z, h_z_inverse, val, grad, val_real, grad_real);
 
             if(cell_operation == CellOperation::convective)
             {
@@ -4990,69 +5601,18 @@ private:
               divergence_plane[qz * nn + qx] = (grad[0][0] + grad[1][1] + grad[2][2]) *
                                                mapping_info.quad_weights_xy[q1] * weight_z;
             }
-            else
+
+            if(cell_operation == CellOperation::convective && factor_convective != Number(1.0))
             {
-              // Laplacian
-              const VectorizedArray<Number> factor_deriv =
-                (mapping_info.quad_weights_xy[q1] * inv_jac_det * factor_lapl * h_z_inverse) *
-                weight_z;
-              const VectorizedArray<Number> factor_ma =
-                (mapping_info.quad_weights_xy[q1] * h_z_inverse * inv_jac_det * factor_mass) *
-                weight_z;
-
+              VectorizedArray<Number> value_tmp[dim], test_grad[dim][dim];
+              piola_transform_point_transpose(
+                geometry, h_z, h_z_inverse, val_real, grad_real, value_tmp, test_grad);
               for(unsigned int d = 0; d < dim; ++d)
-                for(unsigned int e = 0; e < dim; ++e)
-                  grad_real[d][e] *= factor_deriv;
-              for(unsigned int d = 0; d < dim; ++d)
-                val_real[d] *= factor_ma;
-            }
-
-            // For the test function part, the Jacobian determinant
-            // that is part of the integration factor cancels with the
-            // inverse Jacobian determinant present in the factor of
-            // the derivative
-
-            // J * (J^{-1} * (grad_in * factor))
-            if(cell_operation == CellOperation::helmholtz ||
-               (cell_operation == CellOperation::convective && factor_convective != Number(1.0)))
-            {
-              VectorizedArray<Number> tmp[2][dim];
-              for(unsigned int d = 0; d < 2; ++d)
-                for(unsigned int e = 0; e < dim; ++e)
-                  tmp[d][e] =
-                    (inv_jac_xy[0][d] * grad_real[e][0] + inv_jac_xy[1][d] * grad_real[e][1]);
-
-              grad_x[ix]     = (jac_xy[0][0] * tmp[0][0] + jac_xy[1][0] * tmp[0][1]);
-              grad_x[ix + 1] = (jac_xy[0][1] * tmp[0][0] + jac_xy[1][1] * tmp[0][1]);
-              grad_x[ix + 2] = h_z * tmp[0][2];
-              grad_y[iy]     = (jac_xy[0][0] * tmp[1][0] + jac_xy[1][0] * tmp[1][1]);
-              grad_y[iy + 1] = (jac_xy[0][1] * tmp[1][0] + jac_xy[1][1] * tmp[1][1]);
-              grad_y[iy + 2] = h_z * tmp[1][2];
-              grad_z[iz]     = (jac_xy[0][0] * (grad_real[0][2] * h_z_inverse) +
-                            jac_xy[1][0] * (grad_real[1][2] * h_z_inverse));
-              grad_z[iz + 1] = (jac_xy[0][1] * (grad_real[0][2] * h_z_inverse) +
-                                jac_xy[1][1] * (grad_real[1][2] * h_z_inverse));
-              grad_z[iz + 2] = grad_real[2][2];
-
-              // jac_grad * (J^{-1} * (grad_in * factor)), re-use part in
-              // braces as 'tmp' from above
-              VectorizedArray<Number> value_tmp[dim];
-              for(unsigned int d = 0; d < 2; ++d)
-                value_tmp[d] =
-                  (tmp[d][0] * jac_grad_xy[d][0] + tmp[d][1] * jac_grad_xy[d][1] +
-                   tmp[1 - d][0] * jac_grad_xy[2][0] + tmp[1 - d][1] * jac_grad_xy[2][1]);
-
-              //   -(grad_in * factor) * J * (J^{-T} * jac_grad * J^{-1})
-              // = -(grad_in * factor) * J * ( \------- tmp4 ---------/ )
-              for(unsigned int d = 0; d < 2; ++d)
               {
-                VectorizedArray<Number> tmp2 =
-                  (grad_real[d][0] * jac_grad_rank1[0] + grad_real[d][1] * jac_grad_rank1[1]);
-                for(unsigned int e = 0; e < 2; ++e)
-                  value_tmp[e] += jac_xy[d][e] * (val_real[d] - tmp2);
+                grad_x[ix + d] = test_grad[0][d];
+                grad_y[iy + d] = test_grad[1][d];
+                grad_z[iz + d] = test_grad[2][d];
               }
-              value_tmp[2] = h_z * (val_real[2] - grad_real[2][0] * jac_grad_rank1[0] -
-                                    grad_real[2][1] * jac_grad_rank1[1]);
 
               if constexpr(with_faces)
                 for(unsigned int d = 0; d < dim; ++d)
@@ -5303,6 +5863,328 @@ private:
         grads_exterior[d][e] =
           grads_face[(d == face_direction && e != face_direction) ? 0 : 1][d] + e;
     }
+  }
+
+  // The following functions evaluate the face integrals of the viscous
+  // term at single quadrature points and are used for the computation of
+  // the diagonal. compute_face() contains the same operations inline,
+  // because the compiler generates slower code for the matrix-vector
+  // product when calling these functions (3-5% for degree 3). The test
+  // extruded_momentum_operator_rt_diagonal checks that the two agree.
+
+  // Indices into the face data of the extruded mapping for the faces in x
+  // and y direction of a cell batch, for the current cell (side 0) and the
+  // neighbor (side 1)
+  struct FaceGeometryIndices
+  {
+    std::array<unsigned int, n_lanes> jacobian[2];
+    std::array<unsigned int, n_lanes> jacobian_grad[2];
+    std::array<unsigned int, n_lanes> normal;
+  };
+
+  FaceGeometryIndices
+  get_face_geometry_indices(const unsigned int cell, const unsigned int f) const
+  {
+    FaceGeometryIndices indices;
+    for(unsigned int v = 0; v < n_lanes; ++v)
+    {
+      const unsigned int idx          = mapping_info.face_mapping_data_index[cell][f][0][v];
+      indices.jacobian[0][v]          = idx * 4;
+      indices.jacobian_grad[0][v]     = idx * 6;
+      indices.normal[v]               = idx * 2;
+      const unsigned int neighbor_idx = mapping_info.face_mapping_data_index[cell][f][1][v];
+      indices.jacobian[1][v]          = neighbor_idx * 4;
+      indices.jacobian_grad[1][v]     = neighbor_idx * 6;
+    }
+    return indices;
+  }
+
+  // Geometry of the extruded mapping at a quadrature point on a face in x
+  // or y direction for both sides of the face (index 0: current cell, 1:
+  // neighbor), which is the same for all points in z direction. The
+  // derivatives of the Jacobian of the neighbor (jac_grad_xy[1],
+  // jac_grad_rank1_normal[1]) are only filled if 'load_exterior' is set.
+  struct FaceGeometryXY
+  {
+    Tensor<2, 2, VectorizedArray<Number>>               jac_xy[2];
+    VectorizedArray<Number>                             inv_jac_det[2];
+    Tensor<1, 3, Tensor<1, 2, VectorizedArray<Number>>> jac_grad_xy[2];
+    // normal vector times J^{-T}
+    Tensor<1, 2, VectorizedArray<Number>> jac_x_normal[2];
+    // J^{-T} * jac_grad * J^{-1} contracted with the normal vector, see
+    // load_point_geometry()
+    VectorizedArray<Number> jac_grad_rank1_normal[2];
+    VectorizedArray<Number> area_element_xy;
+  };
+
+  template<bool load_exterior>
+  DEAL_II_ALWAYS_INLINE FaceGeometryXY
+  load_face_geometry(const FaceGeometryIndices & indices,
+                     const unsigned int          face_direction,
+                     const unsigned int          q1) const
+  {
+    Tensor<2, 2, VectorizedArray<Number>> jac_xy[2];
+    vectorized_load_and_transpose(4,
+                                  &mapping_info.face_jacobians_xy[q1][0][0],
+                                  indices.jacobian[0].data(),
+                                  &jac_xy[0][0][0]);
+    vectorized_load_and_transpose(4,
+                                  &mapping_info.face_jacobians_xy[q1][0][0],
+                                  indices.jacobian[1].data(),
+                                  &jac_xy[1][0][0]);
+
+    const VectorizedArray<Number> area_element_xy =
+      std::sqrt(jac_xy[0][0][1 - face_direction] * jac_xy[0][0][1 - face_direction] +
+                jac_xy[0][1][1 - face_direction] * jac_xy[0][1][1 - face_direction]);
+
+    const VectorizedArray<Number> inv_jac_det[2] = {Number(1.0) / determinant(jac_xy[0]),
+                                                    Number(1.0) / determinant(jac_xy[1])};
+    const Tensor<2, 2, VectorizedArray<Number>> inv_jac_xy[2] = {transpose(invert(jac_xy[0])),
+                                                                 transpose(invert(jac_xy[1]))};
+
+    Tensor<1, 3, Tensor<1, 2, VectorizedArray<Number>>> jac_grad_xy[2];
+    vectorized_load_and_transpose(6,
+                                  &mapping_info.face_jacobian_grads[q1][0][0],
+                                  indices.jacobian_grad[0].data(),
+                                  &jac_grad_xy[0][0][0]);
+    if(load_exterior)
+      vectorized_load_and_transpose(6,
+                                    &mapping_info.face_jacobian_grads[q1][0][0],
+                                    indices.jacobian_grad[1].data(),
+                                    &jac_grad_xy[1][0][0]);
+
+    Tensor<1, 2, VectorizedArray<Number>> normal;
+    vectorized_load_and_transpose(2,
+                                  &mapping_info.face_normal_vector_xy[q1][0],
+                                  indices.normal.data(),
+                                  &normal[0]);
+
+    Tensor<1, 2, VectorizedArray<Number>> jac_x_normal[2] = {normal * inv_jac_xy[0],
+                                                             normal * inv_jac_xy[1]};
+
+    // Prepare for -(J^{-T} * jac_grad * J^{-1} * J * values *
+    // det(J^{-1})), which can be expressed as a rank-1 update
+    // tmp[d] * tmp4[e], where tmp = J * values and tmp4 =
+    // (J^{-T} * jac_grad * J^{-1})
+    VectorizedArray<Number> jac_grad_rank1_normal[2] = {};
+    for(unsigned int s = 0; s < (load_exterior ? 2 : 1); ++s)
+    {
+      VectorizedArray<Number> tmp[2];
+      for(unsigned int d = 0; d < 2; ++d)
+        tmp[d] =
+          (inv_jac_xy[s][0][d] * jac_grad_xy[s][d][0] + inv_jac_xy[s][1][d] * jac_grad_xy[s][d][1] +
+           inv_jac_xy[s][0][1 - d] * jac_grad_xy[s][2][0] +
+           inv_jac_xy[s][1][1 - d] * jac_grad_xy[s][2][1]);
+      jac_grad_rank1_normal[s] = (tmp[0] * jac_x_normal[s][0] + tmp[1] * jac_x_normal[s][1]);
+    }
+
+    // The geometry is first computed into local variables, which leads to
+    // better code than writing into 'geometry' directly
+    FaceGeometryXY geometry;
+    for(unsigned int s = 0; s < 2; ++s)
+    {
+      geometry.jac_xy[s]                = jac_xy[s];
+      geometry.inv_jac_det[s]           = inv_jac_det[s];
+      geometry.jac_grad_xy[s]           = jac_grad_xy[s];
+      geometry.jac_x_normal[s]          = jac_x_normal[s];
+      geometry.jac_grad_rank1_normal[s] = jac_grad_rank1_normal[s];
+    }
+    geometry.area_element_xy = area_element_xy;
+    return geometry;
+  }
+
+  // The face integrals of the symmetric interior penalty method for the
+  // viscous term at a quadrature point on a face in x or y direction in 3D.
+  // The values (val[s][d] for component d on side s) and the derivatives in
+  // the two directions of the xy plane (grad[s][d][e]) are given in the
+  // reference coordinates of the respective side. The terms tested by the
+  // values and the derivatives of the test functions of side s are passed in
+  // the same format (test_value[d], test_grad[d][e]) to
+  // store_test(s, test_value, test_grad), which is called right after the
+  // terms of a side are computed to keep few variables alive, for side 1
+  // only if 'test_exterior' is set. If 'exterior_from_data' is not set, the
+  // exterior values are zero, i.e., val[1] and grad[1] are not read. If
+  // 'apply_boundary_mask' is set, the exterior values of the lanes with
+  // boundary_mask = -1 are replaced by the mirror of the interior values,
+  // i.e., a homogeneous Dirichlet condition.
+  template<bool exterior_from_data,
+           bool apply_boundary_mask,
+           bool test_exterior,
+           typename StoreTest>
+  DEAL_II_ALWAYS_INLINE void
+  viscous_face_point_operation_xy(const FaceGeometryXY &        geometry,
+                                  const VectorizedArray<Number> integrate_factor,
+                                  const VectorizedArray<Number> sigmaF,
+                                  const VectorizedArray<Number> boundary_mask,
+                                  const Number                  h_z,
+                                  const Number                  h_z_inverse,
+                                  const VectorizedArray<Number> val[2][3],
+                                  const VectorizedArray<Number> grad[2][3][2],
+                                  const StoreTest &             store_test) const
+  {
+    const auto & jac_xy                = geometry.jac_xy;
+    const auto & inv_jac_det           = geometry.inv_jac_det;
+    const auto & jac_grad_xy           = geometry.jac_grad_xy;
+    const auto & jac_x_normal          = geometry.jac_x_normal;
+    const auto & jac_grad_rank1_normal = geometry.jac_grad_rank1_normal;
+
+    Tensor<1, dim, VectorizedArray<Number>> val_real[2];
+    Tensor<1, dim, VectorizedArray<Number>> normal_derivatives[2];
+    for(unsigned int s = 0; s < (exterior_from_data ? 2 : 1); ++s)
+    {
+      val_real[s][0] = jac_xy[s][0][0] * val[s][0] + jac_xy[s][0][1] * val[s][1];
+      val_real[s][1] = jac_xy[s][1][0] * val[s][0] + jac_xy[s][1][1] * val[s][1];
+
+      for(unsigned int d = 0; d < 2; ++d)
+      {
+        // (J * grad_quad) * J^-1 * det(J^-1), part in braces
+        VectorizedArray<Number> tmp[2];
+        for(unsigned int e = 0; e < 2; ++e)
+          tmp[e] = (jac_xy[s][d][0] * grad[s][0][e] + jac_xy[s][d][1] * grad[s][1][e]);
+
+        // Add (jac_grad * values) * J^{-1} * det(J^{-1}), combine terms
+        // outside braces with gradient part from above
+        tmp[0] += jac_grad_xy[s][0][d] * val[s][0];
+        tmp[0] += jac_grad_xy[s][2][d] * val[s][1];
+        tmp[1] += jac_grad_xy[s][1][d] * val[s][1];
+        tmp[1] += jac_grad_xy[s][2][d] * val[s][0];
+
+        VectorizedArray<Number> normal_deriv_d =
+          tmp[0] * jac_x_normal[s][0] + tmp[1] * jac_x_normal[s][1];
+
+        normal_deriv_d -= jac_grad_rank1_normal[s] * val_real[s][d];
+
+        normal_derivatives[s][d] = (h_z_inverse * inv_jac_det[s]) * normal_deriv_d;
+      }
+
+      // jac[2][2] (= h_z) cancels with h_z_inverse contained in determinant
+      normal_derivatives[s][2] =
+        inv_jac_det[s] * (jac_x_normal[s][0] * grad[s][2][0] + jac_x_normal[s][1] * grad[s][2][1] -
+                          jac_grad_rank1_normal[s] * val[s][2]);
+
+      for(unsigned int d = 0; d < 2; ++d)
+        val_real[s][d] *= inv_jac_det[s] * h_z_inverse;
+      val_real[s][2] = inv_jac_det[s] * val[s][2];
+    }
+
+    if constexpr(apply_boundary_mask)
+    {
+      val_real[1] =
+        boundary_mask * val_real[0] + (Number(1.0) - std::abs(boundary_mask)) * val_real[1];
+      normal_derivatives[1] = -boundary_mask * normal_derivatives[0] +
+                              (Number(1.0) - std::abs(boundary_mask)) * normal_derivatives[1];
+    }
+
+    // physical terms
+    const VectorizedArray<Number> effective_factor =
+      integrate_factor * make_vectorized_array<Number>(0.5 * this->factor_laplace);
+
+    const auto viscous_value_flux =
+      (integrate_factor * sigmaF) * (val_real[0] - val_real[1]) -
+      effective_factor * (normal_derivatives[0] + normal_derivatives[1]);
+
+    const auto viscous_gradient_flux = effective_factor * (val_real[1] - val_real[0]);
+
+    // apply test functions via transpose of the above
+    for(unsigned int s = 0; s < (test_exterior ? 2 : 1); ++s)
+    {
+      const auto my_viscous_gradient = viscous_gradient_flux * inv_jac_det[s];
+      const auto my_viscous_value =
+        viscous_value_flux * (s == 1 ? -inv_jac_det[s] : inv_jac_det[s]);
+      VectorizedArray<Number> tmp[2][2];
+      for(unsigned int d = 0; d < 2; ++d)
+        for(unsigned int e = 0; e < 2; ++e)
+          tmp[d][e] = jac_x_normal[s][d] * my_viscous_gradient[e];
+
+      VectorizedArray<Number> test_grad[3][2];
+      for(unsigned int d = 0; d < 2; ++d)
+      {
+        test_grad[0][d] = (jac_xy[s][0][0] * tmp[d][0] + jac_xy[s][1][0] * tmp[d][1]);
+        test_grad[1][d] = (jac_xy[s][0][1] * tmp[d][0] + jac_xy[s][1][1] * tmp[d][1]);
+        test_grad[2][d] = (h_z * my_viscous_gradient[2]) * jac_x_normal[s][d];
+      }
+
+      // jac_grad * (J^{-1} * (grad_in * factor)), re-use part in braces as
+      // 'tmp' from above
+      VectorizedArray<Number> value_tmp[dim];
+      for(unsigned int d = 0; d < 2; ++d)
+        value_tmp[d] =
+          (tmp[d][0] * jac_grad_xy[s][d][0] + tmp[d][1] * jac_grad_xy[s][d][1] +
+           tmp[1 - d][0] * jac_grad_xy[s][2][0] + tmp[1 - d][1] * jac_grad_xy[s][2][1]);
+
+      //   -(grad_in * factor) * J * (J^{-T} * jac_grad * J^{-1})
+      // = -(grad_in * factor) * J * ( \------- tmp4 ---------/ )
+      for(unsigned int d = 0; d < 2; ++d)
+      {
+        VectorizedArray<Number> tmp2 =
+          my_viscous_value[d] - my_viscous_gradient[d] * jac_grad_rank1_normal[s];
+        for(unsigned int e = 0; e < 2; ++e)
+          value_tmp[e] += jac_xy[s][d][e] * tmp2;
+      }
+      value_tmp[2] =
+        h_z * (my_viscous_value[2] - my_viscous_gradient[2] * jac_grad_rank1_normal[s]);
+      store_test(s, value_tmp, test_grad);
+    }
+  }
+
+  // Same as viscous_face_point_operation_xy() for a face in z direction,
+  // where the geometry is the same on both sides and only the derivatives
+  // in z direction enter (grad[s][d]: derivative of component d in z
+  // direction on side s). The flux is only computed for interior faces.
+  // Only the terms of side 0 are returned (test_value[d], test_grad[d]),
+  // because the ones of side 1 follow as -test_value and test_grad.
+  template<bool exterior_from_data>
+  DEAL_II_ALWAYS_INLINE void
+  viscous_face_point_operation_z(const Tensor<2, 2, VectorizedArray<Number>> & jac_xy,
+                                 const Number                                  weight_xy,
+                                 const Number                                  normal_sign,
+                                 const VectorizedArray<Number>                 sigmaF,
+                                 const Number                                  h_z_inverse,
+                                 const VectorizedArray<Number>                 val[2][3],
+                                 const VectorizedArray<Number>                 grad[2][3],
+                                 VectorizedArray<Number>                       test_value[3],
+                                 VectorizedArray<Number>                       test_grad[3]) const
+  {
+    const VectorizedArray<Number> inv_jac_det = Number(1.0) / determinant(jac_xy);
+
+    Tensor<1, dim, VectorizedArray<Number>> val_real[2];
+    Tensor<1, dim, VectorizedArray<Number>> normal_derivatives[2];
+    for(unsigned int s = 0; s < (exterior_from_data ? 2 : 1); ++s)
+    {
+      for(unsigned int d = 0; d < 2; ++d)
+        normal_derivatives[s][d] = (h_z_inverse * h_z_inverse * normal_sign * inv_jac_det) *
+                                   (jac_xy[d][0] * grad[s][0] + jac_xy[d][1] * grad[s][1]);
+      normal_derivatives[s][2] = (h_z_inverse * normal_sign * inv_jac_det) * grad[s][2];
+
+      for(unsigned int d = 0; d < 2; ++d)
+        val_real[s][d] =
+          (h_z_inverse * inv_jac_det) * (jac_xy[d][0] * val[s][0] + jac_xy[d][1] * val[s][1]);
+
+      // h_z cancels with factor h_z_inverse from Jacobian determinant
+      val_real[s][2] = inv_jac_det * val[s][2];
+    }
+
+    const VectorizedArray<Number> integrate_factor = weight_xy * determinant(jac_xy);
+
+    // physical terms
+    const VectorizedArray<Number> effective_factor =
+      integrate_factor * make_vectorized_array<Number>(0.5 * this->factor_laplace);
+    const auto viscous_value_flux =
+      (integrate_factor * sigmaF) * (val_real[0] - val_real[1]) -
+      effective_factor * (normal_derivatives[0] + normal_derivatives[1]);
+
+    const auto viscous_gradient_flux = effective_factor * (val_real[1] - val_real[0]);
+
+    // transpose of evaluate part
+    for(unsigned int d = 0; d < 2; ++d)
+      test_value[d] = (h_z_inverse * inv_jac_det) *
+                      (jac_xy[0][d] * viscous_value_flux[0] + jac_xy[1][d] * viscous_value_flux[1]);
+    test_value[2] = inv_jac_det * viscous_value_flux[2];
+    for(unsigned int d = 0; d < 2; ++d)
+      test_grad[d] =
+        (h_z_inverse * h_z_inverse * normal_sign * inv_jac_det) *
+        (jac_xy[0][d] * viscous_gradient_flux[0] + jac_xy[1][d] * viscous_gradient_flux[1]);
+    test_grad[2] = (h_z_inverse * normal_sign * inv_jac_det) * viscous_gradient_flux[2];
   }
 
   template<int degree, bool compute_exterior>
