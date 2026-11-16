@@ -152,6 +152,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
     convective_divergence_rhs(this->param.order_extrapolation_pressure_nbc),
     divergences(this->order),
     pressure_nbc_rhs(this->param.order_extrapolation_pressure_nbc),
+    rhs_rt(this->param.convective_problem() and not this->param.ale_formulation ?
+             this->vec_convective_term.back() :
+             rhs_rt_storage),
     factors_time_step_mass{},
     momentum_sliding_max_eigenvalue(0),
     momentum_min_eigenvalue_factor(0),
@@ -221,6 +224,17 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::setup_derived()
 
 template<int dim, typename Number>
 void
+TimeIntBDFConsistentSplittingExtruded<dim, Number>::prepare_velocity_for_postprocessing() const
+{
+  // postprocessing() runs after prepare_vectors_for_next_timestep(), so the
+  // current solution is in velocity[0]. The constrained entries at the end of
+  // velocity_np are not touched, they get updated by distributing the
+  // constraints when the postprocessor requests it.
+  op_rt->copy_this_to_mf_vector(velocity[0], velocity_np);
+}
+
+template<int dim, typename Number>
+void
 TimeIntBDFConsistentSplittingExtruded<dim, Number>::write_vector_norms() const
 {
   // write vector norms describing the state of the solver
@@ -276,6 +290,12 @@ void
 TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
 {
   Base::allocate_vectors();
+
+  // The restart of this class serializes the velocity only and recomputes the
+  // convective terms, see read_restart_vectors(), so the base class vectors
+  // for the convective terms in restart files are not needed
+  for(VectorType & vector : this->vec_convective_term_for_restart)
+    vector.reinit(0);
 
   // velocity
   pde_operator->initialize_vector_velocity(velocity_np);
@@ -345,14 +365,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   op_rt_float->set_parameters(1.0, 0.0);
   op_rt_float->compute_diagonal(diagonal_mass);
 
-  preconditioner_mass.get_vector().reinit(diagonal_mass, true);
-  const unsigned int local_size = diagonal_mass.locally_owned_size();
-  DEAL_II_OPENMP_SIMD_PRAGMA
-  for(unsigned int i = 0; i < local_size; ++i)
-  {
+  for(unsigned int i = 0; i < diagonal_mass.locally_owned_size(); ++i)
     AssertThrow(diagonal_mass.local_element(i) > 1e-30, dealii::ExcInternalError());
-    preconditioner_mass.get_vector().local_element(i) = 1. / diagonal_mass.local_element(i);
-  }
   op_rt_float->set_parameters(0.0, 1.0);
   op_rt_float->compute_diagonal(diagonal_laplace);
 
@@ -378,6 +392,15 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
   // eigenvalue of the momentum matrix for the Chebyshev solver.
   if(this->param.solver_data_momentum.linear_solver == LinearSolver::Chebyshev)
   {
+    // the preconditioner is only needed here, so release it at the end of
+    // this scope
+    dealii::DiagonalMatrix<VectorType> preconditioner_mass;
+    preconditioner_mass.get_vector().reinit(rhs_rt, true);
+    const unsigned int local_size = diagonal_mass.locally_owned_size();
+    DEAL_II_OPENMP_SIMD_PRAGMA
+    for(unsigned int i = 0; i < local_size; ++i)
+      preconditioner_mass.get_vector().local_element(i) = 1. / diagonal_mass.local_element(i);
+
     op_rt->set_parameters(1.0, 0.0);
     for(double & a : rhs_rt)
       a = static_cast<double>(rand()) / RAND_MAX;
@@ -393,6 +416,10 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
     });
     solver_cg.solve(*op_rt, solution_rt, rhs_rt, preconditioner_mass);
     momentum_eigenvalue_range_mass = std::make_pair(min_eig, max_eig);
+
+    // rhs_rt might refer to a convective term vector, so clear it
+    rhs_rt      = 0.;
+    solution_rt = 0.;
   }
 
   laplace_op = std::make_shared<LaplaceOperator::LaplaceOperatorDG<dim, Number>>();
@@ -838,9 +865,14 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       // the extrapolation of the initial guess reads the oldest velocity in
       // velocity.back() before it is overwritten, so keep a copy for the
       // check
-      VectorType velocity_oldest;
+      // check; likewise for the oldest convective term, which rhs_rt might
+      // overwrite
+      VectorType velocity_oldest, convective_oldest;
       if(check_fused_momentum_rhs)
-        velocity_oldest = velocity.back();
+      {
+        velocity_oldest   = velocity.back();
+        convective_oldest = this->vec_convective_term.back();
+      }
       op_rt->set_parameters(-this->get_scaling_factor_time_derivative_term(),
                             -this->pde_operator->get_viscous_kernel_data().viscosity);
       op_rt->vmult_add_with_momentum_rhs(
@@ -879,7 +911,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         // recompute with the separate loops (the extrapolations give
         // identical results with the restored oldest velocity) and compare
         VectorType fused_result(rhs_rt);
-        velocity.back() = velocity_oldest;
+        velocity.back()                  = velocity_oldest;
+        this->vec_convective_term.back() = convective_oldest;
         op_rt->evaluate_momentum_rhs(
           pressure_np,
           velocity.back(),
@@ -1451,11 +1484,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     {
       DEAL_II_OPENMP_SIMD_PRAGMA
       for(unsigned int i = 0; i < owned_size; ++i)
-      {
-        const Number u_i = solution_rt.local_element(i) + velocity_red.back().local_element(i);
-        solution_rt.local_element(i) = u_i;
-        velocity_np.local_element(i) = u_i;
-      }
+        solution_rt.local_element(i) += velocity_red.back().local_element(i);
     }
     else
     {
@@ -1464,7 +1493,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       {
         const Number u_i = solution_rt.local_element(i) + velocity_red.back().local_element(i);
         solution_rt.local_element(i)         = u_i;
-        velocity_np.local_element(i)         = u_i;
         velocity_red.back().local_element(i) = u_i;
       }
     }
@@ -1479,9 +1507,21 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     const bool used_extrapolation = momentum_solver_in_extrapolation_mode;
 
     // Update the strategy.
-    if(this->get_time_step_number() > 10 && may_leave_projection_mode && velocity_red.size() == 4 &&
-       this->order == 3)
+    if(not momentum_solver_in_extrapolation_mode && this->get_time_step_number() > 10 &&
+       may_leave_projection_mode && velocity_red.size() == 4 && this->order == 3)
+    {
       momentum_solver_in_extrapolation_mode = true;
+
+      // The extrapolation mode is never left again, and it only uses the
+      // single-precision solution and right-hand side vectors in the last
+      // slots of velocity_red and velocity_matvec, so release the remaining
+      // vectors of the least-squares projection. Rotating a single vector in
+      // prepare_vectors_for_next_timestep() does nothing.
+      velocity_red.front().swap(velocity_red.back());
+      velocity_red.resize(1);
+      velocity_matvec.front().swap(velocity_matvec.back());
+      velocity_matvec.resize(1);
+    }
 
     if(this->print_solver_info() and not(this->is_test))
     {

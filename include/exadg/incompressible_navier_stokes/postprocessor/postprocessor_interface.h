@@ -43,6 +43,21 @@ public:
   {
   }
 
+  /*
+   * Return whether do_postprocessing() reads the velocity vector passed to it
+   * in this time step. Time integrators that do not keep that vector up to
+   * date in every time step only fill it when this function returns true.
+   * The default returns true. Derived classes that evaluate the velocity
+   * themselves, in addition to the tools of a base class, must take this
+   * into account when overriding the function.
+   */
+  virtual bool
+  needs_velocity_vector(double const /*          time */,
+                        types::time_step const /*time_step_number*/) const
+  {
+    return true;
+  }
+
   virtual bool
   needs_constraints_distributed(double const /*          time */,
                                 types::time_step const /*time_step_number*/) const

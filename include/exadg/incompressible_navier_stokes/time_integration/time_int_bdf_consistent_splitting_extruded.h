@@ -160,6 +160,10 @@ private:
   void
   setup_derived() final;
 
+  // copy the current solution 'velocity[0]' into 'velocity_np'
+  void
+  prepare_velocity_for_postprocessing() const final;
+
   void
   write_vector_norms() const;
 
@@ -221,7 +225,11 @@ private:
 
   std::vector<VectorType> velocity; // `op_rt` vector
 
-  VectorType velocity_np; // mf vector
+  // MatrixFree vector of the velocity for postprocessing, only up to date
+  // after setup and in time steps where the postprocessor reads the velocity,
+  // see prepare_velocity_for_postprocessing(); the time integration itself
+  // works on 'velocity'
+  mutable VectorType velocity_np; // mf vector
 
   std::vector<VectorTypeFloat> velocity_red;    // `op_rt_float` vector
   std::vector<VectorTypeFloat> velocity_matvec; // `op_rt_float` vector
@@ -244,11 +252,22 @@ private:
   SeparateVectorMemory<VectorTypeFloat>   vector_memory_momentum;
   VectorTypeFloat                         diagonal_laplace;
   dealii::DiagonalMatrix<VectorTypeFloat> preconditioner_viscous;
-  dealii::DiagonalMatrix<VectorType>      preconditioner_mass;
   VectorType                              solution_rt;
-  std::vector<VectorType>                 solutions_convective;
-  VectorType                              rhs_rt;
-  std::array<double, 6>                   factors_time_step_mass;
+
+  // Right-hand side and residual of the momentum step in double precision.
+  // Its content is only needed from the right-hand side computation until
+  // it is copied to the single-precision solver vector, the same time window
+  // in which the oldest convective term this->vec_convective_term.back() is
+  // dead: that one is read for the last time when the right-hand side
+  // initializes rhs_rt (entry by entry in place) and overwritten with the
+  // new convective term by evaluate_convective_term(). So rhs_rt refers to
+  // that vector, unless the convective term is not evaluated, in which case
+  // it uses the separate 'rhs_rt_storage'. Note that the vectors in
+  // vec_convective_term are rotated by swapping their content, so the
+  // reference stays valid.
+  VectorType            rhs_rt_storage;
+  VectorType &          rhs_rt;
+  std::array<double, 6> factors_time_step_mass;
 
   using ChebyshevSolver =
     PreconditionChebyshevScratch<RTOperator::RaviartThomasOperator<dim, float>>;

@@ -123,6 +123,26 @@ PostProcessor<dim, Number>::setup(Operator const & pde_operator)
 }
 
 template<int dim, typename Number>
+bool
+PostProcessor<dim, Number>::needs_velocity_vector(double const           time,
+                                                  types::time_step const time_step_number) const
+{
+  // the particles are moved in every time step once active, see
+  // do_postprocessing()
+  return time_control_mean_velocity.check_for_evaluation(time, time_step_number) or
+         output_generator.time_control.check_for_evaluation(time, time_step_number) or
+         pointwise_output_generator.time_control.check_for_evaluation(time, time_step_number) or
+         error_calculator_u.time_control.check_for_evaluation(time, time_step_number) or
+         lift_and_drag_calculator.time_control.check_for_evaluation(time, time_step_number) or
+         div_and_mass_error_calculator.time_control.check_for_evaluation(time, time_step_number) or
+         kinetic_energy_calculator.time_control.check_for_evaluation(time, time_step_number) or
+         kinetic_energy_spectrum_calculator.time_control.check_for_evaluation(time,
+                                                                              time_step_number) or
+         pp_data.particle_data.time_control_data.is_active or
+         line_plot_calculator.time_control.check_for_evaluation(time, time_step_number);
+}
+
+template<int dim, typename Number>
 void
 PostProcessor<dim, Number>::do_postprocessing(VectorType const &     velocity,
                                               VectorType const &     pressure,

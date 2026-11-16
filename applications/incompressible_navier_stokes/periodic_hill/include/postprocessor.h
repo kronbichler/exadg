@@ -104,6 +104,15 @@ public:
   }
 
   bool
+  needs_velocity_vector(double const time, types::time_step const time_step_number) const override
+  {
+    // with the consistent splitting operator, the flow rate and the line
+    // plot statistics read the velocity of the momentum operator directly
+    return consistent_splitting_operator == nullptr ||
+           Base::needs_velocity_vector(time, time_step_number);
+  }
+
+  bool
   needs_constraints_distributed(double const           time,
                                 types::time_step const time_step_number) const override
   {

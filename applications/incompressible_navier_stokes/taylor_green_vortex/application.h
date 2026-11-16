@@ -166,7 +166,7 @@ private:
     this->param.calculation_of_time_step_size          = TimeStepCalculation::CFL;
     this->param.adaptive_time_stepping_limiting_factor = 3.0;
     this->param.max_velocity                           = max_velocity;
-    this->param.cfl                                    = 0.4;
+    this->param.cfl                                    = 0.37;
     this->param.cfl_exponent_fe_degree_velocity        = 1.5;
     this->param.time_step_size                         = 1.0e-3;
 
@@ -236,7 +236,7 @@ private:
 
     // pressure Poisson equation
     this->param.solver_data_pressure_poisson =
-      SolverData(1000, ABS_TOL, REL_TOL, LinearSolver::CG, 100);
+      SolverData(1000, ABS_TOL, 100 * REL_TOL, LinearSolver::CG, 100);
     this->param.preconditioner_pressure_poisson      = PreconditionerPressurePoisson::Multigrid;
     this->param.multigrid_data_pressure_poisson.type = MultigridType::cphMG;
 
@@ -261,7 +261,7 @@ private:
                    ABS_TOL,
                    REL_TOL,
                    this->param.treatment_of_convective_term == TreatmentOfConvectiveTerm::Explicit ?
-                     LinearSolver::CG :
+                     LinearSolver::Chebyshev :
                      LinearSolver::GMRES);
       this->param.preconditioner_momentum =
         this->param.spatial_discretization == SpatialDiscretization::L2 ?
@@ -556,7 +556,7 @@ private:
 
   // solver tolerances
   double const ABS_TOL = 1.e-12;
-  double const REL_TOL = 1.e-3;
+  double const REL_TOL = 1.e-8;
 
   double const ABS_TOL_LINEAR = 1.e-12;
   double const REL_TOL_LINEAR = 1.e-2;

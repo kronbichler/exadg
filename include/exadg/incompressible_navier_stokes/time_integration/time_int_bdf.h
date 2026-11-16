@@ -120,6 +120,15 @@ protected:
   virtual void
   copy_to_vec_convective_term_for_restart(unsigned int const i) const;
 
+  // Called by postprocessing() before the postprocessor reads the velocity
+  // vector given by get_velocity(), for time integrators that do not keep
+  // that vector up to date in every time step. Only called if the
+  // postprocessor needs the velocity in the current time step.
+  virtual void
+  prepare_velocity_for_postprocessing() const
+  {
+  }
+
   virtual void
   copy_from_vec_convective_term_for_restart(unsigned int const i);
 

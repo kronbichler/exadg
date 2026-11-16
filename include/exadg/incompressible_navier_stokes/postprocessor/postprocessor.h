@@ -80,6 +80,11 @@ public:
   void
   setup(Operator const & pde_operator) override;
 
+  // true if any of the tools evaluated in do_postprocessing() reads the
+  // velocity in this time step, without changing the time controls
+  bool
+  needs_velocity_vector(double const time, types::time_step const time_step_number) const override;
+
   void
   do_postprocessing(VectorType const &     velocity,
                     VectorType const &     pressure,

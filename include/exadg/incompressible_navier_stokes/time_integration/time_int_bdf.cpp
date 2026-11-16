@@ -703,6 +703,9 @@ TimeIntBDF<dim, Number>::postprocessing() const
     helpers_ale->update_pde_operator_after_grid_motion();
   }
 
+  if(postprocessor->needs_velocity_vector(this->get_time(), this->get_time_step_number()))
+    prepare_velocity_for_postprocessing();
+
   // We need to distribute the dofs before computing the error since
   // `dealii::VectorTools::integrate_difference()` does not take constraints into account like
   // `dealii::MatrixFree` does, hence reading the wrong values. `distribute_constraint_u()` updates
