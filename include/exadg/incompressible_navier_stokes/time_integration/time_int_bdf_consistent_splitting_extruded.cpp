@@ -41,6 +41,99 @@ namespace ExaDG
 {
 namespace IncNS
 {
+namespace
+{
+// Square of the l2 norm of the entries [begin, end) of a vector, as a sum of
+// SIMD lanes
+template<typename VectorType>
+dealii::VectorizedArray<typename VectorType::value_type>
+vector_norm_sqr_on_range(VectorType const & vec, unsigned int const begin, unsigned int const end)
+{
+  using Number                              = typename VectorType::value_type;
+  constexpr unsigned int          n_lanes   = dealii::VectorizedArray<Number>::size();
+  Number const *                  ptr       = vec.begin() + begin;
+  unsigned int const              n_batches = (end - begin) / (2 * n_lanes);
+  dealii::VectorizedArray<Number> sum_0 = 0, sum_1 = 0;
+  for(unsigned int i = 0; i < n_batches; ++i)
+  {
+    dealii::VectorizedArray<Number> tmp;
+    tmp.load(ptr + n_lanes * 2 * i);
+    sum_0 += tmp * tmp;
+    tmp.load(ptr + n_lanes * (2 * i + 1));
+    sum_1 += tmp * tmp;
+  }
+  unsigned int remainder = end - begin - 2 * n_lanes * n_batches;
+  if(remainder > 0)
+  {
+    ptr += 2 * n_lanes * n_batches;
+    if(remainder >= n_lanes)
+    {
+      dealii::VectorizedArray<Number> tmp;
+      tmp.load(ptr);
+      sum_0 += tmp * tmp;
+      ptr += n_lanes;
+      remainder -= n_lanes;
+    }
+    for(unsigned int i = 0; i < remainder; ++i)
+      sum_1[i] += ptr[i] * ptr[i];
+  }
+  return sum_0 + sum_1;
+}
+
+// Square of the l2 norm of the entries [begin, end) of a vector, as a sum of
+// SIMD lanes, and simultaneous copy into another vector that amortizes the
+// memory access.
+template<typename VectorType, typename VectorType2>
+dealii::VectorizedArray<typename VectorType::value_type>
+vector_norm_sqr_and_copy_on_range(VectorType const & vec,
+                                  VectorType2 &      other_vec,
+                                  unsigned int const begin,
+                                  unsigned int const end)
+{
+  using Number                              = typename VectorType::value_type;
+  using Number2                             = typename VectorType2::value_type;
+  constexpr unsigned int          n_lanes   = dealii::VectorizedArray<Number>::size();
+  Number const *                  ptr       = vec.begin() + begin;
+  Number2 *                       out_ptr   = other_vec.begin() + begin;
+  unsigned int const              n_batches = (end - begin) / (2 * n_lanes);
+  dealii::VectorizedArray<Number> sum_0 = 0, sum_1 = 0;
+  for(unsigned int i = 0; i < n_batches; ++i)
+  {
+    dealii::VectorizedArray<Number> tmp;
+    tmp.load(ptr + n_lanes * 2 * i);
+    tmp.store(out_ptr + n_lanes * 2 * i);
+    sum_0 += tmp * tmp;
+    tmp.load(ptr + n_lanes * (2 * i + 1));
+    tmp.store(out_ptr + n_lanes * (2 * i + 1));
+    sum_1 += tmp * tmp;
+  }
+  unsigned int remainder = end - begin - 2 * n_lanes * n_batches;
+  if(remainder > 0)
+  {
+    ptr += 2 * n_lanes * n_batches;
+    out_ptr += 2 * n_lanes * n_batches;
+    if(remainder >= n_lanes)
+    {
+      dealii::VectorizedArray<Number> tmp;
+      tmp.load(ptr);
+      tmp.store(out_ptr);
+      sum_0 += tmp * tmp;
+      ptr += n_lanes;
+      out_ptr += n_lanes;
+      remainder -= n_lanes;
+    }
+    for(unsigned int i = 0; i < remainder; ++i)
+    {
+      sum_1[i] += ptr[i] * ptr[i];
+      out_ptr[i] = ptr[i];
+    }
+  }
+  return sum_0 + sum_1;
+}
+} // namespace
+
+
+
 template<int dim, typename Number>
 TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittingExtruded(
   std::shared_ptr<Operator>                       operator_in,
@@ -75,6 +168,14 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
                         /* start_with_low_order */ true)
 {
   op_rt = std::make_shared<RTOperator::RaviartThomasOperator<dim, Number>>();
+
+  if(const char * interval = std::getenv("EXADG_INITIAL_GUESS_DIAGNOSTIC"))
+    ig_diagnostic_interval = std::max(0, std::atoi(interval));
+  if(std::getenv("EXADG_NO_FUSED_MOMENTUM_RHS"))
+    fused_momentum_rhs = false;
+  if(const char * interval = std::getenv("EXADG_MOMENTUM_RHS_NORM_INTERVAL"))
+    momentum_rhs_norm_interval = std::max(1, std::atoi(interval));
+  check_fused_momentum_rhs = std::getenv("EXADG_CHECK_FUSED_MOMENTUM_RHS") != nullptr;
 
   pde_operator->momentum_operator = op_rt;
   pde_operator->velocity_vector   = &velocity[0];
@@ -611,24 +712,30 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::rhs_pressure(VectorType & rh
   std::vector<Number> factors(extra_pressure_rhs.get_order());
   for(unsigned int i = 0; i < extra_pressure_rhs.get_order(); ++i)
     factors[i] = extra_pressure_rhs.get_beta(i);
-  extrapolate_vectors(factors, convective_divergence_rhs, rhs);
 
   /*
    *  II. calculate Leray projection
    */
+  std::vector<Number> factors_leray;
   if(this->param.apply_leray_projection)
   {
-    factors.resize(divergences.size());
+    factors_leray.resize(divergences.size());
     for(unsigned int i = 0; i < divergences.size(); ++i)
-      factors[i] = -this->bdf.get_alpha(i) / this->get_time_step_size();
-    extrapolate_vectors_and_add(factors, divergences, rhs);
+      factors_leray[i] = -this->bdf.get_alpha(i) / this->get_time_step_size();
   }
 
   /*
    *  III. forcing term
    */
   laplace_op->evaluate_add_divergence_body_force(
-    this->get_next_time(), *pde_operator->get_field_functions()->right_hand_side, rhs);
+    this->get_next_time(),
+    *pde_operator->get_field_functions()->right_hand_side,
+    [&](const unsigned int begin, const unsigned int end) {
+      extrapolate_vectors_range<false>(begin, end, factors, convective_divergence_rhs, rhs);
+      if(factors_leray.empty() == false)
+        extrapolate_vectors_range<true>(begin, end, factors_leray, divergences, rhs);
+    },
+    rhs);
 
   /*
    *  IV. handle consistent boundary condition
@@ -715,8 +822,99 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     // derivative terms in the right-hand side term, so amortize the memory
     // access for that second purpose. The vector 'velocity.back()' holds the
     // extrapolated time derivative terms used for the rhs computation and
-    // must not be used elsewhere in this solver
-    if(momentum_solver_in_extrapolation_mode)
+    // must not be used elsewhere in this solver.
+    // In extrapolation mode, the right-hand side and the residual of the
+    // initial guess can be computed in a single cell loop, see
+    // RaviartThomasOperator::vmult_add_with_momentum_rhs(). The norm of the
+    // right-hand side, which sets the solver tolerance, is then not
+    // available, so we use the value of the last step with the separate
+    // computation, done every 'momentum_rhs_norm_interval' steps.
+    const bool use_fused_rhs = fused_momentum_rhs && momentum_solver_in_extrapolation_mode &&
+                               momentum_rhs_norm_last > 0. &&
+                               this->get_time_step_number() % momentum_rhs_norm_interval != 0;
+    dealii::VectorizedArray<Number> fused_norm_sqr_residual = 0;
+    if(use_fused_rhs)
+    {
+      // the extrapolation of the initial guess reads the oldest velocity in
+      // velocity.back() before it is overwritten, so keep a copy for the
+      // check
+      VectorType velocity_oldest;
+      if(check_fused_momentum_rhs)
+        velocity_oldest = velocity.back();
+      op_rt->set_parameters(-this->get_scaling_factor_time_derivative_term(),
+                            -this->pde_operator->get_viscous_kernel_data().viscosity);
+      op_rt->vmult_add_with_momentum_rhs(
+        rhs_rt,
+        solution_rt,
+        pressure_np,
+        velocity.back(),
+        1.0,
+        // The extrapolations and time derivative terms run before the
+        // first read of solution_rt by the face integrals, whereas
+        // the linear combination of the convective terms with the
+        // respective extrapolation scheme only writes the 'rhs'
+        // vector, which can be done with the tighter of the sets,
+        // which is the 'write' set.
+        [&](const unsigned int begin, const unsigned int end) {
+          extrapolate_two_vectors_range(begin,
+                                        end,
+                                        factors_velocity_rhs,
+                                        factors_initial_guess,
+                                        velocity,
+                                        velocity.back(),
+                                        solution_rt);
+        },
+        [&](const unsigned int begin, const unsigned int end) {
+          extrapolate_vectors_range<false>(
+            begin, end, factors_convective_term, this->vec_convective_term, rhs_rt);
+        },
+        [&](const unsigned int begin, const unsigned int end) {
+          fused_norm_sqr_residual +=
+            vector_norm_sqr_and_copy_on_range(rhs_rt, velocity_matvec.back(), begin, end);
+        },
+        right_hand_side);
+
+      if(check_fused_momentum_rhs)
+      {
+        // recompute with the separate loops (the extrapolations give
+        // identical results with the restored oldest velocity) and compare
+        VectorType fused_result(rhs_rt);
+        velocity.back() = velocity_oldest;
+        op_rt->evaluate_momentum_rhs(
+          pressure_np,
+          velocity.back(),
+          1.0,
+          rhs_rt,
+          [&](const unsigned int begin, const unsigned int end) {
+            extrapolate_two_vectors_range(begin,
+                                          end,
+                                          factors_velocity_rhs,
+                                          factors_initial_guess,
+                                          velocity,
+                                          velocity.back(),
+                                          solution_rt);
+            extrapolate_vectors_range<false>(
+              begin, end, factors_convective_term, this->vec_convective_term, rhs_rt);
+          },
+          [&](const unsigned int, const unsigned int) {},
+          right_hand_side);
+        const double rhs_norm = rhs_rt.l2_norm();
+        op_rt->vmult(
+          rhs_rt,
+          solution_rt,
+          [](const unsigned int, const unsigned int) {},
+          [](const unsigned int, const unsigned int) {});
+        const double residual_norm = rhs_rt.l2_norm();
+        rhs_rt -= fused_result;
+        const double difference = rhs_rt.l2_norm();
+        rhs_rt                  = fused_result;
+        this->pcout << "Fused momentum rhs and residual: |residual| = " << std::setprecision(6)
+                    << residual_norm << ", |fused - separate| = " << difference
+                    << " (relative to |rhs| " << difference / rhs_norm << "), |rhs| = " << rhs_norm
+                    << ", lagged |rhs| = " << momentum_rhs_norm_last << std::endl;
+      }
+    }
+    else if(momentum_solver_in_extrapolation_mode)
       op_rt->evaluate_momentum_rhs(
         pressure_np,
         velocity.back(),
@@ -751,7 +949,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
         right_hand_side);
 
     const double t_rhs = timer.wall_time();
-    stat_momentum_time_rhs.add_sample(t_rhs);
+    if(not use_fused_rhs)
+      stat_momentum_time_rhs.add_sample(t_rhs);
 
     dealii::Timer timer2;
 
@@ -843,59 +1042,34 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     // from the last previous time step and will be rotated to the front as
     // the 'new time step' rhs/solution vectors.
     op_rt->set_parameters(-factor_mass, -factor_lapl);
-    if(momentum_solver_in_extrapolation_mode)
+    if(use_fused_rhs)
     {
-      const auto compute_vector_norm_sqr_on_range =
-        [this](const unsigned int begin,
-               const unsigned int end) -> dealii::VectorizedArray<Number> {
-        constexpr unsigned int          n_lanes   = dealii::VectorizedArray<Number>::size();
-        const Number *                  ptr       = rhs_rt.begin() + begin;
-        const unsigned int              n_batches = (end - begin) / (2 * n_lanes);
-        dealii::VectorizedArray<Number> sum_0 = 0, sum_1 = 0;
-        for(unsigned int i = 0; i < n_batches; ++i)
-        {
-          dealii::VectorizedArray<Number> tmp;
-          tmp.load(ptr + n_lanes * 2 * i);
-          sum_0 += tmp * tmp;
-          tmp.load(ptr + n_lanes * (2 * i + 1));
-          sum_1 += tmp * tmp;
-        }
-        unsigned int remainder = end - begin - 2 * n_lanes * n_batches;
-        if(remainder > 0)
-        {
-          ptr += 2 * n_lanes * n_batches;
-          if(remainder >= n_lanes)
-          {
-            dealii::VectorizedArray<Number> tmp;
-            tmp.load(ptr);
-            sum_0 += tmp * tmp;
-            ptr += n_lanes;
-            remainder -= n_lanes;
-          }
-          for(unsigned int i = 0; i < remainder; ++i)
-            sum_1[i] += ptr[i] * ptr[i];
-        }
-        return sum_0 + sum_1;
-      };
-
+      const double norm_sqr_residual =
+        dealii::Utilities::MPI::sum(fused_norm_sqr_residual.sum(),
+                                    solution_rt.get_mpi_communicator());
+      extrapolate_accuracy = std::make_pair(momentum_rhs_norm_last, std::sqrt(norm_sqr_residual));
+    }
+    else if(momentum_solver_in_extrapolation_mode)
+    {
       dealii::VectorizedArray<Number> norm_sqr_rhs = 0, norm_sqr_residual = 0;
       op_rt->vmult(
         rhs_rt,
         solution_rt,
         [&](const unsigned int begin, const unsigned int end) {
-          norm_sqr_rhs += compute_vector_norm_sqr_on_range(begin, end);
+          norm_sqr_rhs += vector_norm_sqr_on_range(rhs_rt, begin, end);
         },
         [&](const unsigned int begin, const unsigned int end) {
           std::copy(rhs_rt.begin() + begin,
                     rhs_rt.begin() + end,
                     velocity_matvec.back().begin() + begin);
-          norm_sqr_residual += compute_vector_norm_sqr_on_range(begin, end);
+          norm_sqr_residual += vector_norm_sqr_on_range(rhs_rt, begin, end);
         });
       std::array<double, 2> sums = {{norm_sqr_rhs.sum(), norm_sqr_residual.sum()}};
       dealii::Utilities::MPI::sum(dealii::ArrayView<const Number>(sums.data(), 2),
                                   solution_rt.get_mpi_communicator(),
                                   dealii::ArrayView<Number>(sums.data(), 2));
-      extrapolate_accuracy = std::make_pair(std::sqrt(sums[0]), std::sqrt(sums[1]));
+      extrapolate_accuracy   = std::make_pair(std::sqrt(sums[0]), std::sqrt(sums[1]));
+      momentum_rhs_norm_last = extrapolate_accuracy.first;
     }
     else
       op_rt->vmult(
@@ -973,7 +1147,16 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
           dealii::Utilities::MPI::min(min_eig_estimate, diagonal_mass.get_mpi_communicator());
     }
     const double t_residual = timer2.wall_time();
-    stat_momentum_time_dp_residual.add_sample(t_residual);
+    if(use_fused_rhs)
+      stat_momentum_time_rhs_residual_fused.add_sample(t_rhs + t_residual);
+    else
+      stat_momentum_time_dp_residual.add_sample(t_residual);
+
+    // diagnostic of alternative initial guesses, based on the residual of
+    // the extrapolation in rhs_rt, not part of the timings
+    if(ig_diagnostic_interval > 0 && momentum_solver_in_extrapolation_mode &&
+       this->get_time_step_number() % ig_diagnostic_interval == 0)
+      initial_guess_diagnostic(factors_initial_guess, extrapolate_accuracy.first);
     timer2.restart();
 
     /*
@@ -1286,6 +1469,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
       }
     }
 
+    if(ig_diagnostic_interval > 0)
+      initial_guess_diagnostic_record_solution();
+
     /*
      * VII. Select the initial guess strategy for the next time step.
      */
@@ -1309,13 +1495,38 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::momentum_step()
     stat_momentum_residual_start.add_sample(initial_residual);
     stat_momentum_residual_stop.add_sample(reached_residual);
 
+    // Share of the solver error of the previous steps in the residual of the
+    // extrapolated initial guess: the solution of step n-1-j carries an error
+    // with residual norm r_end(n-1-j), which enters the initial guess with
+    // the extrapolation factor c_j. Assuming independent errors, they add up
+    // to sqrt(sum_j c_j^2 r_end(n-1-j)^2). Compared with the residual of the
+    // initial guess r_start^2 = r_smooth^2 + leak^2, a share above about 0.2
+    // means that the solver tolerance degrades the initial guess, i.e., the
+    // time history loses smoothness.
+    double solver_error_share = std::numeric_limits<double>::quiet_NaN();
+    if(used_extrapolation && momentum_residual_end_history.size() >= factors_initial_guess.size())
+    {
+      double leak_sqr = 0.;
+      for(unsigned int j = 0; j < factors_initial_guess.size(); ++j)
+        leak_sqr += dealii::Utilities::fixed_power<2>(factors_initial_guess[j] *
+                                                      momentum_residual_end_history[j]);
+      solver_error_share = std::sqrt(leak_sqr) / initial_residual;
+      stat_momentum_solver_error_share.add_sample(solver_error_share);
+    }
+    momentum_residual_end_history.insert(momentum_residual_end_history.begin(), reached_residual);
+    if(momentum_residual_end_history.size() > 8)
+      momentum_residual_end_history.pop_back();
+
     if(this->print_solver_info() and not(this->is_test))
     {
       this->pcout << std::endl
                   << "Solve viscous step (" << (used_extrapolation ? "extrapolation" : "projection")
                   << " reduced residual from " << extrapolate_accuracy.first << " to "
                   << initial_residual << " solve " << (need_cg_solver ? "CG" : "Ch") << " to "
-                  << reached_residual << "):";
+                  << reached_residual;
+      if(std::isfinite(solver_error_share))
+        this->pcout << ", solver error share " << std::setprecision(3) << solver_error_share;
+      this->pcout << "):";
       print_solver_info_linear(this->pcout, n_iterations, timer.wall_time());
     }
   }
@@ -1496,14 +1707,18 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
 
     iterations_avg.resize(2);
     iterations_avg[0] = stat_pressure_iterations.get_mean();
-    iterations_avg[1] =
-      (stat_momentum_iterations_cg.get_mean() * stat_momentum_iterations_cg.get_n_samples() +
-       stat_momentum_iterations_cheby.get_mean() * stat_momentum_iterations_cheby.get_n_samples() +
-       stat_momentum_iterations_cg_help.get_mean() *
-         stat_momentum_iterations_cg_help.get_n_samples()) /
-      (stat_momentum_iterations_cg.get_n_samples() +
-       stat_momentum_iterations_cheby.get_n_samples() +
-       stat_momentum_iterations_cg_help.get_n_samples());
+    // sum up only the solvers that ran, as an empty statistic has a NaN mean
+    double       sum_iterations = 0.;
+    unsigned int n_solves       = 0;
+    for(Utilities::StatisticalQuantity const * stat : {&stat_momentum_iterations_cg,
+                                                       &stat_momentum_iterations_cheby,
+                                                       &stat_momentum_iterations_cg_help})
+      if(stat->get_n_samples() > 0)
+      {
+        sum_iterations += stat->get_mean() * stat->get_n_samples();
+        n_solves += stat->get_n_samples();
+      }
+    iterations_avg[1] = sum_iterations / n_solves;
   }
 
   print_list_of_iterations(this->pcout, names, iterations_avg);
@@ -1529,6 +1744,7 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
   stat_momentum_rhs_norm.print_statistics(this->pcout, "U rhs norm", 25);
   stat_momentum_residual_start.print_statistics(this->pcout, "U residual start solve", 25);
   stat_momentum_residual_stop.print_statistics(this->pcout, "U residual end solve", 25);
+  stat_momentum_solver_error_share.print_statistics(this->pcout, "U solver error share", 25);
   stat_momentum_time_rhs.print_statistics(this->pcout, "U time rhs [s]", 25, &this->mpi_comm);
   stat_momentum_time_projection.print_statistics(
     this->pcout,
@@ -1539,6 +1755,12 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
                                                   "U time residual FP64 [s]",
                                                   25,
                                                   &this->mpi_comm);
+  stat_momentum_time_rhs_residual_fused.print_statistics(
+    this->pcout,
+    "U fused rhs+res (" + std::to_string(stat_momentum_time_rhs_residual_fused.get_n_samples()) +
+      "x)",
+    25,
+    &this->mpi_comm);
   stat_momentum_time_solve_cg.print_statistics(
     this->pcout,
     "U solve_cg (" + std::to_string(stat_momentum_time_solve_cg.get_n_samples()) + "x) [s]",
@@ -1550,7 +1772,198 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
       "x) [s]",
     25,
     &this->mpi_comm);
+  if(!ig_diagnostic_ratio.empty())
+  {
+    const unsigned int n = ig_diagnostic_history.size();
+    this->pcout << "  Residual of initial guess relative to extrapolation of order 4:" << std::endl;
+    for(unsigned int k = 0; k < ig_diagnostic_ratio.size(); ++k)
+      ig_diagnostic_ratio[k].print_statistics(this->pcout,
+                                              k < n ?
+                                                "  extrapolation order " + std::to_string(k + 1) :
+                                                "  projection " + std::to_string(k - n + 4) +
+                                                  " vectors",
+                                              25);
+  }
   this->pcout << std::endl;
+}
+
+
+
+template<int dim, typename Number>
+void
+TimeIntBDFConsistentSplittingExtruded<dim, Number>::initial_guess_diagnostic_record_solution()
+{
+  constexpr unsigned int n_history = 8;
+  if(ig_diagnostic_history.empty())
+  {
+    ig_diagnostic_history.resize(n_history);
+    ig_diagnostic_matvec.resize(n_history);
+    for(unsigned int i = 0; i < n_history; ++i)
+    {
+      ig_diagnostic_history[i].reinit(velocity_red[0], true);
+      ig_diagnostic_matvec[i].reinit(velocity_red[0], true);
+    }
+    ig_diagnostic_times.assign(n_history, 0.);
+    ig_diagnostic_ratio.resize(n_history + n_history - 3);
+  }
+  for(unsigned int i = n_history - 1; i > 0; --i)
+  {
+    ig_diagnostic_history[i].swap(ig_diagnostic_history[i - 1]);
+    ig_diagnostic_times[i] = ig_diagnostic_times[i - 1];
+  }
+  ig_diagnostic_history[0].copy_locally_owned_data_from(solution_rt);
+  ig_diagnostic_times[0] = this->get_next_time();
+  ig_diagnostic_n_filled = std::min<unsigned int>(ig_diagnostic_n_filled + 1, n_history);
+}
+
+
+
+// Compare the residual of the current initial guess, the extrapolation of
+// order 4 from the last four solutions, to the residuals of extrapolations
+// of other orders and of least-squares projections onto the span of the
+// last 4 to n solutions. The residual of the current guess r = b - A x_4 in
+// rhs_rt has been computed in double precision. As it is about 1e-7 of the
+// right-hand side, the other candidates are evaluated via their difference
+// to x_4, r - A (x - x_4), expanded in the basis of backward differences
+// B_m of the solutions, for which single-precision products A B_m are
+// accurate enough because the coefficients of the difference are small.
+template<int dim, typename Number>
+void
+TimeIntBDFConsistentSplittingExtruded<dim, Number>::initial_guess_diagnostic(
+  std::vector<Number> const & factors_initial_guess,
+  double const                rhs_norm)
+{
+  const unsigned int n = ig_diagnostic_history.size();
+  if(ig_diagnostic_n_filled < n || factors_initial_guess.size() != 4)
+    return;
+
+  // backward differences B_m = sum_j (-1)^j binom(m, j) u^{n-j} and their
+  // products with the operator of this time step
+  std::vector<std::vector<double>> binomial(n, std::vector<double>(n, 0.));
+  for(unsigned int m = 0; m < n; ++m)
+  {
+    binomial[m][0] = 1.;
+    for(unsigned int j = 1; j <= m; ++j)
+      binomial[m][j] = binomial[m - 1][j - 1] + (j < m ? binomial[m - 1][j] : 0.);
+  }
+  VectorTypeFloat difference;
+  difference.reinit(ig_diagnostic_history[0], true);
+  op_rt_float->set_parameters(this->get_scaling_factor_time_derivative_term(),
+                              this->pde_operator->get_viscous_kernel_data().viscosity);
+  const unsigned int owned_size = difference.locally_owned_size();
+  for(unsigned int m = 0; m < n; ++m)
+  {
+    difference = 0.f;
+    for(unsigned int j = 0; j <= m; ++j)
+      difference.add((j % 2 ? -1. : 1.) * binomial[m][j], ig_diagnostic_history[j]);
+    op_rt_float->vmult(ig_diagnostic_matvec[m], difference);
+  }
+
+  // Gram matrix G_ml = (A B_m, A B_l), g_m = (A B_m, r), and |r|^2
+  std::vector<double> sums(n * n + n + 1, 0.);
+  for(unsigned int i = 0; i < owned_size; ++i)
+  {
+    const double r_i = rhs_rt.local_element(i);
+    for(unsigned int m = 0; m < n; ++m)
+    {
+      const double v_m = ig_diagnostic_matvec[m].local_element(i);
+      for(unsigned int l = 0; l <= m; ++l)
+        sums[m * n + l] += v_m * ig_diagnostic_matvec[l].local_element(i);
+      sums[n * n + m] += v_m * r_i;
+    }
+    sums[n * n + n] += r_i * r_i;
+  }
+  dealii::Utilities::MPI::sum(dealii::ArrayView<const double>(sums.data(), sums.size()),
+                              solution_rt.get_mpi_communicator(),
+                              dealii::ArrayView<double>(sums.data(), sums.size()));
+  const auto G = [&](const unsigned int m, const unsigned int l) {
+    return m >= l ? sums[m * n + l] : sums[l * n + m];
+  };
+  const double * g      = sums.data() + n * n;
+  const double   r_sqr  = sums[n * n + n];
+  const double   r_norm = std::sqrt(r_sqr);
+
+  // residual of x_4 + sum_m a_m B_m
+  const auto residual = [&](const std::vector<double> & a) {
+    double value = r_sqr;
+    for(unsigned int m = 0; m < n; ++m)
+    {
+      value -= 2. * a[m] * g[m];
+      for(unsigned int l = 0; l < n; ++l)
+        value += a[m] * G(m, l) * a[l];
+    }
+    return std::sqrt(std::abs(value));
+  };
+
+  // extrapolation of order k by Lagrange interpolation in the times of the
+  // solutions, as difference to the current guess in the basis B_m
+  const double        t_new = this->get_next_time();
+  std::vector<double> ratios;
+  for(unsigned int k = 1; k <= n; ++k)
+  {
+    std::vector<double> c(n, 0.);
+    for(unsigned int j = 0; j < k; ++j)
+    {
+      double beta = 1.;
+      for(unsigned int l = 0; l < k; ++l)
+        if(l != j)
+          beta *=
+            (t_new - ig_diagnostic_times[l]) / (ig_diagnostic_times[j] - ig_diagnostic_times[l]);
+      c[j] = beta;
+    }
+    for(unsigned int j = 0; j < 4; ++j)
+      c[j] -= factors_initial_guess[j];
+    // u^{n-j} = sum_m (-1)^m binom(j, m) B_m
+    std::vector<double> a(n, 0.);
+    for(unsigned int j = 0; j < n; ++j)
+      for(unsigned int m = 0; m <= j; ++m)
+        a[m] += c[j] * (m % 2 ? -1. : 1.) * binomial[j][m];
+    ratios.push_back(residual(a) / r_norm);
+  }
+
+  // projection onto the span of B_0, ..., B_{p-1}, p >= 4, which contains
+  // the current guess: |r|^2 - g^T G^{-1} g by an LDL^T factorization
+  {
+    std::vector<std::vector<double>> L(n, std::vector<double>(n, 0.));
+    std::vector<double>              D(n, 0.), y(n, 0.);
+    double                           reduction = 0.;
+    for(unsigned int i = 0; i < n; ++i)
+    {
+      for(unsigned int j = 0; j < i; ++j)
+      {
+        double value = G(i, j);
+        for(unsigned int k = 0; k < j; ++k)
+          value -= L[i][k] * D[k] * L[j][k];
+        L[i][j] = value / D[j];
+      }
+      D[i] = G(i, i);
+      for(unsigned int k = 0; k < i; ++k)
+        D[i] -= L[i][k] * L[i][k] * D[k];
+      y[i] = g[i];
+      for(unsigned int k = 0; k < i; ++k)
+        y[i] -= L[i][k] * y[k];
+      if(D[i] > 1e-14 * G(i, i) && D[i] > 0)
+        reduction += y[i] * y[i] / D[i];
+      if(i >= 3)
+        ratios.push_back(std::sqrt(std::max(0., r_sqr - reduction)) / r_norm);
+    }
+  }
+
+  for(unsigned int k = 0; k < ratios.size(); ++k)
+    ig_diagnostic_ratio[k].add_sample(ratios[k]);
+
+  if(this->print_solver_info() and not(this->is_test))
+  {
+    this->pcout << std::endl
+                << "Initial guess diagnostic: |b| = " << rhs_norm << ", |r| = " << r_norm
+                << " (extrapolation order 4); relative residual extrapolation order 1-" << n << ":";
+    for(unsigned int k = 0; k < n; ++k)
+      this->pcout << " " << ratios[k];
+    this->pcout << "; projection 4-" << n << " vectors:";
+    for(unsigned int k = n; k < ratios.size(); ++k)
+      this->pcout << " " << ratios[k];
+    this->pcout << std::endl;
+  }
 }
 
 

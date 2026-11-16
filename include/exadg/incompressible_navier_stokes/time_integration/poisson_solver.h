@@ -280,7 +280,7 @@ public:
   }
 
   /**
-   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual
+   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual_and_add
    */
   void
   restrict_residual(VectorType &       dst,
@@ -290,6 +290,7 @@ public:
     const bool has_ghosts = solution.has_ghost_elements();
     if(!has_ghosts)
       solution.update_ghost_values();
+    dst = 0;
     restrict_cells<true>(dst, solution, &rhs);
     if(!has_ghosts)
       solution.zero_out_ghost_values();
@@ -342,42 +343,35 @@ private:
   // with 'A src' evaluated within the same loop (residual == true), and summed into dst
   template<bool residual>
   void
-  restrict_cells(VectorType & coarse_dst, const VectorType & src, const VectorType * rhs) const
+  restrict_cells(VectorType & dst, const VectorType & src, const VectorType * rhs) const
   {
-    int dummy = 0;
-    operator_coarse.get_matrix_free().template cell_loop<VectorType, int>(
-      [&](const auto &,
-          VectorType & dst,
-          const int &,
-          const std::pair<unsigned int, unsigned int> & cell_range) {
-        const unsigned int size_fine = prolongation_matrix.n();
-        for(unsigned int cell = cell_range.first; cell < cell_range.second; ++cell)
-        {
-          if(size_fine == 2)
-            do_restrict_and_add_on_cell<2, residual>(cell, dst, src, rhs);
-          else if(size_fine == 3)
-            do_restrict_and_add_on_cell<3, residual>(cell, dst, src, rhs);
-          else if(size_fine == 4)
-            do_restrict_and_add_on_cell<4, residual>(cell, dst, src, rhs);
-          else if(size_fine == 5)
-            do_restrict_and_add_on_cell<5, residual>(cell, dst, src, rhs);
-          else if(size_fine == 6)
-            do_restrict_and_add_on_cell<6, residual>(cell, dst, src, rhs);
-          else if(size_fine == 7)
-            do_restrict_and_add_on_cell<7, residual>(cell, dst, src, rhs);
-          else if(size_fine == 8)
-            do_restrict_and_add_on_cell<8, residual>(cell, dst, src, rhs);
-          else if(size_fine == 9)
-            do_restrict_and_add_on_cell<9, residual>(cell, dst, src, rhs);
-          else
-            AssertThrow(false,
-                        ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
-                                   " not instantiated"));
-        }
-      },
-      coarse_dst,
-      dummy,
-      /* zero_dst */ residual);
+    const unsigned int size_fine      = prolongation_matrix.n();
+    const unsigned int n_cell_batches = operator_fine.get_matrix_free().n_cell_batches();
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      if(size_fine == 2)
+        do_restrict_and_add_on_cell<2, residual>(cell, dst, src, rhs);
+      else if(size_fine == 3)
+        do_restrict_and_add_on_cell<3, residual>(cell, dst, src, rhs);
+      else if(size_fine == 4)
+        do_restrict_and_add_on_cell<4, residual>(cell, dst, src, rhs);
+      else if(size_fine == 5)
+        do_restrict_and_add_on_cell<5, residual>(cell, dst, src, rhs);
+      else if(size_fine == 6)
+        do_restrict_and_add_on_cell<6, residual>(cell, dst, src, rhs);
+      else if(size_fine == 7)
+        do_restrict_and_add_on_cell<7, residual>(cell, dst, src, rhs);
+      else if(size_fine == 8)
+        do_restrict_and_add_on_cell<8, residual>(cell, dst, src, rhs);
+      else if(size_fine == 9)
+        do_restrict_and_add_on_cell<9, residual>(cell, dst, src, rhs);
+      else
+        AssertThrow(false,
+                    ExcMessage("Fine degree " + std::to_string(size_fine - 1) +
+                               " not instantiated"));
+    }
+
+    dst.compress(VectorOperation::add);
   }
 
   template<int size_fine>
@@ -801,7 +795,7 @@ public:
   }
 
   /**
-   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual
+   * @copydoc MGTwoLevelTransferResidualRestriction::restrict_residual_and_add
    */
   void
   restrict_residual(VectorType &       dst,
@@ -2425,7 +2419,12 @@ private:
   do_vcycle(const bool zero_out_solution, const VectorType & src_rhs, VectorType & solution) const
   {
     if(residual_restriction.empty())
+    {
       setup_residual_restriction();
+      setup_fused_dg_prolongation();
+      if(std::getenv("EXADG_BENCHMARK_DG_PROLONGATION") != nullptr)
+        benchmark_dg_prolongation();
+    }
     ++count_times;
     Timer time;
     if(zero_out_solution)
@@ -2489,12 +2488,154 @@ private:
       timings[level + 1][1] += time.wall_time();
       time.restart();
     }
-    dg_matrix.prolongate_and_add(solution, solution_update[max_level], mg_matrices[max_level]);
-    timings.back()[3] += time.wall_time();
-    time.restart();
+    if(fused_dg_prolongation)
+    {
+      // prolongation within the first matrix-vector product of the DG
+      // smoother, accounted as smoothing
+      step_dg_smoother_with_prolongation(solution, src_rhs, solution_update[max_level]);
+      timings.back()[1] += time.wall_time();
+    }
+    else
+    {
+      dg_matrix.prolongate_and_add(solution, solution_update[max_level], mg_matrices[max_level]);
+      timings.back()[3] += time.wall_time();
+      time.restart();
 
-    mg_smoother_dg.step(solution, src_rhs);
-    timings.back()[1] += time.wall_time();
+      mg_smoother_dg.step(solution, src_rhs);
+      timings.back()[1] += time.wall_time();
+    }
+  }
+
+  // Add the prolongation of fe_correction to solution and run the DG
+  // smoother with it as initial guess, with the prolongation within the
+  // first matrix-vector product
+  void
+  step_dg_smoother_with_prolongation(VectorType &       solution,
+                                     const VectorType & rhs_dg,
+                                     const VectorType & fe_correction) const
+  {
+    mg_smoother_dg.step_with_first_product(solution, rhs_dg, [&](const auto & after_loop) {
+      dg_matrix.vmult_scratch_with_prolongation(solution,
+                                                fe_correction,
+                                                mg_matrices[max_level],
+                                                after_loop);
+    });
+  }
+
+  // Time the kernels of the DG prolongation over all cells, see
+  // LaplaceOperatorDG::benchmark_prolongation_kernel(), with the number of
+  // repetitions given by EXADG_BENCHMARK_DG_PROLONGATION, and check that
+  // they give the same result
+  void
+  benchmark_dg_prolongation() const
+  {
+    const MPI_Comm     comm = MPI_COMM_WORLD;
+    const unsigned int n_repetitions =
+      std::max(1, std::atoi(std::getenv("EXADG_BENCHMARK_DG_PROLONGATION")));
+    const auto & fe = mg_matrices[max_level];
+    AssertThrow(Utilities::MPI::max(fe.has_hanging_nodes() ? 1 : 0, comm) == 0,
+                ExcMessage("The scalar variant does not support hanging nodes"));
+    VectorType e, dg_initial, dg;
+    fe.initialize_dof_vector(e);
+    dg_matrix.initialize_dof_vector(dg_initial);
+    std::mt19937                           gen(Utilities::MPI::this_mpi_process(comm));
+    std::uniform_real_distribution<Number> dist(-1., 1.);
+    for(unsigned int i = 0; i < e.locally_owned_size(); ++i)
+      e.local_element(i) = dist(gen);
+    for(const unsigned int i : fe.get_matrix_free().get_constrained_dofs())
+      e.local_element(i) = 0;
+    for(unsigned int i = 0; i < dg_initial.locally_owned_size(); ++i)
+      dg_initial.local_element(i) = dist(gen);
+    e.update_ghost_values();
+
+    std::array<VectorType, 3> results;
+    std::array<double, 3>     times;
+    for(unsigned int variant = 0; variant < 3; ++variant)
+    {
+      results[variant] = dg_initial;
+      dg_matrix.benchmark_prolongation_kernel(variant, e, fe, results[variant]);
+      dg       = dg_initial;
+      int ierr = MPI_Barrier(comm);
+      AssertThrowMPI(ierr);
+      Timer timer;
+      for(unsigned int r = 0; r < n_repetitions; ++r)
+        dg_matrix.benchmark_prolongation_kernel(variant, e, fe, dg);
+      times[variant] = 1e6 * Utilities::MPI::max(timer.wall_time(), comm) / n_repetitions;
+    }
+    e.zero_out_ghost_values();
+
+    std::array<unsigned int, 3> n_different = {};
+    for(unsigned int variant = 1; variant < 3; ++variant)
+    {
+      for(unsigned int i = 0; i < dg.locally_owned_size(); ++i)
+        if(results[variant].local_element(i) != results[0].local_element(i))
+          ++n_different[variant];
+      n_different[variant] = Utilities::MPI::sum(n_different[variant], comm);
+    }
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << std::endl
+                << "DG prolongation kernels over all cells, degree "
+                << fe.get_matrix_free().get_dof_handler().get_fe().degree << ", " << n_repetitions
+                << " repetitions, microseconds per call, max over processes:" << std::endl
+                << std::fixed << std::setprecision(1)
+                << "  (a) per cell batch (do_prolongate):          " << times[0] << std::endl
+                << "  (b) gathered index arrays:                   " << times[1] << "   ("
+                << n_different[1] << " entries differ from (a))" << std::endl
+                << "  (c) scalar read per cell, contiguous update: " << times[2] << "   ("
+                << n_different[2] << " entries differ from (a))" << std::defaultfloat << std::endl
+                << std::endl;
+  }
+
+  // Use the DG prolongation within the first product of the DG smoother
+  // unless the environment variable EXADG_NO_FUSED_DG_PROLONGATION is set;
+  // with EXADG_CHECK_FUSED_DG_PROLONGATION, compare to the separate
+  // computation on random vectors
+  void
+  setup_fused_dg_prolongation() const
+  {
+    fused_dg_prolongation = std::getenv("EXADG_NO_FUSED_DG_PROLONGATION") == nullptr;
+    if(!fused_dg_prolongation || std::getenv("EXADG_CHECK_FUSED_DG_PROLONGATION") == nullptr)
+      return;
+
+    VectorType x_separate, x_fused, b, e;
+    dg_matrix.initialize_dof_vector(x_separate);
+    dg_matrix.initialize_dof_vector(b);
+    mg_matrices[max_level].initialize_dof_vector(e);
+    std::mt19937                           gen(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD));
+    std::uniform_real_distribution<Number> dist(-1., 1.);
+    for(unsigned int i = 0; i < x_separate.locally_owned_size(); ++i)
+    {
+      x_separate.local_element(i) = dist(gen);
+      b.local_element(i)          = dist(gen);
+    }
+    for(unsigned int i = 0; i < e.locally_owned_size(); ++i)
+      e.local_element(i) = dist(gen);
+    for(const unsigned int i : mg_matrices[max_level].get_matrix_free().get_constrained_dofs())
+      e.local_element(i) = 0;
+    x_fused = x_separate;
+
+    dg_matrix.prolongate_and_add(x_separate, e, mg_matrices[max_level]);
+    mg_smoother_dg.step(x_separate, b);
+    step_dg_smoother_with_prolongation(x_fused, b, e);
+
+    double       max_difference = 0;
+    unsigned int n_different    = 0;
+    for(unsigned int i = 0; i < x_fused.locally_owned_size(); ++i)
+      if(x_fused.local_element(i) != x_separate.local_element(i))
+      {
+        ++n_different;
+        max_difference =
+          std::max<double>(max_difference,
+                           std::abs(x_fused.local_element(i) - x_separate.local_element(i)));
+      }
+    max_difference    = Utilities::MPI::max(max_difference, MPI_COMM_WORLD);
+    n_different       = Utilities::MPI::sum(n_different, MPI_COMM_WORLD);
+    const double norm = x_separate.l2_norm();
+    if(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+      std::cout << "Fused DG prolongation in DG smoother: " << n_different << " of "
+                << x_fused.size()
+                << " entries differ from the separate computation, max difference "
+                << max_difference << ", |x| = " << norm << std::endl;
   }
 
   std::vector<std::shared_ptr<const dealii::Triangulation<dim>>> coarse_triangulations;
@@ -2525,6 +2666,10 @@ private:
   // restriction, else nullptr, set up in the first V-cycle
   mutable std::vector<const MGTwoLevelTransferResidualRestriction<dim, Number> *>
     residual_restriction;
+
+  // whether the DG prolongation runs within the first product of the DG
+  // smoother, set up in the first V-cycle
+  mutable bool fused_dg_prolongation = false;
 
   mutable dealii::MGLevelObject<VectorType> rhs;
   mutable dealii::MGLevelObject<VectorType> temp_vector;

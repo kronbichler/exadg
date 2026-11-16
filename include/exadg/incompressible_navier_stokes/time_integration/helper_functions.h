@@ -21,26 +21,6 @@
 
 #pragma once
 
-/*  ______________________________________________________________________
- *
- *  ExaDG - High-Order Discontinuous Galerkin for the Exa-Scale
- *
- *  Copyright (C) 2025 by Martin Kronbichler, Shubham Goswami,
- *  Schussnig
- *
- *  This file is dual-licensed under the Apache-2.0 with LLVM Exception (see
- *  https://spdx.org/licenses/Apache-2.0.html and
- *  https://spdx.org/licenses/LLVM-exception.html) and the GNU General Public
- *  License as published by the Free Software Foundation, either version 3 of
- *  the License, or (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License in the top-level LICENSE file for
- *  more details.
- *  ______________________________________________________________________
- */
 template<bool add_into_result, typename Number, typename Number2, typename Number3>
 void
 extrapolate_vectors_range(
