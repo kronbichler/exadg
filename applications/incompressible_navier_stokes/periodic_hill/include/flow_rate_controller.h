@@ -66,7 +66,8 @@ public:
 
     // dimensional analysis: [k_I] = 1/(m^2 s^2) -> k_I = const * u_b^2 / H^4
     double const C_I = 100.0;
-    double const k_I = C_I * std::pow(bulk_velocity, 2) / std::pow(length_scale, 4);
+    double const H   = length_scale;
+    double const k_I = C_I * std::pow(bulk_velocity, 2) / ((H * H) * (H * H));
     f += k_I * (target_flow_rate - flow_rate) * time_step;
 
     // the time step size is 0 when this function is called the first time
@@ -74,14 +75,14 @@ public:
     {
       // dimensional analysis: [k_D] = 1/(m^2) -> k_D = const / H^2
       double const C_D = 0.1;
-      double const k_D = C_D / std::pow(length_scale, 2.0);
+      double const k_D = C_D / (H * H);
       f_damping        = -k_D * (flow_rate - flow_rate_old) / time_step;
     }
 
     // proportional term (P) to damp the oscillation of the I-controller
     // dimensional analysis: [k_P] = 1/(m^2 s) -> k_P = const * u_b / H^3
     double const C_P = 2.0;
-    double const k_P = C_P * bulk_velocity / std::pow(length_scale, 3);
+    double const k_P = C_P * bulk_velocity / (H * H * H);
     f_proportional   = k_P * (target_flow_rate - flow_rate);
 
     flow_rate_old = flow_rate;
