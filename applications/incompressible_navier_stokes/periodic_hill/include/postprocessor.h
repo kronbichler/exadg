@@ -217,6 +217,13 @@ private:
     AssertThrow(consistent_splitting_operator->momentum_operator.get() != nullptr,
                 dealii::ExcNotImplemented());
     const auto & momentum_op = *consistent_splitting_operator->momentum_operator;
+
+    // the evaluation of the convective term at the end of the time step
+    // computes the integral as a by-product, so use that one if available
+    dealii::Tensor<1, dim, double> integral;
+    if(momentum_op.get_velocity_integral(*consistent_splitting_operator->velocity_vector, integral))
+      return integral[0];
+
     std::array<unsigned int, dealii::VectorizedArray<Number>::size()>              indices;
     dealii::AlignedVector<dealii::Tensor<1, dim, dealii::VectorizedArray<Number>>> velocities;
     Number                                                                         sum = 0;

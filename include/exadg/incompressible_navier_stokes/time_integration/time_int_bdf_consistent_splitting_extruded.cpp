@@ -664,6 +664,12 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::evaluate_convective_term()
         pressure_nbc_rhs.back());
     }
   }
+  else
+  {
+    // the velocity integral of the evaluation during initialization does
+    // not belong to the new solution, even if its vector data is cycled back
+    op_rt->invalidate_velocity_integral();
+  }
 
   this->timer_tree->insert({"Timeloop", "Evaluate convection"}, timer.wall_time());
 }

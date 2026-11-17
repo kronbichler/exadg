@@ -899,7 +899,8 @@ public:
                 velocity_dst.begin() + cell_loop_pre_list[range].second,
                 Number());
 
-    Number cfl_factor = 0.;
+    Number                 cfl_factor = 0.;
+    Tensor<1, dim, double> integral;
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
       for(unsigned int range = cell_loop_mass_pre_list_index[cell];
@@ -909,40 +910,50 @@ public:
                   velocity_dst.begin() + cell_loop_mass_pre_list[range].second,
                   Number());
 
-      VectorizedArray<Number> convective_cfl = 0.;
-      const unsigned int      degree         = shape_info.data[0].fe_degree;
+      VectorizedArray<Number>                 convective_cfl = 0.;
+      Tensor<1, dim, VectorizedArray<Number>> cell_integral;
+      const unsigned int                      degree = shape_info.data[0].fe_degree;
       if(degree == 2)
         convective_cfl = do_convective_and_divergence_on_cell<2>(
-          cell, src, velocity_dst, convective_divergence, divergence);
+          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
       else if(degree == 3)
         convective_cfl = do_convective_and_divergence_on_cell<3>(
-          cell, src, velocity_dst, convective_divergence, divergence);
+          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
       else if(degree == 4)
         convective_cfl = do_convective_and_divergence_on_cell<4>(
-          cell, src, velocity_dst, convective_divergence, divergence);
+          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
 #ifndef DEBUG
       else if(degree == 5)
         convective_cfl = do_convective_and_divergence_on_cell<5>(
-          cell, src, velocity_dst, convective_divergence, divergence);
+          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
       else if(degree == 6)
         convective_cfl = do_convective_and_divergence_on_cell<6>(
-          cell, src, velocity_dst, convective_divergence, divergence);
+          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
       else if(degree == 7)
         convective_cfl = do_convective_and_divergence_on_cell<7>(
-          cell, src, velocity_dst, convective_divergence, divergence);
+          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
       else if(degree == 8)
         convective_cfl = do_convective_and_divergence_on_cell<8>(
-          cell, src, velocity_dst, convective_divergence, divergence);
+          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
       else if(degree == 9)
         convective_cfl = do_convective_and_divergence_on_cell<9>(
-          cell, src, velocity_dst, convective_divergence, divergence);
+          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
 #endif
       else
         AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
 
       for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+      {
         cfl_factor = std::max(cfl_factor, convective_cfl[v]);
+        for(unsigned int d = 0; d < dim; ++d)
+          integral[d] += cell_integral[d][v];
+      }
     }
+
+    // store the local part of the velocity integral for
+    // get_velocity_integral(), tagged by the data of the source vector
+    velocity_integral_local = integral;
+    velocity_integral_data  = src.begin();
 
     single_exchange.signal_done_reading();
     velocity_dst.compress_start(0, VectorOperation::add);
@@ -951,6 +962,39 @@ public:
     single_exchange.wait_until_source_vector_free();
 
     return Utilities::MPI::max(cfl_factor, divergence.get_mpi_communicator());
+  }
+
+  // Get the integral of the velocity over the domain, computed as a
+  // by-product of the last call to evaluate_convective_and_divergence_term()
+  // at the cost of a few multiply-adds per quadrature point. The value is
+  // only valid if that call was done on the data now held by `velocity`
+  // (vectors that were swapped since then keep their data, so the check
+  // compares the data pointers). Returns false on all processes if this is
+  // not the case on some process, in which case the caller must compute the
+  // integral by other means. This function is collective over the
+  // communicator of `velocity`, with one reduction.
+  bool
+  get_velocity_integral(const VectorType & velocity, Tensor<1, dim, double> & integral) const
+  {
+    std::array<double, dim + 1> data;
+    for(unsigned int d = 0; d < dim; ++d)
+      data[d] = velocity_integral_local[d];
+    data[dim] =
+      (velocity_integral_data != nullptr && velocity_integral_data == velocity.begin()) ? 0. : 1.;
+    Utilities::MPI::sum(ArrayView<const double>(data.data(), data.size()),
+                        velocity.get_mpi_communicator(),
+                        ArrayView<double>(data.data(), data.size()));
+    for(unsigned int d = 0; d < dim; ++d)
+      integral[d] = data[d];
+    return data[dim] == 0.;
+  }
+
+  // Mark the velocity integral of get_velocity_integral() as invalid, for
+  // callers that change the data of the evaluated vector in place.
+  void
+  invalidate_velocity_integral() const
+  {
+    velocity_integral_data = nullptr;
   }
 
   // Interface for benchmarking the cell kernels of vmult() and
@@ -2148,6 +2192,12 @@ private:
   std::shared_ptr<const Utilities::MPI::Partitioner> partitioner;
 
   mutable std::array<double, 15> timings;
+
+  // local part of the velocity integral from the last call to
+  // evaluate_convective_and_divergence_term() and the data of the vector it
+  // was computed from, see get_velocity_integral()
+  mutable Tensor<1, dim, double> velocity_integral_local;
+  mutable const Number *         velocity_integral_data = nullptr;
 
   // number of calls and accumulated time of the products with the Laplace
   // part for the variants vmult() with functions, vmult_add_before_on_dst()
@@ -4835,11 +4885,13 @@ private:
   // benchmark_cell_range().
   template<int degree, int last_stage = 3>
   VectorizedArray<Number>
-  do_convective_and_divergence_on_cell(const unsigned int cell,
-                                       const VectorType & src,
-                                       VectorType &       velocity_dst,
-                                       VectorType &       convective_divergence,
-                                       VectorType &       divergence) const
+  do_convective_and_divergence_on_cell(
+    const unsigned int                        cell,
+    const VectorType &                        src,
+    VectorType &                              velocity_dst,
+    VectorType &                              convective_divergence,
+    VectorType &                              divergence,
+    Tensor<1, dim, VectorizedArray<Number>> * velocity_integral = nullptr) const
   {
     constexpr unsigned int n_q_points_1d = degree + (degree + 1) / 2;
     constexpr unsigned int n_points      = Utilities::pow(n_q_points_1d, dim);
@@ -4856,8 +4908,9 @@ private:
     // of a plane of constant y only while processing that plane (the
     // derivatives in y direction are computed for the whole cell before),
     // and reads each point and line before writing it. The faces are
-    // computed before compute_cell().
-    VectorizedArray<Number> quad_values[dim * n_points + 1];
+    // computed before compute_cell(). After the CFL velocity, compute_cell()
+    // appends the integral of the velocity over the cell (dim entries).
+    VectorizedArray<Number> quad_values[dim * n_points + 1 + dim];
     VectorizedArray<Number> pressure_values[3 * n_points];
     VectorizedArray<Number> pressure_dofs[n_pressure];
     VectorizedArray<Number> face_data[2 * dim * (dim + 1) * n_points_plane];
@@ -4948,6 +5001,10 @@ private:
                                                     pressure_values + n_points_plane,
                                                     pressure_dofs);
     store_pressure(convective_divergence);
+
+    if(velocity_integral != nullptr)
+      for(unsigned int d = 0; d < dim; ++d)
+        (*velocity_integral)[d] = quad_values[dim * n_points + 1 + d];
 
     return quad_values[dim * n_points];
   }
@@ -5301,6 +5358,10 @@ private:
 
     VectorizedArray<Number> cfl_velocity = 0;
 
+    // integral of the velocity over the cell, computed as a by-product of the
+    // convective term with divergence, see get_velocity_integral()
+    Tensor<1, dim, VectorizedArray<Number>> velocity_integral;
+
     for(unsigned int qy = 0, q1 = 0; qy < nn; ++qy)
     {
       for(unsigned int i0 = 0; i0 < (dim == 3 ? nn : 1); ++i0)
@@ -5404,6 +5465,10 @@ private:
               cfl_velocity =
                 std::max(cfl_velocity, scaled_velocity.norm_square() * (inv_jac_det * inv_jac_det));
             }
+            // u * det(J) = J * val, so the integral of u is the sum of
+            // J * val times the quadrature weight
+            for(unsigned int d = 0; d < dim; ++d)
+              velocity_integral[d] += val_real[d] * mapping_info.quad_weights_xy[q1];
             VectorizedArray<Number> tmp[2] = {grad_real[0][0] * t0 + grad_real[0][1] * t1,
                                               grad_real[1][0] * t0 + grad_real[1][1] * t1};
             for(unsigned int d = 0; d < dim; ++d)
@@ -5599,6 +5664,14 @@ private:
                   std::max(cfl_velocity,
                            scaled_velocity.norm_square() * (inv_jac_det_3d * inv_jac_det_3d));
               }
+              // u * det(J) = J * val (val_real, without the factor
+              // det(J^{-1})), so the integral of u is the sum of J * val
+              // times the quadrature weight
+              {
+                const VectorizedArray<Number> weight = mapping_info.quad_weights_xy[q1] * weight_z;
+                for(unsigned int d = 0; d < dim; ++d)
+                  velocity_integral[d] += val_real[d] * weight;
+              }
               VectorizedArray<Number> tmp[3];
               for(unsigned int d = 0; d < dim; ++d)
               {
@@ -5751,6 +5824,12 @@ private:
     if(cell_operation == CellOperation::convective_and_divergence ||
        cell_operation == CellOperation::convective)
       out_values[dim * n_q_points] = std::sqrt(cfl_velocity);
+
+    // the convective term with divergence additionally appends the integral
+    // of the velocity over the cell
+    if constexpr(cell_operation == CellOperation::convective_and_divergence)
+      for(unsigned int d = 0; d < dim; ++d)
+        out_values[dim * n_q_points + 1 + d] = velocity_integral[d];
   }
 
   template<int n_q_points_1d>
