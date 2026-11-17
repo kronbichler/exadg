@@ -44,6 +44,13 @@
 
 namespace RTOperator
 {
+  using namespace dealii;
+
+  /**
+   * Add element-wise contributions of Raviart-Thomas operator evaluation to a
+   * right-hand-side vector for a given polynomial degree and with the given
+   * indices.
+   */
 template<int dim, int degree, typename Number>
 void
 distribute_local_to_global_rt_compressed(
@@ -57,6 +64,7 @@ distribute_local_to_global_rt_compressed(
   constexpr unsigned int dofs_per_face = dealii::Utilities::pow(degree, dim - 1);
   constexpr unsigned int dofs_per_comp = dofs_per_face * (degree + 1);
 
+  // x component: face contributions
   dealii::VectorizedArray<Number> data[dofs_per_face];
   for(unsigned int f = 0; f < 2; ++f)
   {
@@ -84,8 +92,10 @@ distribute_local_to_global_rt_compressed(
         }
     }
   }
+
   if(dim == 3)
   {
+    // face contributions of y component in a 3d problem
     for(unsigned int f = 0; f < 2; ++f)
     {
       for(unsigned int i = 0; i < degree; ++i)
@@ -117,6 +127,7 @@ distribute_local_to_global_rt_compressed(
     }
   }
 
+  // face contribution of last component (in 3d: z component)
   for(unsigned int f = 0; f < 2; ++f)
   {
     const dealii::VectorizedArray<Number> * data =
@@ -145,6 +156,9 @@ distribute_local_to_global_rt_compressed(
     }
   }
 
+  // cell contributions, working through x component, y component, and z
+  // component, copying data out in a contiguous array that can be added with
+  // vectorized operations
   dealii::VectorizedArray<Number> data_2[dofs_per_comp - 2 * dofs_per_face];
   for(unsigned int i = 0; i < dofs_per_face; ++i)
     for(unsigned int j = 1; j < degree; ++j)
@@ -193,9 +207,6 @@ distribute_local_to_global_rt_compressed(
 }
 
 
-using namespace dealii;
-
-
 
 template<int dim, typename Number = double>
 class RaviartThomasOperator : public EnableObserverPointer
@@ -224,14 +235,15 @@ public:
     this->dof_handler             = &dof_handler;
     const FiniteElement<dim> & fe = dof_handler.get_fe();
 
-    // per cell batch, face and lane: index of the face among the faces
-    // whose data is received from remote processes, used to set up
+    // per cell batch, face and lane: index of the face among the list of
+    // faces whose data is received from remote processes used to set up
     // single_exchange
     std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>> mpi_exchange_data_on_faces;
 
     AssertThrow(dynamic_cast<const FE_RaviartThomasNodal<dim> *>(&fe),
                 ExcMessage("This class only works for Raviart-Thomas elements. Set "
                            "spatial discretization to HDIV"));
+
     MatrixFree<dim, Number>                          matrix_free;
     typename MatrixFree<dim, Number>::AdditionalData mf_data;
     mf_data.cell_vectorization_category          = cell_vectorization_category;
@@ -267,10 +279,10 @@ public:
       // Extract ghost entries for which we need to query the numbers from
       // remote processes - we do not know the start indices of the respective
       // processes even though we could query the DoF index owner through the
-      // triangulation, so we need to perform a lookup anyway and do that by a
-      // ghost exchange of all data. While there, also extract a compressed
+      // triangulation. We instead perform a lookup that mimics a ghost
+      // exchange of the relevant data. While there, also extract a compressed
       // representation, taking the first number on each entity (face, cell)
-      // in global index space, which we later translate to local numbers
+      // in global index space, which we later translate to local numbers.
 
       std::vector<types::global_dof_index> local_dof_indices(fe.dofs_per_cell);
       std::vector<dealii::ndarray<types::global_dof_index, 2 * dim + 1, n_lanes>>
@@ -764,7 +776,7 @@ public:
   void
   vmult(VectorType & dst, const VectorType & src) const
   {
-    vmult_before_on_dst(
+    vmult_add_before_on_dst(
       dst,
       src,
       [&dst](const unsigned int start, const unsigned int end) {
@@ -778,7 +790,7 @@ public:
   void
   vmult_add(VectorType & dst, const VectorType & src) const
   {
-    vmult_before_on_dst(
+    vmult_add_before_on_dst(
       dst,
       src,
       [](const unsigned int, const unsigned int) {},
@@ -798,7 +810,8 @@ public:
   // The parameter `factor_convective` can be set to (1.0) for the convective
   // form of the convective term, 0.5 for the skew-symmetric form and to 0.0
   // for the divergence form.
-  // Returns the same CFL factor as evaluate_convective_and_divergence_term().
+  // Returns a CFL factor that reports the relative scaled velocity to set a
+  // time step limit in terms of the CFL number.
   Number
   evaluate_convective_term(const VectorType & src,
                            const Number       factor_convective,
@@ -862,6 +875,12 @@ public:
     return Utilities::MPI::max(cfl_factor, dst.get_mpi_communicator());
   }
 
+  // Evaluate the convective term (v, u \cdot \nabla u), the convective
+  // divergence -(\nabla q, u \cdot \nabla u) as well as the velocity
+  // divergence (q, div u), the latter two as the vectors used by the
+  // consistent splitting method.
+  // Returns a CFL factor that reports the relative scaled velocity to set a
+  // time step limit in terms of the CFL number.
   Number
   evaluate_convective_and_divergence_term(const VectorType & src,
                                           VectorType &       velocity_dst,
@@ -1239,7 +1258,7 @@ public:
   // - 'before_loop_src' runs before the first read of an entry of src, like
   //   'before_loop' in vmult(), including the face integrals of neighbors,
   // - 'before_loop_dst' runs before the first access to an entry of dst or
-  //   velocity_old by the cell integrals, like in vmult_before_on_dst(),
+  //   velocity_old by the cell integrals, like in vmult_add_before_on_dst(),
   //   which is usually much later.
   // For every entry, 'before_loop_src' runs before 'before_loop_dst'.
   // 'after_loop' runs once the entries of dst are final.
@@ -1388,7 +1407,7 @@ public:
   // neighbors. This keeps the range of entries between 'before_loop' and
   // 'after_loop' much smaller.
   void
-  vmult_before_on_dst(
+  vmult_add_before_on_dst(
     VectorType &                                                        dst,
     const VectorType &                                                  src,
     const std::function<void(const unsigned int, const unsigned int)> & before_loop,
@@ -1462,10 +1481,10 @@ public:
     }
   }
 
-  // Variant of the matrix-vector product that accumulates the result into
-  // a small scratch array instead of a global vector, see
-  // ExaDG::ScratchMatrixVectorProduct for the format of the ranges passed
-  // to 'after_loop'. Like for vmult_before_on_dst(), the vector src must be
+  // Variant of the matrix-vector product that accumulates the result into a
+  // small scratch array instead of a global vector, see
+  // ExaDG::ScratchMatrixVectorProduct for the format of the ranges passed to
+  // 'after_loop'. Like for vmult_add_before_on_dst(), the vector src must be
   // final upon entry.
   //
   // With shared memory, other processes may still read src after this
@@ -2131,8 +2150,8 @@ private:
   mutable std::array<double, 15> timings;
 
   // number of calls and accumulated time of the products with the Laplace
-  // part for the variants vmult() with functions, vmult_before_on_dst() and
-  // vmult_scratch(), and the time waiting for the processes reading the
+  // part for the variants vmult() with functions, vmult_add_before_on_dst()
+  // and vmult_scratch(), and the time waiting for the processes reading the
   // source vector in shared memory, at the end of the products (part of the
   // compress timer) and before the cell loop of vmult_scratch()
   mutable std::array<std::array<double, 2>, 4> product_timings            = {};
