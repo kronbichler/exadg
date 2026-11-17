@@ -134,8 +134,22 @@ test(const unsigned int degree, const unsigned int n_refinements)
 
   check_vmult_scratch(pcout, op, src, dst, tolerance<Number>());
 
-  VectorType inverse_diagonal;
+  // diagonal, with the constrained entries set to one in both cases
+  VectorType inverse_diagonal, reference_diagonal;
   op.compute_inverse_diagonal(inverse_diagonal);
+  laplace_op.calculate_diagonal(reference_diagonal);
+  difference.copy_locally_owned_data_from(inverse_diagonal);
+  for(const unsigned int i : matrix_free.get_constrained_dofs())
+    reference_diagonal.local_element(i) = 1.;
+  for(unsigned int i = 0; i < reference_diagonal.locally_owned_size(); ++i)
+    reference_diagonal.local_element(i) = Number(1.) / reference_diagonal.local_element(i);
+  difference -= reference_diagonal;
+  print_check(pcout,
+              "inverse diagonal vs. Poisson::LaplaceOperator",
+              difference.linfty_norm(),
+              reference_diagonal.linfty_norm(),
+              tolerance<Number>());
+
   // the first Chebyshev iteration is fused into the second one, first with
   // 'before_loop' on all entries before the loop, as the mesh is below the
   // default minimal size, then within the cell loop

@@ -126,6 +126,22 @@ test(const unsigned int degree, const unsigned int n_refinements)
                 tolerance<Number>());
 
     check_vmult_scratch(pcout, op, src, dst, tolerance<Number>());
+
+    VectorType inverse_diagonal, reference_diagonal;
+    op.compute_inverse_diagonal(inverse_diagonal);
+    laplace_op.calculate_diagonal(reference_diagonal);
+    reference_diagonal *= factor_laplace;
+    mass_op.calculate_diagonal(tmp);
+    reference_diagonal.add(factor_mass, tmp);
+    for(unsigned int i = 0; i < reference_diagonal.locally_owned_size(); ++i)
+      reference_diagonal.local_element(i) = Number(1.) / reference_diagonal.local_element(i);
+    tmp.copy_locally_owned_data_from(inverse_diagonal);
+    tmp -= reference_diagonal;
+    print_check(pcout,
+                "inverse diagonal vs. Poisson::LaplaceOperator",
+                tmp.linfty_norm(),
+                reference_diagonal.linfty_norm(),
+                tolerance<Number>());
   }
 
   op.set_parameters(0., 1.);

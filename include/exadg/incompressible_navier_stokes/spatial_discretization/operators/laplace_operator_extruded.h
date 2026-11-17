@@ -227,6 +227,146 @@ compute_cell_lapl(const internal::MatrixFreeFunctions::UnivariateShapeData<Numbe
 
 
 
+// Diagonal of the cell integrals of compute_cell_lapl() for the tensor
+// product basis with shape_data.fe_degree + 1 = n_q_points_1d functions per
+// direction, in lexicographic order. Rather than applying the cell operator
+// to unit vectors, we use that the diagonal entry of basis function
+// phi_i0(x) phi_i1(y) phi_i2(z) only involves the squares phi^2, phi phi'
+// and phi'^2 of the 1D functions: the xy part is the contraction of the
+// metric terms at the xy quadrature points with tables of these 1D products
+// (sum factorization in x, then y), and the geometry does not depend on z,
+// so the z part is a weighted 1D integral. If given, z_face_terms[i2] is
+// added to the factor of the integral of JxW_xy phi_i0^2 phi_i1^2 (this is
+// the form of the face integrals on faces with normal in z direction).
+template<int n_q_points_1d, int dim, typename Number>
+void
+compute_cell_lapl_diagonal(
+  const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape_data,
+  const Extruded::MappingInfo<dim, Number> &                         mapping_info,
+  const unsigned int                                                 cell,
+  const Number                                                       factor_mass,
+  const Number                                                       factor_lapl,
+  const VectorizedArray<Number> *                                    z_face_terms,
+  VectorizedArray<Number> *                                          diagonal)
+{
+  static_assert(dim == 2 || dim == 3, "Only implemented for dim = 2, 3");
+  constexpr unsigned int nn            = n_q_points_1d;
+  constexpr unsigned int n_q_points_2d = nn * nn;
+  constexpr unsigned int n_lanes       = VectorizedArray<Number>::size();
+  AssertDimension(shape_data.fe_degree + 1, nn);
+  AssertDimension(shape_data.n_q_points_1d, nn);
+
+  // 1D products of shape functions at the quadrature points: [0] phi phi,
+  // [1] phi phi', [2] phi' phi'
+  Number products[3][nn * nn];
+  for(unsigned int i = 0; i < nn; ++i)
+    for(unsigned int q = 0; q < nn; ++q)
+    {
+      const Number value      = shape_data.shape_values[i * nn + q];
+      const Number derivative = shape_data.shape_gradients[i * nn + q];
+      products[0][i * nn + q] = value * value;
+      products[1][i * nn + q] = value * derivative;
+      products[2][i * nn + q] = derivative * derivative;
+    }
+
+  std::array<unsigned int, n_lanes> shifted_data_indices;
+  for(unsigned int v = 0; v < n_lanes; ++v)
+    shifted_data_indices[v] = mapping_info.mapping_data_index[cell][v] * 4;
+
+  // coefficients at the xy quadrature points of the terms phi'phi' x phi phi,
+  // phi phi' x phi phi' and phi phi x phi'phi' of the xy gradient part as
+  // well as of the term phi phi x phi phi, the latter without factors
+  VectorizedArray<Number>                  coefficients[4][n_q_points_2d];
+  [[maybe_unused]] VectorizedArray<Number> h_z, h_z_inverse;
+  if constexpr(dim == 3)
+  {
+    std::array<unsigned int, n_lanes> geometry_indices;
+    for(unsigned int v = 0; v < n_lanes; ++v)
+      geometry_indices[v] = mapping_info.mapping_data_index[cell][v] / n_q_points_2d;
+    h_z.gather(mapping_info.h_z_values.data(), geometry_indices.data());
+    h_z_inverse = Number(1) / h_z;
+  }
+  for(unsigned int q1 = 0; q1 < n_q_points_2d; ++q1)
+  {
+    Tensor<2, 2, VectorizedArray<Number>> inv_jac_xy;
+    vectorized_load_and_transpose(4,
+                                  &mapping_info.inv_jacobians_xy[q1][0][0],
+                                  shifted_data_indices.data(),
+                                  &inv_jac_xy[0][0]);
+    VectorizedArray<Number> JxW_xy;
+    JxW_xy.gather(&mapping_info.cell_JxW_xy[q1], mapping_info.mapping_data_index[cell].data());
+
+    VectorizedArray<Number> factor = JxW_xy * factor_lapl;
+    if constexpr(dim == 3)
+      factor *= h_z;
+    // metric tensor inv_jac_xy^T inv_jac_xy
+    const VectorizedArray<Number> metric_00 =
+      inv_jac_xy[0][0] * inv_jac_xy[0][0] + inv_jac_xy[1][0] * inv_jac_xy[1][0];
+    const VectorizedArray<Number> metric_01 =
+      inv_jac_xy[0][0] * inv_jac_xy[0][1] + inv_jac_xy[1][0] * inv_jac_xy[1][1];
+    const VectorizedArray<Number> metric_11 =
+      inv_jac_xy[0][1] * inv_jac_xy[0][1] + inv_jac_xy[1][1] * inv_jac_xy[1][1];
+    coefficients[0][q1] = factor * metric_00;
+    coefficients[1][q1] = (Number(2) * factor) * metric_01;
+    coefficients[2][q1] = factor * metric_11;
+    coefficients[3][q1] = JxW_xy;
+  }
+
+  // sum factorization in x direction, then in y direction, for the four
+  // terms, with the pairs (x table, y table) of the products
+  constexpr unsigned int  table_x[4] = {2, 1, 0, 0};
+  constexpr unsigned int  table_y[4] = {0, 1, 2, 0};
+  VectorizedArray<Number> tmp[4][n_q_points_2d];
+  for(unsigned int t = 0; t < 4; ++t)
+    for(unsigned int qy = 0; qy < nn; ++qy)
+      for(unsigned int i0 = 0; i0 < nn; ++i0)
+      {
+        VectorizedArray<Number> sum = coefficients[t][qy * nn] * products[table_x[t]][i0 * nn];
+        for(unsigned int qx = 1; qx < nn; ++qx)
+          sum += coefficients[t][qy * nn + qx] * products[table_x[t]][i0 * nn + qx];
+        tmp[t][qy * nn + i0] = sum;
+      }
+  VectorizedArray<Number> xy_gradient[n_q_points_2d], xy_value[n_q_points_2d];
+  for(unsigned int i1 = 0; i1 < nn; ++i1)
+    for(unsigned int i0 = 0; i0 < nn; ++i0)
+    {
+      VectorizedArray<Number> sum[4];
+      for(unsigned int t = 0; t < 4; ++t)
+      {
+        sum[t] = tmp[t][i0] * products[table_y[t]][i1 * nn];
+        for(unsigned int qy = 1; qy < nn; ++qy)
+          sum[t] += tmp[t][qy * nn + i0] * products[table_y[t]][i1 * nn + qy];
+      }
+      xy_gradient[i1 * nn + i0] = sum[0] + sum[1] + sum[2];
+      xy_value[i1 * nn + i0]    = sum[3];
+    }
+
+  if constexpr(dim == 2)
+  {
+    for(unsigned int i = 0; i < n_q_points_2d; ++i)
+      diagonal[i] = xy_gradient[i] + factor_mass * xy_value[i];
+  }
+  else
+  {
+    for(unsigned int i2 = 0; i2 < nn; ++i2)
+    {
+      Number z_value = 0, z_derivative = 0;
+      for(unsigned int qz = 0; qz < nn; ++qz)
+      {
+        z_value += mapping_info.quad_weights_z[qz] * products[0][i2 * nn + qz];
+        z_derivative += mapping_info.quad_weights_z[qz] * products[2][i2 * nn + qz];
+      }
+      VectorizedArray<Number> factor_value =
+        (factor_mass * z_value) * h_z + (factor_lapl * z_derivative) * h_z_inverse;
+      if(z_face_terms != nullptr)
+        factor_value += z_face_terms[i2];
+      for(unsigned int i = 0; i < n_q_points_2d; ++i)
+        diagonal[i2 * n_q_points_2d + i] = z_value * xy_gradient[i] + factor_value * xy_value[i];
+    }
+  }
+}
+
+
 // retrieve the coarsening sequence for p multigrid, defined in a central
 // place: pick the next coarser degree as half the previous degree, but for
 // small degrees we do smaller steps to avoid too aggressive coarsening (i.e.,
@@ -1338,53 +1478,14 @@ private:
     else
     {
       VectorizedArray<Number> diag_values[n_q_points];
-      for(unsigned int i = 0; i < n_q_points; ++i)
-      {
-        std::array<unsigned int, dim> tensor_i;
-        constexpr unsigned int        nn = degree + 1;
-        if(dim == 2)
-        {
-          tensor_i[0] = i % nn;
-          tensor_i[1] = i / nn;
-        }
-        else if(dim == 3)
-        {
-          tensor_i[0] = i % nn;
-          tensor_i[1] = (i / nn) % nn;
-          tensor_i[2] = i / (nn * nn);
-        }
-        for(unsigned int q2 = 0, q = 0; q2 < (dim > 2 ? n_q_points_1d : 1); ++q2)
-          for(unsigned int q1 = 0; q1 < (dim > 1 ? n_q_points_1d : 1); ++q1)
-            for(unsigned int q0 = 0; q0 < n_q_points_1d; ++q0, ++q)
-              quad_values[q] =
-                ((dim == 3 ? shape_data.shape_values[tensor_i[2] * nn + q2] : Number(1.0)) *
-                 shape_data.shape_values[tensor_i[1] * nn + q1]) *
-                shape_data.shape_values[tensor_i[0] * nn + q0];
-
-        if(factor_laplace != 0)
-          compute_cell_lapl<n_q_points_1d>(shape_data,
-                                           mapping_info,
-                                           cell_index,
-                                           factor_mass,
-                                           factor_laplace,
-                                           quad_values,
-                                           quad_values);
-
-        VectorizedArray<Number> sum = 0;
-        for(unsigned int q2 = 0, q = 0; q2 < (dim > 2 ? n_q_points_1d : 1); ++q2)
-          for(unsigned int q1 = 0; q1 < (dim > 1 ? n_q_points_1d : 1); ++q1)
-          {
-            VectorizedArray<Number> inner_sum = {};
-            for(unsigned int q0 = 0; q0 < n_q_points_1d; ++q0, ++q)
-              inner_sum += shape_data.shape_values[tensor_i[0] * nn + q0] * quad_values[q];
-            sum += ((dim == 3 ? shape_data.shape_values[tensor_i[2] * nn + q2] : Number(1.0)) *
-                    shape_data.shape_values[tensor_i[1] * nn + q1]) *
-                   inner_sum;
-          }
-
-        // write diagonal entry to global vector
-        diag_values[i] = sum;
-      }
+      compute_cell_lapl_diagonal<n_q_points_1d>(shape_data,
+                                                mapping_info,
+                                                cell_index,
+                                                factor_mass,
+                                                factor_laplace,
+                                                static_cast<const VectorizedArray<Number> *>(
+                                                  nullptr),
+                                                diag_values);
       distribute_local_to_global<degree, false>(cell_index, diag_values, dst);
     }
   }
@@ -4240,65 +4341,160 @@ private:
   void
   do_cell_operation(const unsigned int cell, const VectorType & src, VectorType & dst) const
   {
-    constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
-    constexpr unsigned int n_q_points_1d = degree + 1;
-    constexpr unsigned int n_points      = Utilities::pow(n_q_points_1d, dim);
-    const auto &           shape_data    = shape_info.data[0];
-
-    VectorizedArray<Number> quad_values[n_points], out_values[n_points];
     if(compute_exterior)
       do_cell_operation<degree>(cell, src, dof_indices[cell], dst.begin());
     else
-    {
-      const unsigned int n_entries_per_batch = n_active_entries_per_cell_batch(cell);
-      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+      compute_diagonal_cell<degree>(cell, dst);
+  }
+
+  // Compute the diagonal of the operator on a cell batch and write it into
+  // dst. As the DG basis functions live on a single cell, the diagonal
+  // consists of the cell integral and the face integrals with the interior
+  // values only, i.e., the exterior value of zero on interior faces and the
+  // mirror values on boundary faces as in compute_face(). We use the tensor
+  // product structure of the basis functions in compute_cell_lapl_diagonal()
+  // for the cell term and the faces in z direction, whose integrals have
+  // the same xy structure. On the faces with normal in x or y direction,
+  // the face integral of basis function i is a function of the 1D traces of
+  // the shape function and its derivative in normal direction times 1D
+  // integrals in the tangential direction and in z direction.
+  template<int degree>
+  void
+  compute_diagonal_cell(const unsigned int cell, VectorType & dst) const
+  {
+    static_assert(dim == 3, "Only implemented for dim = 3");
+    constexpr unsigned int nn            = degree + 1;
+    constexpr unsigned int n_q_points_1d = degree + 1;
+    constexpr unsigned int dofs_per_cell = Utilities::pow(nn, dim);
+    const auto &           shape_data    = shape_info.data[0];
+
+    // traces of the shape functions and their derivatives on the left
+    // (side 0) and right (side 1) end of the unit interval, with the same
+    // interpolation from quadrature points as in compute_face()
+    Number trace_value[2][nn], trace_derivative[2][nn];
+    for(unsigned int side = 0; side < 2; ++side)
+      for(unsigned int i = 0; i < nn; ++i)
       {
-        std::array<unsigned int, dim> tensor_i;
-        constexpr unsigned int        nn = degree + 1;
-        if(dim == 2)
+        Number value = 0, derivative = 0;
+        for(unsigned int q = 0; q < n_q_points_1d; ++q)
         {
-          tensor_i[0] = i % nn;
-          tensor_i[1] = i / nn;
+          value += interpolate_quad_to_boundary[side][q][0] * shape_data.shape_values[i * nn + q];
+          derivative +=
+            interpolate_quad_to_boundary[side][q][1] * shape_data.shape_values[i * nn + q];
         }
-        else if(dim == 3)
+        trace_value[side][i]      = value;
+        trace_derivative[side][i] = derivative;
+      }
+
+    // faces in z direction, assumed to be interior faces as in
+    // compute_face()
+    VectorizedArray<Number> z_face_terms[nn];
+    for(unsigned int i2 = 0; i2 < nn; ++i2)
+      z_face_terms[i2] = VectorizedArray<Number>();
+    if(factor_laplace != 0.)
+      for(unsigned int side = 0; side < 2; ++side)
+      {
+        const Number                  normal_sign = side ? 1 : -1;
+        const VectorizedArray<Number> sigmaF =
+          penalty_parameters[cell][4 + side] * this->factor_laplace;
+        const Number factor_derivative =
+          this->factor_laplace * normal_sign * mapping_info.h_z_inverse;
+        for(unsigned int i2 = 0; i2 < nn; ++i2)
+          z_face_terms[i2] +=
+            sigmaF * (trace_value[side][i2] * trace_value[side][i2]) -
+            factor_derivative * (trace_value[side][i2] * trace_derivative[side][i2]);
+      }
+
+    VectorizedArray<Number> diagonal[dofs_per_cell];
+    compute_cell_lapl_diagonal<n_q_points_1d>(shape_data,
+                                              mapping_info,
+                                              cell,
+                                              factor_mass,
+                                              factor_laplace,
+                                              factor_laplace != 0. ? z_face_terms : nullptr,
+                                              diagonal);
+
+    // faces in x and y direction
+    if(factor_laplace != 0.)
+    {
+      Number z_value[nn];
+      for(unsigned int i2 = 0; i2 < nn; ++i2)
+      {
+        z_value[i2] = 0;
+        for(unsigned int qz = 0; qz < n_q_points_1d; ++qz)
+          z_value[i2] += mapping_info.quad_weights_z[qz] * shape_data.shape_values[i2 * nn + qz] *
+                         shape_data.shape_values[i2 * nn + qz];
+      }
+
+      for(unsigned int f = 0; f < 4; ++f)
+      {
+        const unsigned int face_direction = f / 2;
+        const unsigned int side           = f % 2;
+
+        // the mirror principle of compute_face() on boundary faces, with
+        // boundary_mask = 1, cancels the face integrals
+        VectorizedArray<Number> interior_face;
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          interior_face[v] = neighbor_cells[cell][f][v] == numbers::invalid_unsigned_int ? 0. : 1.;
+        const VectorizedArray<Number> sigmaF = penalty_parameters[cell][f] * this->factor_laplace;
+
+        std::array<unsigned int, n_lanes> shifted_data_indices;
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          shifted_data_indices[v] = mapping_info.face_mapping_data_index[cell][f][0][v] * 2;
+
+        // 1D integrals in tangential direction of the factors multiplying
+        // the squared trace value and the product of trace value and
+        // normal derivative
+        VectorizedArray<Number> factor_value[nn], factor_derivative[nn];
+        for(unsigned int it = 0; it < nn; ++it)
         {
-          tensor_i[0] = i % nn;
-          tensor_i[1] = (i / nn) % nn;
-          tensor_i[2] = i / (nn * nn);
+          factor_value[it]      = VectorizedArray<Number>();
+          factor_derivative[it] = VectorizedArray<Number>();
         }
-        for(unsigned int q2 = 0, q = 0; q2 < (dim > 2 ? n_q_points_1d : 1); ++q2)
-          for(unsigned int q1 = 0; q1 < (dim > 1 ? n_q_points_1d : 1); ++q1)
-            for(unsigned int q0 = 0; q0 < n_q_points_1d; ++q0, ++q)
-              quad_values[q] =
-                ((dim == 3 ? shape_data.shape_values[tensor_i[2] * nn + q2] : Number(1.0)) *
-                 shape_data.shape_values[tensor_i[1] * nn + q1]) *
-                shape_data.shape_values[tensor_i[0] * nn + q0];
-
-        if(factor_laplace != 0)
-          compute_cell_lapl<n_q_points_1d>(
-            shape_data, mapping_info, cell, factor_mass, factor_laplace, quad_values, out_values);
-
-        if(factor_laplace != 0.)
-          for(unsigned int f = 0; f < 2 * dim; ++f)
-            compute_face<degree, false>(shape_data, src, cell, f, quad_values, out_values);
-
-        VectorizedArray<Number> sum = 0;
-        for(unsigned int q2 = 0, q = 0; q2 < (dim > 2 ? n_q_points_1d : 1); ++q2)
-          for(unsigned int q1 = 0; q1 < (dim > 1 ? n_q_points_1d : 1); ++q1)
+        for(unsigned int q1 = 0; q1 < n_q_points_1d; ++q1)
+        {
+          Tensor<1, 2, VectorizedArray<Number>> jac_x_normal;
+          vectorized_load_and_transpose(2,
+                                        &mapping_info.face_jxn_xy[q1][0],
+                                        shifted_data_indices.data(),
+                                        &jac_x_normal[0]);
+          VectorizedArray<Number> JxW_xy;
+          JxW_xy.gather(mapping_info.face_JxW_xy.data() + q1,
+                        mapping_info.face_mapping_data_index[cell][f][0].data());
+          const VectorizedArray<Number> factor = (JxW_xy * mapping_info.h_z) * interior_face;
+          const VectorizedArray<Number> factor_normal =
+            factor * (this->factor_laplace * jac_x_normal[face_direction]);
+          const VectorizedArray<Number> factor_tangential =
+            factor * (this->factor_laplace * jac_x_normal[1 - face_direction]);
+          const VectorizedArray<Number> factor_penalty = factor * sigmaF;
+          for(unsigned int it = 0; it < nn; ++it)
           {
-            VectorizedArray<Number> inner_sum = 0;
-            for(unsigned int q0 = 0; q0 < n_q_points_1d; ++q0, ++q)
-              inner_sum += shape_data.shape_values[tensor_i[0] * nn + q0] * out_values[q];
-            sum += ((dim == 3 ? shape_data.shape_values[tensor_i[2] * nn + q2] : Number(1.0)) *
-                    shape_data.shape_values[tensor_i[1] * nn + q1]) *
-                   inner_sum;
+            const Number value      = shape_data.shape_values[it * nn + q1];
+            const Number derivative = shape_data.shape_gradients[it * nn + q1];
+            factor_value[it] +=
+              factor_penalty * (value * value) - factor_tangential * (value * derivative);
+            factor_derivative[it] -= factor_normal * (value * value);
           }
+        }
 
-        // write diagonal entry to global vector
-        for(unsigned int v = 0; v < n_entries_per_batch; ++v)
-          dst.local_element(dof_indices[cell][v] + i) = sum[v];
+        for(unsigned int i2 = 0; i2 < nn; ++i2)
+          for(unsigned int i1 = 0; i1 < nn; ++i1)
+            for(unsigned int i0 = 0; i0 < nn; ++i0)
+            {
+              const unsigned int in = face_direction == 0 ? i0 : i1;
+              const unsigned int it = face_direction == 0 ? i1 : i0;
+              diagonal[(i2 * nn + i1) * nn + i0] +=
+                z_value[i2] *
+                (factor_value[it] * (trace_value[side][in] * trace_value[side][in]) +
+                 factor_derivative[it] * (trace_value[side][in] * trace_derivative[side][in]));
+            }
       }
     }
+
+    const unsigned int n_entries_per_batch = n_active_entries_per_cell_batch(cell);
+    for(unsigned int i = 0; i < dofs_per_cell; ++i)
+      for(unsigned int v = 0; v < n_entries_per_batch; ++v)
+        dst.local_element(dof_indices[cell][v] + i) = diagonal[i][v];
   }
 
   template<int degree, bool compute_exterior>

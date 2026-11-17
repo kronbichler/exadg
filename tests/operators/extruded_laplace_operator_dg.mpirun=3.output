@@ -4,11 +4,13 @@ DG degree 1, double, 768 cells, 6144 DoFs
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
  factor mass 2.5, factor Laplace 0.3
   vmult vs. Poisson::LaplaceOperator            : OK
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
   Chebyshev degree 1 vmult_with_residual        : OK
@@ -28,11 +30,13 @@ DG degree 1, float, 768 cells, 6144 DoFs
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
  factor mass 2.5, factor Laplace 0.3
   vmult vs. Poisson::LaplaceOperator            : OK
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
   Chebyshev degree 1 vmult_with_residual        : OK
@@ -52,11 +56,13 @@ DG degree 2, double, 768 cells, 20736 DoFs
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
  factor mass 2.5, factor Laplace 0.3
   vmult vs. Poisson::LaplaceOperator            : OK
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
   Chebyshev degree 1 vmult_with_residual        : OK
@@ -76,11 +82,13 @@ DG degree 2, float, 768 cells, 20736 DoFs
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
  factor mass 2.5, factor Laplace 0.3
   vmult vs. Poisson::LaplaceOperator            : OK
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
   Chebyshev degree 1 vmult_with_residual        : OK
@@ -100,11 +108,13 @@ DG degree 3, double, 768 cells, 49152 DoFs
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
  factor mass 2.5, factor Laplace 0.3
   vmult vs. Poisson::LaplaceOperator            : OK
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
   Chebyshev degree 1 vmult_with_residual        : OK
@@ -124,11 +134,13 @@ DG degree 3, float, 768 cells, 49152 DoFs
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
  factor mass 2.5, factor Laplace 0.3
   vmult vs. Poisson::LaplaceOperator            : OK
   vmult_scratch: entries not finalized once     : 0
   vmult_scratch: misaligned ranges              : 0
   vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
   Chebyshev degree 1 vmult_with_residual        : OK
