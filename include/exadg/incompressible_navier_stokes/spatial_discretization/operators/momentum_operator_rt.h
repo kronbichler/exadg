@@ -38,19 +38,20 @@
 #include <map>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/extruded_mapping_info.h>
+#include <exadg/incompressible_navier_stokes/spatial_discretization/operators/face_integral_helper.h>
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/momentum_operator_rt_single_exchange.h>
 #include <exadg/solvers_and_preconditioners/preconditioners/scratch_matrix_vector_product.h>
 #include <exadg/utilities/mpi_shared_memory.h>
 
 namespace RTOperator
 {
-  using namespace dealii;
+using namespace dealii;
 
-  /**
-   * Add element-wise contributions of Raviart-Thomas operator evaluation to a
-   * right-hand-side vector for a given polynomial degree and with the given
-   * indices.
-   */
+/**
+ * Add cell-wise contributions of Raviart-Thomas operator evaluation to the
+ * vector passed as last argument for a given polynomial degree and with the
+ * given indices of the cell-wise contributions.
+ */
 template<int dim, int degree, typename Number>
 void
 distribute_local_to_global_rt_compressed(
@@ -156,9 +157,9 @@ distribute_local_to_global_rt_compressed(
     }
   }
 
-  // cell contributions, working through x component, y component, and z
-  // component, copying data out in a contiguous array that can be added with
-  // vectorized operations
+  // cell contributions, successively adding the x component, y component, and
+  // z component, copying the data ordered lexicographically within the cell
+  // into a contiguous array that can be added with vectorized operations
   dealii::VectorizedArray<Number> data_2[dofs_per_comp - 2 * dofs_per_face];
   for(unsigned int i = 0; i < dofs_per_face; ++i)
     for(unsigned int j = 1; j < degree; ++j)
@@ -244,6 +245,8 @@ public:
                 ExcMessage("This class only works for Raviart-Thomas elements. Set "
                            "spatial discretization to HDIV"));
 
+    // Impose a given external numbering of cells on a temporary MatrixFree
+    // objects that we use for embedding indices
     MatrixFree<dim, Number>                          matrix_free;
     typename MatrixFree<dim, Number>::AdditionalData mf_data;
     mf_data.cell_vectorization_category          = cell_vectorization_category;
@@ -276,13 +279,14 @@ public:
       for(unsigned int i = 0; i < n_unconstrained_owned_dofs; ++i)
         dof_numbers[i] = counter++;
 
-      // Extract ghost entries for which we need to query the numbers from
-      // remote processes - we do not know the start indices of the respective
-      // processes even though we could query the DoF index owner through the
-      // triangulation. We instead perform a lookup that mimics a ghost
-      // exchange of the relevant data. While there, also extract a compressed
-      // representation, taking the first number on each entity (face, cell)
-      // in global index space, which we later translate to local numbers.
+      // Extract ghost entries for which we need to query the vector entries
+      // stored on remote processes - we do not know the start indices of the
+      // respective processes even though we could query the DoF index owner
+      // through the triangulation. We instead perform a lookup that mimics a
+      // ghost exchange of the relevant data. While collecting the relevant
+      // data, also extract a compressed representation, taking the first
+      // number on each entity (face, cell) in global index space, which we
+      // later translate to local numbers.
 
       std::vector<types::global_dof_index> local_dof_indices(fe.dofs_per_cell);
       std::vector<dealii::ndarray<types::global_dof_index, 2 * dim + 1, n_lanes>>
@@ -293,7 +297,7 @@ public:
         {
           matrix_free.get_cell_iterator(cell, v)->get_dof_indices(local_dof_indices);
 
-          // Adjust dof indices due to periodicity
+          // Resolve constraints due to periodicity
           for(types::global_dof_index & a : local_dof_indices)
           {
             const auto line = constraints.get_constraint_entries(a);
@@ -551,28 +555,32 @@ public:
 
     setup_scratch();
 
-    {
-      std::vector<Polynomials::Polynomial<double>> basis =
-        Polynomials::generate_complete_Lagrange_basis(quadrature.get_points());
-      interpolate_quad_to_boundary[0].resize(basis.size());
-      interpolate_quad_to_boundary[1].resize(basis.size());
-      std::vector<double> val_and_der(2);
-      for(unsigned int i = 0; i < basis.size(); ++i)
-      {
-        basis[i].value(0., val_and_der);
-        interpolate_quad_to_boundary[0][i][0] = val_and_der[0];
-        interpolate_quad_to_boundary[0][i][1] = val_and_der[1];
-        basis[i].value(1., val_and_der);
-        interpolate_quad_to_boundary[1][i][0] = val_and_der[0];
-        interpolate_quad_to_boundary[1][i][1] = val_and_der[1];
-      }
-    }
+    const auto fill_quad_to_boundary =
+      [](const std::vector<Point<1>> &                       points,
+         std::array<std::vector<std::array<Number, 2>>, 2> & data_array) {
+        std::vector<Polynomials::Polynomial<double>> basis =
+          Polynomials::generate_complete_Lagrange_basis(points);
+        data_array[0].resize(basis.size());
+        data_array[1].resize(basis.size());
+        std::vector<double> val_and_der(2);
+        for(unsigned int i = 0; i < basis.size(); ++i)
+        {
+          basis[i].value(0., val_and_der);
+          data_array[0][i][0] = val_and_der[0];
+          data_array[0][i][1] = val_and_der[1];
+          basis[i].value(1., val_and_der);
+          data_array[1][i][0] = val_and_der[0];
+          data_array[1][i][1] = val_and_der[1];
+        }
+      };
+
+    fill_quad_to_boundary(quadrature.get_points(), interpolate_quad_to_boundary);
 
     shape_info = matrix_free.get_shape_info();
 
     // The face integrals take the value of the normal component on the
     // neighbor from the current cell, which requires shape functions that
-    // are nodal on the faces in normal direction
+    // are nodal on the faces in normal direction.
     for(unsigned int side = 0; side < 2; ++side)
       for(unsigned int i = 0; i <= fe.degree; ++i)
         AssertThrow(std::abs(shape_info.data[0].shape_data_on_face[side][i] -
@@ -589,20 +597,7 @@ public:
 
       convective_shape_info.reinit(quad, fe);
 
-      std::vector<Polynomials::Polynomial<double>> basis =
-        Polynomials::generate_complete_Lagrange_basis(quad.get_points());
-      convective_interpolate_quad_to_boundary[0].resize(basis.size());
-      convective_interpolate_quad_to_boundary[1].resize(basis.size());
-      std::vector<double> val_and_der(2);
-      for(unsigned int i = 0; i < basis.size(); ++i)
-      {
-        basis[i].value(0., val_and_der);
-        convective_interpolate_quad_to_boundary[0][i][0] = val_and_der[0];
-        convective_interpolate_quad_to_boundary[0][i][1] = val_and_der[1];
-        basis[i].value(1., val_and_der);
-        convective_interpolate_quad_to_boundary[1][i][0] = val_and_der[0];
-        convective_interpolate_quad_to_boundary[1][i][1] = val_and_der[1];
-      }
+      fill_quad_to_boundary(quad.get_points(), convective_interpolate_quad_to_boundary);
     }
 
     detect_dependencies_of_face_integrals();
@@ -621,10 +616,10 @@ public:
     mpi_send_buffer.clear();
     {
       mpi_recv_buffer.resize_fast(single_exchange.recv_buffer_size);
-      mpi_requests.resize(2 * single_exchange.partners.size());
+      mpi_requests.resize(2 * single_exchange.neighbors.size());
 
       // With a shared-memory communicator, the send buffer is allocated in
-      // shared memory, and the partners in the same shared-memory domain
+      // shared memory, and the neighbors in the same shared-memory domain
       // read their messages directly from it.
       single_exchange.setup_shared_memory(dof_handler.get_mpi_communicator(), communicator_shared);
       free_communicator_sm();
@@ -696,7 +691,7 @@ public:
                          "Compress cell ghost values",
                          comm,
                          total_time);
-      if(Utilities::MPI::sum(single_exchange.n_shared_memory_partners(), comm) > 0)
+      if(Utilities::MPI::sum(single_exchange.n_shared_memory_neighbors(), comm) > 0)
         Helper::print_time((time_wait_readers + time_wait_readers_deferred) / timings[0],
                            "Wait for readers (shm)",
                            comm,
@@ -752,6 +747,10 @@ public:
   void
   copy_mf_to_this_vector(const VectorType1 & src, VectorType2 & dst) const
   {
+    // Our renumbering of unknowns, that is asserted in reinit(), makes sure
+    // the unknowns not appearing in the vectors of this class (categorized as
+    // 'this') are at the end of the locally owned elements of matrix-free
+    // vectors.
     Assert(partitioner->is_compatible(*dst.get_partitioner()), ExcInternalError());
     AssertIndexRange(dst.locally_owned_size(), src.locally_owned_size() + 1);
     std::copy(src.begin(), src.begin() + dst.locally_owned_size(), dst.begin());
@@ -899,8 +898,12 @@ public:
                 velocity_dst.begin() + cell_loop_pre_list[range].second,
                 Number());
 
-    Number                 cfl_factor = 0.;
-    Tensor<1, dim, double> integral;
+    Number cfl_factor = 0.;
+    // store the local part of the velocity integral for
+    // get_velocity_integral(), tagged by the data of the source vector
+    velocity_integral_data  = src.begin();
+    velocity_integral_local = {};
+
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
       for(unsigned int range = cell_loop_mass_pre_list_index[cell];
@@ -915,29 +918,29 @@ public:
       const unsigned int                      degree = shape_info.data[0].fe_degree;
       if(degree == 2)
         convective_cfl = do_convective_and_divergence_on_cell<2>(
-          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
+          cell, src, velocity_dst, convective_divergence, divergence, cell_integral);
       else if(degree == 3)
         convective_cfl = do_convective_and_divergence_on_cell<3>(
-          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
+          cell, src, velocity_dst, convective_divergence, divergence, cell_integral);
       else if(degree == 4)
         convective_cfl = do_convective_and_divergence_on_cell<4>(
-          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
+          cell, src, velocity_dst, convective_divergence, divergence, cell_integral);
 #ifndef DEBUG
       else if(degree == 5)
         convective_cfl = do_convective_and_divergence_on_cell<5>(
-          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
+          cell, src, velocity_dst, convective_divergence, divergence, cell_integral);
       else if(degree == 6)
         convective_cfl = do_convective_and_divergence_on_cell<6>(
-          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
+          cell, src, velocity_dst, convective_divergence, divergence, cell_integral);
       else if(degree == 7)
         convective_cfl = do_convective_and_divergence_on_cell<7>(
-          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
+          cell, src, velocity_dst, convective_divergence, divergence, cell_integral);
       else if(degree == 8)
         convective_cfl = do_convective_and_divergence_on_cell<8>(
-          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
+          cell, src, velocity_dst, convective_divergence, divergence, cell_integral);
       else if(degree == 9)
         convective_cfl = do_convective_and_divergence_on_cell<9>(
-          cell, src, velocity_dst, convective_divergence, divergence, &cell_integral);
+          cell, src, velocity_dst, convective_divergence, divergence, cell_integral);
 #endif
       else
         AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
@@ -946,14 +949,9 @@ public:
       {
         cfl_factor = std::max(cfl_factor, convective_cfl[v]);
         for(unsigned int d = 0; d < dim; ++d)
-          integral[d] += cell_integral[d][v];
+          velocity_integral_local[d] += cell_integral[d][v];
       }
     }
-
-    // store the local part of the velocity integral for
-    // get_velocity_integral(), tagged by the data of the source vector
-    velocity_integral_local = integral;
-    velocity_integral_data  = src.begin();
 
     single_exchange.signal_done_reading();
     velocity_dst.compress_start(0, VectorOperation::add);
@@ -964,15 +962,15 @@ public:
     return Utilities::MPI::max(cfl_factor, divergence.get_mpi_communicator());
   }
 
-  // Get the integral of the velocity over the domain, computed as a
-  // by-product of the last call to evaluate_convective_and_divergence_term()
-  // at the cost of a few multiply-adds per quadrature point. The value is
-  // only valid if that call was done on the data now held by `velocity`
-  // (vectors that were swapped since then keep their data, so the check
-  // compares the data pointers). Returns false on all processes if this is
-  // not the case on some process, in which case the caller must compute the
-  // integral by other means. This function is collective over the
-  // communicator of `velocity`, with one reduction.
+  // Get the integral of the velocity over the domain. The function
+  // evaluate_convective_and_divergence_term() can compute this as a
+  // by-product, to avoid another access to the vector. The value is only
+  // valid if that call was done on the data now held by `velocity` (vectors
+  // that were swapped since then keep their data, so the check compares the
+  // data pointers). Returns false on all processes if this is not the case on
+  // some process, in which case the caller must compute the integral by other
+  // means. This function is collective over the communicator of `velocity`,
+  // with one reduction.
   bool
   get_velocity_integral(const VectorType & velocity, Tensor<1, dim, double> & integral) const
   {
@@ -997,34 +995,9 @@ public:
     velocity_integral_data = nullptr;
   }
 
-  // Interface for benchmarking the cell kernels of vmult() and
-  // evaluate_convective_and_divergence_term() in isolation, used by
-  // prototypes/rt_kernel_benchmark.cpp. benchmark_prepare() exchanges the
-  // ghost values and face data of src like the regular loops. Then,
-  // benchmark_cell_range() may be called any number of times, followed by
-  // benchmark_finish(). benchmark_cell_range() runs a kernel on the cell
-  // batches [begin, end), without zeroing or compressing the result vectors.
-  // The kernel stops after the phase 'last_stage':
-  //   0: interpolation of the cell values to the quadrature points
-  //   1: + cell integrals (momentum) or face integrals (convective)
-  //   2: + face integrals (momentum) or cell integrals (convective, which
-  //      include applying the face terms, the integration of the
-  //      divergence and the gradient part of the convective divergence)
-  //   3: + integration and scatter into the result vectors (full kernel)
-  // The kernel 'convective' is the convective term alone, as in
-  // evaluate_convective_term() with factor 1, with the kernel selected by
-  // set_convective_kernel(); for the layered kernel, stage 2 also includes the
-  // integration in x and z direction for the layered kernel.
-  enum class BenchmarkKernel
-  {
-    momentum,
-    convective,
-    convective_and_divergence
-  };
-
-  // Switch the flux buffer of the face integrals of the convective term
-  // off, so that each cell computes the face integrals of all its faces
-  // itself, for comparisons
+  // Toggle for whether to use the flux buffer of the face integrals of the
+  // convective term. If off, each cell computes the face integrals of all its
+  // faces itself, for comparisons.
   void
   set_use_convective_face_flux_buffer(const bool use_buffer)
   {
@@ -1033,11 +1006,10 @@ public:
 
   // Kernels for the convective term (with and without divergence): the
   // collocation-based kernels interpolate to the quadrature points and
-  // compute the derivatives in the collocation basis there, the layered
-  // kernels use tensor products of the non-collocated shape functions and
-  // process the cell plane by plane, see do_convective_on_cell_layered().
-  // 'automatic' selects by the degree, see
-  // use_layered_convective_by_default().
+  // compute the derivatives in the collocation basis, the layered kernels use
+  // tensor products of the cell's shape functions and process the cell plane
+  // by plane, see do_convective_on_cell_layered(). 'automatic' selects by
+  // the degree, see use_layered_convective_by_default().
   enum class ConvectiveKernel
   {
     automatic,
@@ -1050,66 +1022,6 @@ public:
   set_convective_kernel(const ConvectiveKernel kernel)
   {
     convective_kernel = kernel;
-  }
-
-  void
-  benchmark_prepare(const VectorType & src) const
-  {
-    exchange_ghosts_and_face_data(src);
-  }
-
-  void
-  benchmark_finish(const VectorType & src) const
-  {
-    single_exchange.signal_done_reading();
-    src.zero_out_ghost_values();
-    single_exchange.wait_until_source_vector_free();
-  }
-
-  void
-  benchmark_cell_range(const BenchmarkKernel kernel,
-                       const unsigned int    last_stage,
-                       const unsigned int    begin,
-                       const unsigned int    end,
-                       const VectorType &    src,
-                       VectorType &          dst,
-                       VectorType &          convective_divergence,
-                       VectorType &          divergence) const
-  {
-    AssertThrow(last_stage <= 3, ExcIndexRange(last_stage, 0, 4));
-    AssertThrow(begin <= end && end <= dof_indices.size(), ExcInternalError());
-    AssertThrow(kernel != BenchmarkKernel::convective_and_divergence ||
-                  pressure_dof_indices != nullptr,
-                ExcMessage("Call initialize_coupling_pressure() first"));
-    const unsigned int degree = shape_info.data[0].fe_degree;
-    if(degree == 2)
-      benchmark_cell_range<2>(
-        kernel, last_stage, begin, end, src, dst, convective_divergence, divergence);
-    else if(degree == 3)
-      benchmark_cell_range<3>(
-        kernel, last_stage, begin, end, src, dst, convective_divergence, divergence);
-    else if(degree == 4)
-      benchmark_cell_range<4>(
-        kernel, last_stage, begin, end, src, dst, convective_divergence, divergence);
-#ifndef DEBUG
-    else if(degree == 5)
-      benchmark_cell_range<5>(
-        kernel, last_stage, begin, end, src, dst, convective_divergence, divergence);
-    else if(degree == 6)
-      benchmark_cell_range<6>(
-        kernel, last_stage, begin, end, src, dst, convective_divergence, divergence);
-    else if(degree == 7)
-      benchmark_cell_range<7>(
-        kernel, last_stage, begin, end, src, dst, convective_divergence, divergence);
-    else if(degree == 8)
-      benchmark_cell_range<8>(
-        kernel, last_stage, begin, end, src, dst, convective_divergence, divergence);
-    else if(degree == 9)
-      benchmark_cell_range<9>(
-        kernel, last_stage, begin, end, src, dst, convective_divergence, divergence);
-#endif
-    else
-      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
   }
 
   void
@@ -1211,6 +1123,7 @@ public:
 
     const unsigned int n_cell_batches = dof_indices.size();
 
+    // 1. Exchange face data with single-exchange strategy
     for(unsigned int range = cell_loop_pre_list_index[n_cell_batches];
         range < cell_loop_pre_list_index[n_cell_batches + 1];
         ++range)
@@ -1220,10 +1133,9 @@ public:
     {
       // Single communication algorithm: the messages only contain data
       // computed from locally owned entries, so we can pack them as soon as
-      // the entries touched by the packing have passed through before_loop,
-      // without previously calling 'src.update_ghost_values'.
-      const unsigned int n_partners = single_exchange.partners.size();
-      check_source_vector_is_shared(src);
+      // the entries touched by the packing have passed through before_loop.
+      const unsigned int n_neighbor_processes = single_exchange.neighbors.size();
+      assert_source_vector_has_expected_shared_state(src);
       single_exchange.start_receives(mpi_recv_buffer.data(),
                                      src.get_mpi_communicator(),
                                      mpi_requests.data());
@@ -1243,9 +1155,10 @@ public:
       timings[1] += time.wall_time();
       time.restart();
 
-      if(n_partners > 0)
+      if(n_neighbor_processes > 0)
       {
-        const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+        const int ierr =
+          MPI_Waitall(n_neighbor_processes * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
         AssertThrowMPI(ierr);
       }
       single_exchange.unpack_and_complete(mpi_recv_buffer.data(),
@@ -1260,6 +1173,7 @@ public:
 
     time.restart();
 
+    // 2. Compute cell integrals
     for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
     {
       if(factor_laplace != 0.)
@@ -1273,7 +1187,7 @@ public:
             ++range)
           before_loop(cell_loop_mass_pre_list[range].first, cell_loop_mass_pre_list[range].second);
 
-      dispatch_cell_operation(cell, src, dst);
+      dispatch_cell_operation(cell, src, dof_indices[cell], dst.begin());
 
       for(unsigned int range = cell_loop_post_list_index[cell];
           range < cell_loop_post_list_index[cell + 1];
@@ -1286,6 +1200,7 @@ public:
     else
       timings[12] += time.wall_time();
 
+    // 3. Finalize result vector by adding off-processor results to the owner
     time.restart();
     single_exchange.signal_done_reading();
     dst.compress_start(0, VectorOperation::add);
@@ -1358,8 +1273,8 @@ public:
         ++range)
       before_loop_src(cell_loop_pre_list[range].first, cell_loop_pre_list[range].second);
 
-    const unsigned int n_partners = single_exchange.partners.size();
-    check_source_vector_is_shared(src);
+    const unsigned int n_neighbor_processes = single_exchange.neighbors.size();
+    assert_source_vector_has_expected_shared_state(src);
     single_exchange.start_receives(mpi_recv_buffer.data(),
                                    src.get_mpi_communicator(),
                                    mpi_requests.data());
@@ -1383,9 +1298,10 @@ public:
       before_loop_dst(cell_loop_mass_pre_list[range].first, cell_loop_mass_pre_list[range].second);
     velocity_old.update_ghost_values_start(1);
 
-    if(n_partners > 0)
+    if(n_neighbor_processes > 0)
     {
-      const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+      const int ierr =
+        MPI_Waitall(n_neighbor_processes * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
       AssertThrowMPI(ierr);
     }
     single_exchange.unpack_and_complete(mpi_recv_buffer.data(), const_cast<Number *>(src.begin()));
@@ -1506,7 +1422,7 @@ public:
           ++range)
         before_loop(cell_loop_mass_pre_list[range].first, cell_loop_mass_pre_list[range].second);
 
-      dispatch_cell_operation(cell, src, dst);
+      dispatch_cell_operation(cell, src, dof_indices[cell], dst.begin());
 
       for(unsigned int range = cell_loop_post_list_index[cell];
           range < cell_loop_post_list_index[cell + 1];
@@ -1569,9 +1485,7 @@ public:
   // by this process (in the cell integrals or the packing of the data sent
   // to other processes) or by other processes in shared memory. Each entry
   // passes through 'before_loop' exactly once, in the ranges of the pre list
-  // in units of 'vector_access_chunk_size'. As the other processes may read
-  // src during the call, 'before_loop' may only change entries of src
-  // (together with other vectors not read by the product).
+  // in units of 'vector_access_chunk_size'.
   template<typename BeforeLoop, typename AfterLoop>
   void
   vmult_scratch(const VectorType & src,
@@ -1656,11 +1570,11 @@ public:
     const MPI_Comm comm         = dof_handler->get_mpi_communicator();
     unsigned int   n_on_node    = 0;
     double         bytes_remote = 0;
-    for(const auto & partner : single_exchange.partners)
-      if(partner.sm_rank != numbers::invalid_unsigned_int)
+    for(const auto & neighbor : single_exchange.neighbors)
+      if(neighbor.sm_rank != numbers::invalid_unsigned_int)
         ++n_on_node;
       else
-        bytes_remote += partner.send_size * sizeof(Number);
+        bytes_remote += neighbor.send_size * sizeof(Number);
     const auto [n_faces, n_faces_shared] = n_remote_faces();
 
     if(Utilities::MPI::this_mpi_process(comm) == 0)
@@ -1668,7 +1582,7 @@ public:
                 << (std::is_same_v<Number, double> ? "double" : "float")
                 << "> per process:" << std::endl;
     Helper::print_time(n_on_node, "Neighbors on same node", comm);
-    Helper::print_time(single_exchange.partners.size() - n_on_node,
+    Helper::print_time(single_exchange.neighbors.size() - n_on_node,
                        "Neighbors on other nodes",
                        comm);
     Helper::print_time(n_faces, "Faces to remote cells", comm);
@@ -1708,9 +1622,9 @@ public:
   // Number of neighboring processes whose face data is read directly from
   // shared memory, see reinit()
   unsigned int
-  n_shared_memory_partners() const
+  n_shared_memory_neighbors() const
   {
-    return single_exchange.n_shared_memory_partners();
+    return single_exchange.n_shared_memory_neighbors();
   }
 
   void
@@ -1957,7 +1871,8 @@ public:
     const unsigned int mm            = shape_info.data[0].fe_degree;
     const unsigned int data_per_face = Utilities::pow(mm, dim - 1);
 
-    // create vector without parallel partitioning
+    // create vector without parallel partitioning but still being
+    // 'VectorType' to enable the use of the optimized extrapolation functions
     pressure_boundary_vector.reinit(cells_at_dirichlet_boundary.size() * n_lanes * data_per_face);
   }
 
@@ -2148,6 +2063,202 @@ public:
       AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
   }
 
+  // Print statistics of the data locality of the cell loop as minimum,
+  // average and maximum over the processes:
+  // - the face flux buffer: the share of the left faces of the cell batches
+  //   taken from the buffer, relative to all left faces and to the faces
+  //   whose left neighbor is a locally owned cell in the interior (the best
+  //   possible outcome, as periodic and remote neighbors always go through
+  //   the face integrals), and the size of the buffer,
+  // - the scratch array of vmult_scratch(),
+  // - the data of the global vectors to be kept in cache between their
+  //   accesses, measured per entry in units of cell batches: for a loop
+  //   without 'before_loop' like the Chebyshev iteration, the source vector
+  //   from its first to its last read in the cell integrals or 'after_loop'
+  //   (the destination lives in the scratch array); for a loop with
+  //   'before_loop' and 'after_loop' like the conjugate gradient method,
+  //   the vectors from the first to the second function, where the entries
+  //   sent to other processes pass through 'before_loop' before the loop,
+  // - the number of ranges in the lists of 'before_loop' and 'after_loop'.
+  void
+  print_data_locality_statistics() const
+  {
+    const MPI_Comm     comm           = dof_handler->get_mpi_communicator();
+    const unsigned int n_cell_batches = dof_indices.size();
+    const unsigned int n_dofs         = partitioner->locally_owned_size();
+    const double       kib            = sizeof(Number) / 1024.;
+
+    // face flux buffer
+    unsigned int n_batch_faces = 0, n_batch_faces_buffer = 0;
+    unsigned int n_faces = 0, n_faces_buffer = 0, n_faces_possible = 0;
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+      for(unsigned int d = 0; d < dim; ++d)
+      {
+        const unsigned int n_active = n_active_entries_per_cell_batch(cell);
+        ++n_batch_faces;
+        n_faces += n_active;
+        if(all_left_face_fluxes_from_buffer[cell][d])
+        {
+          ++n_batch_faces_buffer;
+          n_faces_buffer += n_active;
+        }
+        for(unsigned int v = 0; v < n_active; ++v)
+        {
+          const auto dcell = get_cell_iterator(cell, v);
+          if(!dcell->at_boundary(2 * d) &&
+             dcell->neighbor(2 * d)->subdomain_id() == dcell->subdomain_id())
+            ++n_faces_possible;
+        }
+      }
+    const unsigned int n_data_per_face =
+      Utilities::pow(mapping_info.quad_weights_z.size(), dim - 1) * 2 * dim;
+
+    // first and last read of each locally owned entry of the source vector
+    // by the cell integrals, which skip the neighbors across the left faces
+    // taken from the flux buffer, and the last write to the result
+    const unsigned int        invalid = numbers::invalid_unsigned_int;
+    std::vector<unsigned int> first_read(n_dofs, invalid), last_read(n_dofs, 0),
+      last_write(n_dofs, 0);
+    const unsigned int dofs_on_quad = dof_handler->get_fe().dofs_per_face;
+    const unsigned int dofs_on_hex  = dof_handler->get_fe().dofs_per_cell - 2 * dim * dofs_on_quad;
+    const auto         for_each_entry = [&](const unsigned int other, const auto & f) {
+      for(unsigned int e = 0; e < 2 * dim + 1; ++e)
+      {
+        const unsigned int idx = dof_indices[other / n_lanes][e][other % n_lanes];
+        if(idx < n_dofs)
+          for(unsigned int i = idx; i < idx + (e < 2 * dim ? dofs_on_quad : dofs_on_hex); ++i)
+            f(i);
+      }
+    };
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+      for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+      {
+        const auto read = [&](const unsigned int i) {
+          first_read[i] = std::min(first_read[i], cell);
+          last_read[i]  = std::max(last_read[i], cell);
+        };
+        for_each_entry(cell * n_lanes + v, [&](const unsigned int i) {
+          read(i);
+          last_write[i] = std::max(last_write[i], cell);
+        });
+        for(unsigned int f = 0; f < 2 * dim; ++f)
+          if(neighbor_cells[cell][f][v] != invalid &&
+             !(f % 2 == 0 && all_left_face_fluxes_from_buffer[cell][f / 2]))
+            for_each_entry(neighbor_cells[cell][f][v], read);
+      }
+
+    // times of 'before_loop' and 'after_loop' per entry, with -1 for
+    // 'before_loop' ahead of the cell loop and n_cell_batches for
+    // 'after_loop' after the loop
+    std::vector<int> pre_time(n_dofs, -1), post_time(n_dofs, n_cell_batches);
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    {
+      for(unsigned int r = cell_loop_pre_list_index[cell]; r < cell_loop_pre_list_index[cell + 1];
+          ++r)
+        for(unsigned int i = cell_loop_pre_list[r].first; i < cell_loop_pre_list[r].second; ++i)
+          pre_time[i] = cell;
+      for(unsigned int r = cell_loop_post_list_index[cell]; r < cell_loop_post_list_index[cell + 1];
+          ++r)
+        for(unsigned int i = cell_loop_post_list[r].first; i < cell_loop_post_list[r].second; ++i)
+          post_time[i] = cell;
+    }
+
+    // number of entries alive at each cell batch from differences at the
+    // start and the end of the windows
+    const auto live_entries = [&](const auto & begin, const auto & end, const bool in_loop_only) {
+      std::vector<long> diff(n_cell_batches + 2, 0);
+      double            sum_length = 0;
+      unsigned int      n_entries  = 0;
+      for(unsigned int i = 0; i < n_dofs; ++i)
+      {
+        if(in_loop_only && begin(i) < 0)
+          continue;
+        ++n_entries;
+        const int b = std::max<int>(begin(i), 0);
+        const int e = std::min<int>(end(i), n_cell_batches - 1);
+        sum_length += e - b + 1;
+        ++diff[b];
+        --diff[e + 1];
+      }
+      long   current = 0, max_live = 0;
+      double sum_live = 0;
+      for(unsigned int c = 0; c < n_cell_batches; ++c)
+      {
+        current += diff[c];
+        max_live = std::max(max_live, current);
+        sum_live += current;
+      }
+      return std::array<double, 3>{
+        {sum_length / std::max(1U, n_entries), double(max_live), sum_live / n_cell_batches}};
+    };
+    const auto src_live =
+      live_entries([&](const unsigned int i) { return int(first_read[i]); },
+                   [&](const unsigned int i) { return std::max<int>(last_read[i], post_time[i]); },
+                   false);
+    const auto pre_post_live    = live_entries([&](const unsigned int i) { return pre_time[i]; },
+                                            [&](const unsigned int i) { return post_time[i]; },
+                                            false);
+    const auto pre_post_in_loop = live_entries([&](const unsigned int i) { return pre_time[i]; },
+                                               [&](const unsigned int i) { return post_time[i]; },
+                                               true);
+
+    // entries passing through 'before_loop' ahead of the loop, and the
+    // distance to their first read in the loop
+    unsigned int n_pre_ahead        = 0;
+    double       sum_distance_ahead = 0;
+    for(unsigned int i = 0; i < n_dofs; ++i)
+      if(pre_time[i] < 0)
+      {
+        ++n_pre_ahead;
+        sum_distance_ahead += first_read[i];
+      }
+
+    const auto scratch_sizes = scratch.get_sizes();
+
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << "Data locality of RT operator <"
+                << (std::is_same_v<Number, double> ? "double" : "float") << ">, "
+                << "min [proc] avg max [proc]:" << std::endl;
+    Helper::print_time(n_cell_batches, "Cell batches", comm);
+    Helper::print_time(double(n_batch_faces_buffer) / std::max(1U, n_batch_faces),
+                       "Flux buffer: batch-dir share",
+                       comm);
+    Helper::print_time(double(n_faces_buffer) / std::max(1U, n_faces),
+                       "Flux buffer: left faces",
+                       comm);
+    Helper::print_time(double(n_faces_possible) / std::max(1U, n_faces),
+                       "Flux buffer: best possible",
+                       comm);
+    Helper::print_time(double(n_faces_buffer) / std::max(1U, n_faces_possible),
+                       "Flux buffer: efficiency",
+                       comm);
+    Helper::print_time(face_flux_buffer.size() / n_data_per_face, "Flux buffer: slots", comm);
+    Helper::print_time(face_flux_buffer.size() * kib, "Flux buffer [KiB]", comm);
+    Helper::print_time(convective_face_flux_buffer.size() * kib, "Conv. flux buffer [KiB]", comm);
+    Helper::print_time(scratch_sizes[0] * kib, "Scratch pool [KiB]", comm);
+    Helper::print_time(scratch_sizes[1] * kib, "Scratch MPI part [KiB]", comm);
+    Helper::print_time(scratch_sizes[2] * kib, "Scratch total [KiB]", comm);
+    Helper::print_time(n_dofs * kib, "Vector size [KiB]", comm);
+    Helper::print_time(src_live[0], "Post-only: src window [cb]", comm);
+    Helper::print_time(src_live[2] * kib, "Post-only: src live avg[KiB]", comm);
+    Helper::print_time(src_live[1] * kib, "Post-only: src live max[KiB]", comm);
+    Helper::print_time(double(n_pre_ahead) / std::max(1U, n_dofs),
+                       "Pre/post: share pre ahead",
+                       comm);
+    Helper::print_time(n_pre_ahead > 0 ? sum_distance_ahead / n_pre_ahead : 0.,
+                       "Pre/post: ahead to read [cb]",
+                       comm);
+    Helper::print_time(pre_post_live[0], "Pre/post: window [cb]", comm);
+    Helper::print_time(pre_post_live[2] * kib, "Pre/post: live avg [KiB]", comm);
+    Helper::print_time(pre_post_live[1] * kib, "Pre/post: live max [KiB]", comm);
+    Helper::print_time(pre_post_in_loop[0], "Pre/post in loop: window[cb]", comm);
+    Helper::print_time(pre_post_in_loop[2] * kib, "Pre/post in loop: live [KiB]", comm);
+    Helper::print_time(cell_loop_pre_list.size(), "Ranges before_loop", comm);
+    Helper::print_time(cell_loop_post_list.size(), "Ranges after_loop", comm);
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << std::endl;
+  }
+
 private:
   enum class CellOperation
   {
@@ -2169,41 +2280,9 @@ private:
   // MPI_COMM_SELF, used to allocate the vectors in shared memory
   MPI_Comm communicator_sm = MPI_COMM_SELF;
 
-  void
-  free_communicator_sm()
-  {
-    if(communicator_sm != MPI_COMM_SELF)
-    {
-      const int ierr = MPI_Comm_free(&communicator_sm);
-      AssertThrowMPI(ierr);
-      communicator_sm = MPI_COMM_SELF;
-    }
-  }
-
-  // Check that the source vector of a product with face integrals is
-  // allocated in shared memory if a shared-memory communicator was given,
-  // i.e., created by initialize_dof_vector() or with reinit() from such a
-  // vector
-  void
-  check_source_vector_is_shared(const VectorType & src) const
-  {
-    if(communicator_sm != MPI_COMM_SELF)
-      AssertThrow(src.shared_vector_data().size() ==
-                    Utilities::MPI::n_mpi_processes(communicator_sm),
-                  ExcMessage("The source vector is not allocated in shared memory; create it "
-                             "with initialize_dof_vector() of this operator"));
-  }
-
   // send buffer of the single exchange in shared memory, see reinit()
   MemorySpace::MemorySpaceData<Number, MemorySpace::Host> shared_send_buffer;
 
-  Number *
-  single_exchange_send_buffer() const
-  {
-    return shared_send_buffer.values.size() > 0 ?
-             const_cast<Number *>(shared_send_buffer.values.data()) :
-             mpi_send_buffer.data();
-  }
   Table<2, unsigned char> all_owned_faces;
 
   std::vector<std::pair<unsigned int, std::array<unsigned int, n_lanes>>>
@@ -2227,15 +2306,6 @@ private:
   mutable std::array<std::array<double, 2>, 4> product_timings            = {};
   mutable double                               time_wait_readers          = 0;
   mutable double                               time_wait_readers_deferred = 0;
-
-  void
-  wait_for_readers(const bool at_end_of_product = true) const
-  {
-    Timer time;
-    single_exchange.wait_until_source_vector_free();
-    if(factor_laplace != 0.)
-      (at_end_of_product ? time_wait_readers : time_wait_readers_deferred) += time.wall_time();
-  }
 
   Number factor_mass;
   Number factor_laplace;
@@ -2292,6 +2362,48 @@ private:
   bool                                                 use_convective_face_flux_buffer = true;
   ConvectiveKernel convective_kernel = ConvectiveKernel::automatic;
 
+  SingleExchange::Data<dim, Number> single_exchange;
+
+  void
+  free_communicator_sm()
+  {
+    if(communicator_sm != MPI_COMM_SELF)
+    {
+      const int ierr = MPI_Comm_free(&communicator_sm);
+      AssertThrowMPI(ierr);
+      communicator_sm = MPI_COMM_SELF;
+    }
+  }
+
+  // Check that the source vector of a product with face integrals is
+  // allocated in shared memory if a shared-memory communicator was given,
+  // i.e., created by initialize_dof_vector() or with reinit() from such a
+  // vector
+  void
+  assert_source_vector_has_expected_shared_state(const VectorType & src) const
+  {
+    if(communicator_sm != MPI_COMM_SELF)
+      AssertThrow(src.shared_vector_data().size() ==
+                    Utilities::MPI::n_mpi_processes(communicator_sm),
+                  ExcMessage("The source vector is not allocated in shared memory; create it "
+                             "with initialize_dof_vector() of this operator"));
+  }
+  Number *
+  single_exchange_send_buffer() const
+  {
+    return shared_send_buffer.values.size() > 0 ?
+             const_cast<Number *>(shared_send_buffer.values.data()) :
+             mpi_send_buffer.data();
+  }
+  void
+  wait_for_readers(const bool at_end_of_product = true) const
+  {
+    Timer time;
+    single_exchange.wait_until_source_vector_free();
+    if(factor_laplace != 0.)
+      (at_end_of_product ? time_wait_readers : time_wait_readers_deferred) += time.wall_time();
+  }
+
   // The layered convective kernels are faster from degree 3 on (16 ranks:
   // up to 9 % for the local kernel, up to 5 % for the evaluation including
   // the exchange), the collocation kernels at degree 2, where the face data
@@ -2311,8 +2423,6 @@ private:
              convective_kernel == ConvectiveKernel::layered;
   }
 
-  SingleExchange::Data<dim, Number> single_exchange;
-
   // Start and complete the ghost exchange of src for the loops in which src
   // is final upon entry, running 'work' while the messages are in flight
   void
@@ -2321,8 +2431,8 @@ private:
     Timer time;
     if(factor_laplace != 0.)
     {
-      const unsigned int n_partners = single_exchange.partners.size();
-      check_source_vector_is_shared(src);
+      const unsigned int n_neighbor_processes = single_exchange.neighbors.size();
+      assert_source_vector_has_expected_shared_state(src);
       single_exchange.start_receives(mpi_recv_buffer.data(),
                                      src.get_mpi_communicator(),
                                      mpi_requests.data());
@@ -2338,9 +2448,10 @@ private:
       timings[4] += time.wall_time();
       time.restart();
 
-      if(n_partners > 0)
+      if(n_neighbor_processes > 0)
       {
-        const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+        const int ierr =
+          MPI_Waitall(n_neighbor_processes * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
         AssertThrowMPI(ierr);
       }
       single_exchange.unpack_and_complete(mpi_recv_buffer.data(),
@@ -2362,8 +2473,8 @@ private:
   void
   exchange_ghosts_and_face_data(const VectorType & src) const
   {
-    const unsigned int n_partners = single_exchange.partners.size();
-    check_source_vector_is_shared(src);
+    const unsigned int n_neighbor_processes = single_exchange.neighbors.size();
+    assert_source_vector_has_expected_shared_state(src);
     single_exchange.start_receives(mpi_recv_buffer.data(),
                                    src.get_mpi_communicator(),
                                    mpi_requests.data());
@@ -2373,9 +2484,10 @@ private:
 
     dispatch_single_exchange_pack_and_send(src);
 
-    if(n_partners > 0)
+    if(n_neighbor_processes > 0)
     {
-      const int ierr = MPI_Waitall(n_partners * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
+      const int ierr =
+        MPI_Waitall(n_neighbor_processes * 2, mpi_requests.data(), MPI_STATUSES_IGNORE);
       AssertThrowMPI(ierr);
     }
     single_exchange.unpack_and_complete(mpi_recv_buffer.data(), const_cast<Number *>(src.begin()));
@@ -2412,12 +2524,6 @@ private:
   }
 
   void
-  dispatch_cell_operation(const unsigned int cell, const VectorType & src, VectorType & dst) const
-  {
-    dispatch_cell_operation(cell, src, dof_indices[cell], dst.begin());
-  }
-
-  void
   dispatch_cell_operation(const unsigned int                                          cell,
                           const VectorType &                                          src,
                           const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dst_indices,
@@ -2425,22 +2531,22 @@ private:
   {
     const unsigned int degree = shape_info.data[0].fe_degree;
     if(degree == 2)
-      do_cell_operation<2, true>(cell, src, dst_indices, dst);
+      do_cell_operation<2>(cell, src, dst_indices, dst);
     else if(degree == 3)
-      do_cell_operation<3, true>(cell, src, dst_indices, dst);
+      do_cell_operation<3>(cell, src, dst_indices, dst);
     else if(degree == 4)
-      do_cell_operation<4, true>(cell, src, dst_indices, dst);
+      do_cell_operation<4>(cell, src, dst_indices, dst);
 #ifndef DEBUG
     else if(degree == 5)
-      do_cell_operation<5, true>(cell, src, dst_indices, dst);
+      do_cell_operation<5>(cell, src, dst_indices, dst);
     else if(degree == 6)
-      do_cell_operation<6, true>(cell, src, dst_indices, dst);
+      do_cell_operation<6>(cell, src, dst_indices, dst);
     else if(degree == 7)
-      do_cell_operation<7, true>(cell, src, dst_indices, dst);
+      do_cell_operation<7>(cell, src, dst_indices, dst);
     else if(degree == 8)
-      do_cell_operation<8, true>(cell, src, dst_indices, dst);
+      do_cell_operation<8>(cell, src, dst_indices, dst);
     else if(degree == 9)
-      do_cell_operation<9, true>(cell, src, dst_indices, dst);
+      do_cell_operation<9>(cell, src, dst_indices, dst);
 #endif
     else
       AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
@@ -2455,22 +2561,22 @@ private:
   single_exchange_pack_and_send(const VectorType & src) const
   {
     single_exchange.wait_until_send_buffer_free();
-    const auto & partners    = single_exchange.partners;
+    const auto & neighbors   = single_exchange.neighbors;
     Number *     send_buffer = single_exchange_send_buffer();
-    for(unsigned int p = 0; p < partners.size(); ++p)
+    for(unsigned int p = 0; p < neighbors.size(); ++p)
     {
-      const auto & partner = partners[p];
-      single_exchange.pack_ghost_section(partner, src.begin(), send_buffer);
-      if(!partner.faces_read_directly)
+      const auto & neighbor = neighbors[p];
+      single_exchange.pack_ghost_section(neighbor, src.begin(), send_buffer);
+      if(!neighbor.faces_read_directly)
         pack_face_data<n_t>(src.begin(),
-                            partner.first_face,
-                            partner.first_face + partner.n_faces,
-                            single_exchange.face_section(partner, send_buffer));
-      single_exchange.pack_supplement_section(partner, src.begin(), send_buffer);
+                            neighbor.first_face,
+                            neighbor.first_face + neighbor.n_faces,
+                            single_exchange.face_section(neighbor, send_buffer));
+      single_exchange.pack_supplement_section(neighbor, src.begin(), send_buffer);
       single_exchange.start_send(p,
                                  send_buffer,
                                  src.get_mpi_communicator(),
-                                 mpi_requests.data() + partners.size());
+                                 mpi_requests.data() + neighbors.size());
     }
   }
 
@@ -2744,9 +2850,9 @@ private:
       partitioner,
       n_cell_batches,
       [&](const unsigned int cell, const auto & add) {
-        for(unsigned int e = 0; e < 2 * dim + 1; ++e)
+        for(unsigned int entity = 0; entity < 2 * dim + 1; ++entity)
           for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
-            add(dof_indices[cell][e][v], e < 2 * dim ? dofs_on_quad : dofs_on_hex);
+            add(dof_indices[cell][entity][v], entity < 2 * dim ? dofs_on_quad : dofs_on_hex);
       },
       true);
 
@@ -4582,7 +4688,7 @@ private:
       const unsigned int face = send_data_face_index[count];
 
       // to use vectorized code path, must check that faces are available,
-      // faces are sorted by face number within each partner
+      // faces are sorted by face number within each neighbor
       unsigned int n_faces = 1;
       if(count + n_lanes <= end_face && send_data_face_index[count + n_lanes - 1] == face)
         n_faces = n_lanes;
@@ -4623,40 +4729,38 @@ private:
     const unsigned int degree = shape_info.data[0].fe_degree;
     AssertDimension(degree, shape_info.data[1].fe_degree + 1);
     if(degree == 2)
-      do_cell_operation<2, false>(cell, dst, dst);
+      compute_diagonal_cell<2>(cell, dof_indices[cell], dst.begin());
     else if(degree == 3)
-      do_cell_operation<3, false>(cell, dst, dst);
+      compute_diagonal_cell<3>(cell, dof_indices[cell], dst.begin());
     else if(degree == 4)
-      do_cell_operation<4, false>(cell, dst, dst);
+      compute_diagonal_cell<4>(cell, dof_indices[cell], dst.begin());
 #ifndef DEBUG
     else if(degree == 5)
-      do_cell_operation<5, false>(cell, dst, dst);
+      compute_diagonal_cell<5>(cell, dof_indices[cell], dst.begin());
     else if(degree == 6)
-      do_cell_operation<6, false>(cell, dst, dst);
+      compute_diagonal_cell<6>(cell, dof_indices[cell], dst.begin());
     else if(degree == 7)
-      do_cell_operation<7, false>(cell, dst, dst);
+      compute_diagonal_cell<7>(cell, dof_indices[cell], dst.begin());
     else if(degree == 8)
-      do_cell_operation<8, false>(cell, dst, dst);
+      compute_diagonal_cell<8>(cell, dof_indices[cell], dst.begin());
     else if(degree == 9)
-      do_cell_operation<9, false>(cell, dst, dst);
+      compute_diagonal_cell<9>(cell, dof_indices[cell], dst.begin());
 #endif
     else
       AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
   }
 
-  template<int degree, bool compute_exterior>
+  template<int degree>
   void
   do_cell_operation(const unsigned int cell, const VectorType & src, VectorType & dst) const
   {
-    do_cell_operation<degree, compute_exterior>(cell, src, dof_indices[cell], dst.begin());
+    do_cell_operation<degree>(cell, src, dof_indices[cell], dst.begin());
   }
 
   // Variant of the cell operation that writes the result into the array
   // 'dst' at the positions given by 'dst_indices' (in the same format as
-  // dof_indices), whereas src is read with the regular dof_indices. The
-  // parameter 'last_stage' truncates the kernel for benchmarking, see
-  // benchmark_cell_range().
-  template<int degree, bool compute_exterior, int last_stage = 3>
+  // dof_indices), whereas src is read with the regular dof_indices.
+  template<int degree>
   void
   do_cell_operation(const unsigned int                                          cell,
                     const VectorType &                                          src,
@@ -4668,42 +4772,26 @@ private:
     const auto &           shape_data    = shape_info.data;
 
     VectorizedArray<Number> quad_values[dim * n_points], out_values[dim * n_points];
-    if(compute_exterior)
+    read_cell_values<degree, n_q_points_1d>(src.begin(), dof_indices[cell], quad_values);
+
+    // If the second derivative terms have a non-zero factor, compute the
+    // relevant parts of cell integrals and the associated face integrals
+    if(factor_laplace != 0)
     {
-      read_cell_values<degree, n_q_points_1d>(src.begin(), dof_indices[cell], quad_values);
-      if constexpr(last_stage == 0)
-      {
-        benchmark_escape(quad_values);
-        return;
-      }
-
-      // If the second derivative terms have a non-zero factor, compute the
-      // relevant parts of cell integrals and the associated face integrals
-      if(factor_laplace != 0)
-      {
-        compute_cell<CellOperation::helmholtz, n_q_points_1d>(shape_data,
-                                                              cell,
-                                                              quad_values,
-                                                              out_values);
-        if constexpr(last_stage >= 2)
-          for(unsigned int f = 0; f < 2 * dim; ++f)
-            compute_face<degree, true>(shape_data, src, cell, f, quad_values, out_values);
-      }
-      else
-        compute_cell_mass<n_q_points_1d>(cell, this->factor_mass, quad_values, out_values);
-      if constexpr(last_stage < 3)
-      {
-        benchmark_escape(out_values);
-        return;
-      }
-
-      integrate_cell_scatter<degree, n_q_points_1d>(dst_indices,
-                                                    n_active_entries_per_cell_batch(cell),
-                                                    out_values,
-                                                    dst);
+      compute_cell<CellOperation::helmholtz, n_q_points_1d>(shape_data,
+                                                            cell,
+                                                            quad_values,
+                                                            out_values);
+      for(unsigned int f = 0; f < 2 * dim; ++f)
+        compute_face<degree, true>(shape_data, src, cell, f, quad_values, out_values);
     }
     else
-      compute_diagonal_cell<degree>(cell, dst_indices, dst);
+      compute_cell_mass<n_q_points_1d>(cell, this->factor_mass, quad_values, out_values);
+
+    integrate_cell_scatter<degree, n_q_points_1d>(dst_indices,
+                                                  n_active_entries_per_cell_batch(cell),
+                                                  out_values,
+                                                  dst);
   }
 
   // Compute the diagonal of the operator on a cell batch and add it into
@@ -5249,76 +5337,11 @@ private:
                                                           dst);
   }
 
-
-  template<int degree>
-  void
-  benchmark_cell_range(const BenchmarkKernel kernel,
-                       const unsigned int    last_stage,
-                       const unsigned int    begin,
-                       const unsigned int    end,
-                       const VectorType &    src,
-                       VectorType &          dst,
-                       VectorType &          convective_divergence,
-                       VectorType &          divergence) const
-  {
-    if(last_stage == 0)
-      benchmark_cell_range<degree, 0>(
-        kernel, begin, end, src, dst, convective_divergence, divergence);
-    else if(last_stage == 1)
-      benchmark_cell_range<degree, 1>(
-        kernel, begin, end, src, dst, convective_divergence, divergence);
-    else if(last_stage == 2)
-      benchmark_cell_range<degree, 2>(
-        kernel, begin, end, src, dst, convective_divergence, divergence);
-    else
-      benchmark_cell_range<degree, 3>(
-        kernel, begin, end, src, dst, convective_divergence, divergence);
-  }
-
-  template<int degree, int last_stage>
-  void
-  benchmark_cell_range(const BenchmarkKernel kernel,
-                       const unsigned int    begin,
-                       const unsigned int    end,
-                       const VectorType &    src,
-                       VectorType &          dst,
-                       VectorType &          convective_divergence,
-                       VectorType &          divergence) const
-  {
-    if(kernel == BenchmarkKernel::momentum)
-      for(unsigned int cell = begin; cell < end; ++cell)
-        do_cell_operation<degree, true, last_stage>(cell, src, dof_indices[cell], dst.begin());
-    else if(kernel == BenchmarkKernel::convective)
-    {
-      VectorizedArray<Number> cfl = 0.;
-      for(unsigned int cell = begin; cell < end; ++cell)
-        cfl = std::max(cfl, do_convective_on_cell<degree, last_stage>(cell, src, Number(1.), dst));
-      benchmark_escape(&cfl);
-    }
-    else
-    {
-      VectorizedArray<Number> cfl = 0.;
-      for(unsigned int cell = begin; cell < end; ++cell)
-        cfl = std::max(cfl,
-                       do_convective_and_divergence_on_cell<degree, last_stage>(
-                         cell, src, dst, convective_divergence, divergence));
-      benchmark_escape(&cfl);
-    }
-  }
-
-  // Make the compiler assume that the memory behind 'pointer' is used, so
-  // that the work of kernels truncated by 'last_stage' is not removed
-  static void
-  benchmark_escape(const void * pointer)
-  {
-    asm volatile("" : : "r"(pointer) : "memory");
-  }
-
   // Variant of do_convective_on_cell() with tensor products of the
   // non-collocated shape functions, processing the cell plane by plane in y
   // direction, see read_cell_values_layered() and
   // compute_cell_convective_layered()
-  template<int degree, int last_stage = 3>
+  template<int degree>
   VectorizedArray<Number>
   do_convective_on_cell_layered(const unsigned int cell,
                                 const VectorType & src,
@@ -5335,31 +5358,15 @@ private:
     VectorizedArray<Number> dof_values[dim * Utilities::pow(degree, dim - 1) * (degree + 1)];
     read_cell_values_layered<degree, n_q_points_1d>(
       src.begin(), dof_indices[cell], dof_values, values_y, derivatives_y);
-    if constexpr(last_stage == 0)
-    {
-      benchmark_escape(values_y);
-      benchmark_escape(derivatives_y);
-      return values_y[0];
-    }
 
     for(unsigned int f = 0; f < 2 * dim; ++f)
       compute_face_convective<false, degree, n_q_points_1d, true>(
         shape_data, src, cell, f, factor_convective, nullptr, dof_values, face_data);
-    if constexpr(last_stage == 1)
-    {
-      benchmark_escape(face_data);
-      return face_data[0];
-    }
 
-    const VectorizedArray<Number> cfl_velocity =
+    Tensor<1, dim, VectorizedArray<Number>> velocity;
+    const VectorizedArray<Number>           cfl_velocity =
       compute_cell_convective_layered<CellOperation::convective, degree, n_q_points_1d>(
-        cell, values_y, derivatives_y, factor_convective, face_data);
-    if constexpr(last_stage == 2)
-    {
-      benchmark_escape(values_y);
-      benchmark_escape(derivatives_y);
-      return cfl_velocity;
-    }
+        cell, values_y, derivatives_y, factor_convective, face_data, velocity);
 
     integrate_cell_layered<degree, n_q_points_1d>(
       values_y, factor_convective != Number(1.0) ? derivatives_y : nullptr, face_data, dof_values);
@@ -5370,9 +5377,7 @@ private:
     return cfl_velocity;
   }
 
-  // The parameter 'last_stage' truncates the kernel for benchmarking, see
-  // benchmark_cell_range().
-  template<int degree, int last_stage = 3>
+  template<int degree>
   VectorizedArray<Number>
   do_convective_on_cell(const unsigned int cell,
                         const VectorType & src,
@@ -5380,7 +5385,7 @@ private:
                         VectorType &       dst) const
   {
     if(use_layered_convective(degree))
-      return do_convective_on_cell_layered<degree, last_stage>(cell, src, factor_convective, dst);
+      return do_convective_on_cell_layered<degree>(cell, src, factor_convective, dst);
 
     constexpr unsigned int n_q_points_1d = degree + (degree + 1) / 2;
     constexpr unsigned int n_points      = Utilities::pow(n_q_points_1d, dim);
@@ -5396,29 +5401,14 @@ private:
                                             dof_indices[cell],
                                             quad_values,
                                             use_cell_dofs_for_faces(degree) ? dof_values : nullptr);
-    if constexpr(last_stage == 0)
-    {
-      benchmark_escape(quad_values);
-      return quad_values[0];
-    }
 
     // face integrals, applied together with the cell integrals
     for(unsigned int f = 0; f < 2 * dim; ++f)
       compute_face_convective<false, degree, n_q_points_1d>(
         shape_data, src, cell, f, factor_convective, quad_values, dof_values, face_data);
-    if constexpr(last_stage == 1)
-    {
-      benchmark_escape(face_data);
-      return face_data[0];
-    }
 
     compute_cell<CellOperation::convective, n_q_points_1d>(
       shape_data, cell, quad_values, quad_values, factor_convective, nullptr, face_data);
-    if constexpr(last_stage == 2)
-    {
-      benchmark_escape(quad_values);
-      return quad_values[dim * n_points];
-    }
 
     integrate_cell_scatter<degree, n_q_points_1d>(dof_indices[cell],
                                                   n_active_entries_per_cell_batch(cell),
@@ -5457,7 +5447,7 @@ private:
   // Variant of do_convective_and_divergence_on_cell() with tensor products
   // of the non-collocated shape functions, processing the cell plane by
   // plane in y direction, see do_convective_on_cell_layered()
-  template<int degree, int last_stage = 3>
+  template<int degree>
   VectorizedArray<Number>
   do_convective_and_divergence_on_cell_layered(
     const unsigned int                        cell,
@@ -5465,7 +5455,7 @@ private:
     VectorType &                              velocity_dst,
     VectorType &                              convective_divergence,
     VectorType &                              divergence,
-    Tensor<1, dim, VectorizedArray<Number>> * velocity_integral = nullptr) const
+    Tensor<1, dim, VectorizedArray<Number>> & velocity_integral) const
   {
     constexpr unsigned int n_q_points_1d = degree + (degree + 1) / 2;
     constexpr unsigned int n_layered     = n_layered_entries<degree, n_q_points_1d>();
@@ -5479,28 +5469,16 @@ private:
     VectorizedArray<Number> dof_values[dim * Utilities::pow(degree, dim - 1) * (degree + 1)];
     read_cell_values_layered<degree, n_q_points_1d>(
       src.begin(), dof_indices[cell], dof_values, values_y, derivatives_y);
-    if constexpr(last_stage == 0)
-    {
-      benchmark_escape(values_y);
-      benchmark_escape(derivatives_y);
-      return values_y[0];
-    }
 
     for(unsigned int f = 0; f < 2 * dim; ++f)
       compute_face_convective<true, degree, n_q_points_1d, true>(
         shape_data, src, cell, f, 1.0, nullptr, dof_values, face_data);
-    if constexpr(last_stage == 1)
-    {
-      benchmark_escape(face_data);
-      return face_data[0];
-    }
 
-    Tensor<1, dim, VectorizedArray<Number>> integral;
-    const VectorizedArray<Number>           cfl_velocity =
+    const VectorizedArray<Number> cfl_velocity =
       compute_cell_convective_layered<CellOperation::convective_and_divergence,
                                       degree,
                                       n_q_points_1d>(
-        cell, values_y, derivatives_y, 1.0, face_data, pressure_y, &integral);
+        cell, values_y, derivatives_y, 1.0, face_data, velocity_integral, pressure_y);
 
     VectorizedArray<Number> pressure_dofs[2][n_pressure];
     integrate_pressure_layered<degree, n_q_points_1d>(pressure_y,
@@ -5508,12 +5486,6 @@ private:
                                                       pressure_dofs[0],
                                                       pressure_dofs[1]);
     store_pressure_dofs(cell, n_pressure, pressure_dofs[1], divergence);
-    if constexpr(last_stage == 2)
-    {
-      benchmark_escape(values_y);
-      benchmark_escape(pressure_dofs);
-      return cfl_velocity;
-    }
 
     integrate_cell_layered<degree, n_q_points_1d>(values_y, nullptr, face_data, dof_values);
     scatter_cell_dofs<degree>(dof_indices[cell],
@@ -5522,15 +5494,10 @@ private:
                               velocity_dst.begin());
     store_pressure_dofs(cell, n_pressure, pressure_dofs[0], convective_divergence);
 
-    if(velocity_integral != nullptr)
-      *velocity_integral = integral;
-
     return cfl_velocity;
   }
 
-  // The parameter 'last_stage' truncates the kernel for benchmarking, see
-  // benchmark_cell_range().
-  template<int degree, int last_stage = 3>
+  template<int degree>
   VectorizedArray<Number>
   do_convective_and_divergence_on_cell(
     const unsigned int                        cell,
@@ -5538,10 +5505,10 @@ private:
     VectorType &                              velocity_dst,
     VectorType &                              convective_divergence,
     VectorType &                              divergence,
-    Tensor<1, dim, VectorizedArray<Number>> * velocity_integral = nullptr) const
+    Tensor<1, dim, VectorizedArray<Number>> & velocity_integral) const
   {
     if(use_layered_convective(degree))
-      return do_convective_and_divergence_on_cell_layered<degree, last_stage>(
+      return do_convective_and_divergence_on_cell_layered<degree>(
         cell, src, velocity_dst, convective_divergence, divergence, velocity_integral);
 
     constexpr unsigned int n_q_points_1d = degree + (degree + 1) / 2;
@@ -5570,22 +5537,11 @@ private:
                                             dof_indices[cell],
                                             quad_values,
                                             use_cell_dofs_for_faces(degree) ? dof_values : nullptr);
-    if constexpr(last_stage == 0)
-    {
-      benchmark_escape(quad_values);
-      return quad_values[0];
-    }
 
     // face integrals, applied together with the cell integrals
     for(unsigned int f = 0; f < 2 * dim; ++f)
       compute_face_convective<true, degree, n_q_points_1d>(
         shape_data, src, cell, f, 1.0, quad_values, dof_values, face_data);
-
-    if constexpr(last_stage == 1)
-    {
-      benchmark_escape(face_data);
-      return face_data[0];
-    }
 
     compute_cell<CellOperation::convective_and_divergence, n_q_points_1d>(
       shape_data, cell, quad_values, quad_values, 1.0, pressure_values, face_data);
@@ -5635,13 +5591,6 @@ private:
     };
     store_pressure(divergence);
 
-    if constexpr(last_stage == 2)
-    {
-      benchmark_escape(quad_values);
-      benchmark_escape(pressure_values);
-      return quad_values[dim * n_points];
-    }
-
     integrate_cell_scatter<degree, n_q_points_1d>(dof_indices[cell],
                                                   n_active_entries_per_cell_batch(cell),
                                                   quad_values,
@@ -5653,9 +5602,8 @@ private:
                                                     pressure_dofs);
     store_pressure(convective_divergence);
 
-    if(velocity_integral != nullptr)
-      for(unsigned int d = 0; d < dim; ++d)
-        (*velocity_integral)[d] = quad_values[dim * n_points + 1 + d];
+    for(unsigned int d = 0; d < dim; ++d)
+      velocity_integral[d] = quad_values[dim * n_points + 1 + d];
 
     return quad_values[dim * n_points];
   }
@@ -6058,21 +6006,19 @@ private:
   // integral of the velocity over the cell is added to 'velocity_integral'.
   template<CellOperation cell_operation, int n_t, int n_points_1d>
   VectorizedArray<Number>
-  compute_cell_convective_layered(
-    const unsigned int                        cell,
-    VectorizedArray<Number> *                 values_y,
-    VectorizedArray<Number> *                 derivatives_y,
-    const Number                              factor_convective,
-    const VectorizedArray<Number> *           face_data,
-    VectorizedArray<Number> *                 pressure_y        = nullptr,
-    Tensor<1, dim, VectorizedArray<Number>> * velocity_integral = nullptr) const
+  compute_cell_convective_layered(const unsigned int                        cell,
+                                  VectorizedArray<Number> *                 values_y,
+                                  VectorizedArray<Number> *                 derivatives_y,
+                                  const Number                              factor_convective,
+                                  const VectorizedArray<Number> *           face_data,
+                                  Tensor<1, dim, VectorizedArray<Number>> & velocity_integral,
+                                  VectorizedArray<Number> * pressure_y = nullptr) const
   {
     static_assert(dim == 3, "Only implemented for 3D");
     constexpr bool with_pressure = cell_operation == CellOperation::convective_and_divergence;
     static_assert(with_pressure || cell_operation == CellOperation::convective,
                   "Only for the convective operations");
-    AssertThrow(!with_pressure || (factor_convective == Number(1.0) && pressure_y != nullptr &&
-                                   velocity_integral != nullptr),
+    AssertThrow(!with_pressure || (factor_convective == Number(1.0) && pressure_y != nullptr),
                 ExcInternalError());
     constexpr unsigned int n_n            = n_t + 1;
     constexpr unsigned int nq             = n_points_1d;
@@ -6506,7 +6452,7 @@ private:
 
     if constexpr(with_pressure)
       for(unsigned int d = 0; d < dim; ++d)
-        (*velocity_integral)[d] += velocity_integral_cell[d];
+        velocity_integral[d] += velocity_integral_cell[d];
 
     return std::sqrt(cfl_velocity);
   }

@@ -39,6 +39,7 @@
 #include <deal.II/matrix_free/vector_access_internal.h>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/extruded_mapping_info.h>
+#include <exadg/incompressible_navier_stokes/spatial_discretization/operators/face_integral_helper.h>
 #include <exadg/solvers_and_preconditioners/preconditioners/scratch_matrix_vector_product.h>
 
 
@@ -3222,6 +3223,68 @@ public:
   get_dof_indices() const
   {
     return dof_indices;
+  }
+
+  // Print statistics of the access to the vectors in the cell loop as
+  // minimum, average and maximum over the processes: the number of ranges
+  // passed to 'before_loop' and 'after_loop', the share of the entries
+  // passing through 'before_loop' ahead of the loop (data sent to other
+  // processes) and the number of cell batches until their first read in the
+  // loop, and the number of positions in the loop where the next cell batch
+  // does not start in memory where the previous one ended
+  void
+  print_data_locality_statistics() const
+  {
+    const MPI_Comm     comm           = dof_handler->get_mpi_communicator();
+    const unsigned int n_cell_batches = dof_indices.size();
+    const unsigned int n_dofs         = partitioner->locally_owned_size();
+    const unsigned int dofs_per_cell  = dof_handler->get_fe().dofs_per_cell;
+
+    std::vector<unsigned int> first_read(n_dofs, numbers::invalid_unsigned_int);
+    unsigned int              n_jumps = 0, last_end = numbers::invalid_unsigned_int;
+    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+      for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
+      {
+        if(dof_indices[cell][v] != last_end)
+          ++n_jumps;
+        last_end = dof_indices[cell][v] + dofs_per_cell;
+        for(unsigned int f = 0; f <= 2 * dim; ++f)
+        {
+          const unsigned int c = f < 2 * dim ? neighbor_cells[cell][f][v] : cell * n_lanes + v;
+          if(c == numbers::invalid_unsigned_int)
+            continue;
+          const unsigned int idx = dof_indices[c / n_lanes][c % n_lanes];
+          if(idx < n_dofs)
+            for(unsigned int i = idx; i < idx + dofs_per_cell; ++i)
+              first_read[i] = std::min(first_read[i], cell);
+        }
+      }
+    unsigned int n_ahead      = 0;
+    double       sum_distance = 0;
+    for(unsigned int r = cell_loop_pre_list_index[n_cell_batches];
+        r < cell_loop_pre_list_index[n_cell_batches + 1];
+        ++r)
+      for(unsigned int i = cell_loop_pre_list[r].first; i < cell_loop_pre_list[r].second; ++i)
+      {
+        ++n_ahead;
+        sum_distance += first_read[i];
+      }
+
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << "Data locality of DG Laplace operator <"
+                << (std::is_same_v<Number, double> ? "double" : "float")
+                << ">, min [proc] avg max [proc]:" << std::endl;
+    Helper::print_time(n_cell_batches, "Cell batches", comm);
+    Helper::print_time(n_dofs * sizeof(Number) / 1024., "Vector size [KiB]", comm);
+    Helper::print_time(double(n_ahead) / std::max(1U, n_dofs), "Pre/post: share pre ahead", comm);
+    Helper::print_time(n_ahead > 0 ? sum_distance / n_ahead : 0.,
+                       "Pre/post: ahead to read [cb]",
+                       comm);
+    Helper::print_time(cell_loop_pre_list.size(), "Ranges before_loop", comm);
+    Helper::print_time(cell_loop_post_list.size(), "Ranges after_loop", comm);
+    Helper::print_time(n_jumps, "Jumps between cells", comm);
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << std::endl;
   }
 
 private:

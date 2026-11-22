@@ -165,6 +165,16 @@ public:
     }
   }
 
+  // Number of entries of the scratch array: the pool of entities alive for a
+  // part of the cell loop (including the staging slots), the part alive
+  // throughout the loop (entries sent to or read by other processes), and the
+  // total size including the ghost entries
+  std::array<unsigned int, 3>
+  get_sizes() const
+  {
+    return {{layout.pool_size, layout.mpi_size, layout.size}};
+  }
+
   // Release the data only needed for scratch_index()
   void
   release_setup_data()

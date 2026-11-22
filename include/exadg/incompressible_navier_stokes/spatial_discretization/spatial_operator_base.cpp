@@ -25,6 +25,7 @@
 #include <exadg/grid/mapping_dof_vector.h>
 #include <exadg/incompressible_navier_stokes/preconditioners/block_preconditioner_projection.h>
 #include <exadg/incompressible_navier_stokes/preconditioners/multigrid_preconditioner_projection.h>
+#include <exadg/incompressible_navier_stokes/spatial_discretization/operators/face_integral_helper.h>
 #include <exadg/incompressible_navier_stokes/spatial_discretization/spatial_operator_base.h>
 #include <exadg/operators/finite_element.h>
 #include <exadg/operators/grid_related_time_step_restrictions.h>
@@ -232,76 +233,75 @@ SpatialOperatorBase<dim, Number>::initialize_dof_handler_and_constraints()
   dof_handler_p.distribute_dofs(*fe_p);
   dof_handler_u_scalar.distribute_dofs(*fe_u_scalar);
 
+  // The extruded schemes run most operations on the velocity and the
+  // pressure with RTOperator::RaviartThomasOperator and
+  // LaplaceOperator::LaplaceOperatorDG, whose cell loops follow the order of
+  // Helper::compute_vectorization_category(), so number the DoFs in that
+  // order
+  const bool number_dofs_in_cell_loop_order =
+    param.spatial_discretization == SpatialDiscretization::HDIV and
+    (param.temporal_discretization == TemporalDiscretization::BDFDualSplittingExtruded or
+     param.temporal_discretization == TemporalDiscretization::BDFConsistentSplittingExtruded);
+  std::vector<unsigned int> cell_loop_categories;
+  if(number_dofs_in_cell_loop_order)
+  {
+    cell_loop_categories = Helper::compute_vectorization_category(*grid->triangulation);
+    Helper::renumber_dg_dofs_in_cell_loop_order(dof_handler_p, cell_loop_categories);
+  }
+
   // Strong imposition of boundary conditions in the case of HDIV
   if(param.spatial_discretization == SpatialDiscretization::HDIV)
   {
-    // Periodic boundaries
-    // We need to make sure the normal dofs are shared between cells on the periodic boundaries,
-    // since these are continuous for HDIV.
-    constraint_u.reinit(dof_handler_u.locally_owned_dofs(),
-                        dealii::DoFTools::extract_locally_relevant_dofs(dof_handler_u));
+    const auto make_constraints_u = [&]() {
+      // Periodic boundaries
+      // We need to make sure the normal dofs are shared between cells on the periodic boundaries,
+      // since these are continuous for HDIV.
+      constraint_u.clear();
+      constraint_u.reinit(dof_handler_u.locally_owned_dofs(),
+                          dealii::DoFTools::extract_locally_relevant_dofs(dof_handler_u));
 
-    for(auto const & face : grid->periodic_face_pairs)
-      dealii::DoFTools::make_periodicity_constraints(
-        dof_handler_u,
-        face.cell[0]->face(face.face_idx[0])->boundary_id(),
-        face.cell[1]->face(face.face_idx[1])->boundary_id(),
-        face.face_idx[0] / 2,
-        constraint_u);
+      for(auto const & face : grid->periodic_face_pairs)
+        dealii::DoFTools::make_periodicity_constraints(
+          dof_handler_u,
+          face.cell[0]->face(face.face_idx[0])->boundary_id(),
+          face.cell[1]->face(face.face_idx[1])->boundary_id(),
+          face.face_idx[0] / 2,
+          constraint_u);
 
-    // Symmetry boundaries
-    // Constraints the normal components of the velocity, where "0" as second argument indicates the
-    // first component in the dof_handler.
-    if(not(boundary_descriptor->velocity->symmetry_bc.empty()))
-    {
-      for(auto bc : boundary_descriptor->velocity->symmetry_bc)
-        dealii::VectorTools::project_boundary_values_div_conforming(
-          dof_handler_u, 0, *(bc.second), bc.first, constraint_u, *get_mapping());
-    }
+      // Symmetry boundaries
+      // Constraints the normal components of the velocity, where "0" as second argument indicates
+      // the first component in the dof_handler.
+      if(not(boundary_descriptor->velocity->symmetry_bc.empty()))
+      {
+        for(auto bc : boundary_descriptor->velocity->symmetry_bc)
+          dealii::VectorTools::project_boundary_values_div_conforming(
+            dof_handler_u, 0, *(bc.second), bc.first, constraint_u, *get_mapping());
+      }
 
-    // Dirichlet boundaries
-    if(not(boundary_descriptor->velocity->dirichlet_bc.empty()))
-    {
-      for(auto bc : boundary_descriptor->velocity->dirichlet_bc)
-        dealii::VectorTools::project_boundary_values_div_conforming(
-          dof_handler_u, 0, *(bc.second), bc.first, constraint_u, *get_mapping());
-    }
+      // Dirichlet boundaries
+      if(not(boundary_descriptor->velocity->dirichlet_bc.empty()))
+      {
+        for(auto bc : boundary_descriptor->velocity->dirichlet_bc)
+          dealii::VectorTools::project_boundary_values_div_conforming(
+            dof_handler_u, 0, *(bc.second), bc.first, constraint_u, *get_mapping());
+      }
 
-    constraint_u.close();
+      constraint_u.close();
+    };
+
+    make_constraints_u();
     typename dealii::MatrixFree<dim, Number>::AdditionalData mf_data;
     mf_data.overlap_communication_computation = false;
 
     // Renumber dofs to a more favorable numbering and build the constraints
     // again with this new numbering
     dealii::DoFRenumbering::matrix_free_data_locality(dof_handler_u, constraint_u, mf_data);
+    make_constraints_u();
 
-    constraint_u.reinit(dof_handler_u.locally_owned_dofs(),
-                        dealii::DoFTools::extract_locally_relevant_dofs(dof_handler_u));
-
-    for(auto const & face : grid->periodic_face_pairs)
-      dealii::DoFTools::make_periodicity_constraints(
-        dof_handler_u,
-        face.cell[0]->face(face.face_idx[0])->boundary_id(),
-        face.cell[1]->face(face.face_idx[1])->boundary_id(),
-        face.face_idx[0] / 2,
-        constraint_u);
-
-    // Symmetry boundaries
-    // Constraints the normal components of the velocity, where "0" as second argument indicates the
-    // first component in the dof_handler.
-    if(not(boundary_descriptor->velocity->symmetry_bc.empty()))
+    if(number_dofs_in_cell_loop_order)
     {
-      for(auto bc : boundary_descriptor->velocity->symmetry_bc)
-        dealii::VectorTools::project_boundary_values_div_conforming(
-          dof_handler_u, 0, *(bc.second), bc.first, constraint_u, *get_mapping());
-    }
-
-    // Dirichlet boundaries
-    if(not(boundary_descriptor->velocity->dirichlet_bc.empty()))
-    {
-      for(auto bc : boundary_descriptor->velocity->dirichlet_bc)
-        dealii::VectorTools::project_boundary_values_div_conforming(
-          dof_handler_u, 0, *(bc.second), bc.first, constraint_u, *get_mapping());
+      Helper::renumber_dofs_in_cell_loop_order(dof_handler_u, constraint_u, cell_loop_categories);
+      make_constraints_u();
     }
   }
 
