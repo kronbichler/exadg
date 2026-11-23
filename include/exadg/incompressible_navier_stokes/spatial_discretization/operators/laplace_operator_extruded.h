@@ -30,6 +30,7 @@
 #include <deal.II/fe/fe_tools.h>
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/lac/affine_constraints.h>
+#include <deal.II/lac/tensor_product_matrix.h>
 #include <deal.II/matrix_free/evaluation_kernels.h>
 #include <deal.II/matrix_free/evaluation_kernels_hanging_nodes.h>
 #include <deal.II/matrix_free/evaluation_template_factory.h>
@@ -37,6 +38,10 @@
 #include <deal.II/matrix_free/matrix_free.h>
 #include <deal.II/matrix_free/tensor_product_kernels.h>
 #include <deal.II/matrix_free/vector_access_internal.h>
+
+#include <map>
+#include <numeric>
+#include <random>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/extruded_mapping_info.h>
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/face_integral_helper.h>
@@ -669,9 +674,82 @@ public:
   void
   vmult(VectorType & dst, const VectorType & src) const
   {
+    Timer timer;
     matrix_free.cell_loop(&LaplaceOperatorFE::local_apply, this, dst, src, true);
     for(unsigned int i : matrix_free.get_constrained_dofs(0))
       dst.local_element(i) = src.local_element(i);
+    timings[t_vmult_count] += 1;
+    timings[t_vmult_total] += timer.wall_time();
+  }
+
+  // Print the collected timings of the phases of vmult_scratch(), which is
+  // used by the Chebyshev smoother, and of the plain vmult(). Must be called
+  // on all processes of the communicator of the DoFHandler.
+  void
+  print_timings(const std::string & label) const
+  {
+    const MPI_Comm comm      = dof_handler->get_mpi_communicator();
+    const double   n_scratch = Utilities::MPI::max(timings[t_scratch_count], comm);
+    const double   n_vmult   = Utilities::MPI::max(timings[t_vmult_count], comm);
+    std::cout << std::defaultfloat << std::setprecision(3);
+    if(n_scratch > 0)
+    {
+      const double count      = std::max(1., timings[t_scratch_count]);
+      const double total_time = Utilities::MPI::sum(timings[t_scratch_total] / count, comm) /
+                                Utilities::MPI::n_mpi_processes(comm);
+      if(Utilities::MPI::this_mpi_process(comm) == 0)
+        std::cout << "Collected timings for FE Laplace operator <"
+                  << (std::is_same_v<Number, double> ? "double" : "float") << "> " << label
+                  << ", degree " << matrix_free.get_shape_info().data[0].fe_degree << ", "
+                  << dof_handler->n_dofs() << " DoFs, vmult_scratch in "
+                  << static_cast<unsigned long>(n_scratch)
+                  << " evaluations [t_total=" << total_time * n_scratch << "s]" << std::endl;
+      Helper::print_time(timings[t_before_loop] / count,
+                         "before_loop prior to ghosts",
+                         comm,
+                         total_time);
+      Helper::print_time(timings[t_ghost_start] / count,
+                         "Ghost send + prepare scratch",
+                         comm,
+                         total_time);
+      Helper::print_time(timings[t_ghost_wait] / count, "Wait for ghosts", comm, total_time);
+      Helper::print_time(timings[t_cell_loop] / count,
+                         "Cell loop incl. after_loop",
+                         comm,
+                         total_time);
+      Helper::print_time_per_node(timings[t_cell_loop] / count,
+                                  "Cell loop, node avg",
+                                  comm,
+                                  total_time);
+      Helper::print_time(timings[t_compress_send] / count,
+                         "Compress send + zero ghosts",
+                         comm,
+                         total_time);
+      Helper::print_time(timings[t_compress_wait] / count, "Compress wait", comm, total_time);
+      Helper::print_time(timings[t_finish_ranges] / count,
+                         "after_loop on MPI ranges",
+                         comm,
+                         total_time);
+      if(Utilities::MPI::max(timings[t_block_interface], comm) > 0)
+        Helper::print_time(timings[t_block_interface] / count,
+                           "Interface blocks (block Jacobi)",
+                           comm,
+                           total_time);
+      Helper::print_time(timings[t_scratch_total] / count, "Total vmult_scratch", comm, total_time);
+    }
+    if(n_vmult > 0)
+    {
+      if(Utilities::MPI::this_mpi_process(comm) == 0 && n_scratch == 0)
+        std::cout << "Collected timings for FE Laplace operator <"
+                  << (std::is_same_v<Number, double> ? "double" : "float") << "> " << label
+                  << ", degree " << matrix_free.get_shape_info().data[0].fe_degree << ", "
+                  << dof_handler->n_dofs() << " DoFs" << std::endl;
+      Helper::print_time(timings[t_vmult_total] / std::max(1., timings[t_vmult_count]),
+                         "vmult (" + std::to_string(static_cast<unsigned long>(n_vmult)) + "x)",
+                         comm);
+    }
+    if((n_scratch > 0 || n_vmult > 0) && Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << std::endl;
   }
 
   void
@@ -712,6 +790,11 @@ public:
                 const BeforeLoop & before_loop,
                 const AfterLoop &  after_loop) const
   {
+    Timer      total_timer, timer;
+    const auto record = [&](const unsigned int phase) {
+      timings[phase] += timer.wall_time();
+      timer.restart();
+    };
     constexpr bool              has_before_loop = !std::is_same_v<BeforeLoop, std::nullptr_t>;
     const bool                  src_has_ghosts  = src.has_ghost_elements();
     const unsigned int          n_cell_batches  = matrix_free.n_cell_batches();
@@ -734,12 +817,15 @@ public:
       else
         before_loop(0, src.locally_owned_size());
     }
+    record(t_before_loop);
 
     if(!src_has_ghosts)
       src.update_ghost_values_start();
     scratch.prepare_loop();
+    record(t_ghost_start);
     if(!src_has_ghosts)
       src.update_ghost_values_finish();
+    record(t_ghost_wait);
 
     const auto copy_constrained =
       [&](const unsigned int begin, const unsigned int end, Number * values) {
@@ -776,6 +862,7 @@ public:
       },
       after_loop,
       copy_constrained);
+    record(t_cell_loop);
 
     scratch.finish_loop(
       after_loop,
@@ -783,7 +870,11 @@ public:
         if(!src_has_ghosts)
           src.zero_out_ghost_values();
       },
-      copy_constrained);
+      copy_constrained,
+      &timings[t_compress_send]);
+
+    timings[t_scratch_count] += 1;
+    timings[t_scratch_total] += total_timer.wall_time();
   }
 
   // Set the minimal number of locally owned entries for which the variant
@@ -833,6 +924,999 @@ public:
                     std::to_string(dof_handler->n_dofs()) + " a = " + std::to_string(a)));
       a = Number(1.) / a;
     }
+  }
+
+  // --- Block-Jacobi preconditioner with fast diagonalization ---
+  //
+  // The unknowns are split into non-overlapping blocks, one per cell: a
+  // cell owns the unknowns at the nodes (i_0, i_1, i_2) of its tensor-
+  // product numbering with i_d in [s_d, degree], where s_d = 1 if the cell
+  // has a neighbor (or a periodic neighbor) on its lower face in direction
+  // d, whose block contains the nodes with i_d = 0, and s_d = 0 at a
+  // boundary. The unknowns of periodic nodes are those of the master DoF
+  // the constraints map them to. The block of the operator is approximated
+  // by the block of a Cartesian surrogate as for LaplaceOperatorDG: per
+  // direction, the 1D mass and stiffness matrices of the continuous
+  // element on the cell with the extent h_d, restricted to the owned
+  // nodes, plus the contribution of the neighbor on the upper face (if
+  // any) to the shared node, using the same extent h_d, and inverted by
+  // the fast diagonalization method. On a Cartesian mesh with uniform
+  // extents, the surrogate block is the exact block of the operator.
+  //
+  // This is a basic implementation applied on whole vectors cell by cell,
+  // to assess the quality of the smoother. Returns false (and sets up
+  // nothing) if the mesh has hanging nodes or constraints other than
+  // periodicity. Uses the current factor_mass and factor_laplace.
+  template<typename OtherNumber>
+  bool
+  setup_block_inverse(const AffineConstraints<OtherNumber> & constraints)
+  {
+    block_start.clear();
+    block_sizes.clear();
+    block_indices.clear();
+    block_eigenvectors.clear();
+    block_eigenvalues.clear();
+    if(Utilities::MPI::max(has_hanging_nodes() ? 1 : 0, dof_handler->get_mpi_communicator()) == 1)
+      return false;
+
+    const unsigned int degree        = matrix_free.get_shape_info().data[0].fe_degree;
+    const unsigned int nn            = degree + 1;
+    const unsigned int n_q_points_1d = matrix_free.get_shape_info().data[0].n_q_points_1d;
+    const unsigned int n_q_points_2d = n_q_points_1d * n_q_points_1d;
+    const auto &       shape_data    = matrix_free.get_shape_info().data[0];
+    AssertDimension(mapping_info.quad_weights_z.size(), n_q_points_1d);
+
+    // 1D mass and stiffness matrices of the element on the unit interval in
+    // lexicographic numbering
+    std::vector<double> mass_ref(nn * nn), stiffness_ref(nn * nn);
+    for(unsigned int i = 0; i < nn; ++i)
+      for(unsigned int j = 0; j < nn; ++j)
+        for(unsigned int q = 0; q < n_q_points_1d; ++q)
+        {
+          const double w = mapping_info.quad_weights_z[q];
+          mass_ref[i * nn + j] += w * shape_data.shape_values[i * n_q_points_1d + q] *
+                                  shape_data.shape_values[j * n_q_points_1d + q];
+          stiffness_ref[i * nn + j] += w * shape_data.shape_gradients[i * n_q_points_1d + q] *
+                                       shape_data.shape_gradients[j * n_q_points_1d + q];
+        }
+
+    const std::vector<unsigned int> hierarchic_to_lexicographic =
+      FETools::hierarchic_to_lexicographic_numbering<dim>(degree);
+    const Utilities::MPI::Partitioner &  part = *matrix_free.get_dof_info().vector_partitioner;
+    std::vector<types::global_dof_index> dof_indices(dof_handler->get_fe().dofs_per_cell),
+      lexicographic_indices(dof_indices.size());
+    std::vector<double> mass, laplace, eigenvalues, eigenvectors;
+    bool                supported = true;
+
+    block_start.push_back(0);
+    for(unsigned int cell = 0; cell < matrix_free.n_cell_batches() && supported; ++cell)
+      for(unsigned int lane = 0; lane < matrix_free.n_active_entries_per_cell_batch(cell); ++lane)
+      {
+        const auto cell_it = matrix_free.get_cell_iterator(cell, lane);
+        cell_it->get_dof_indices(dof_indices);
+        for(unsigned int i = 0; i < dof_indices.size(); ++i)
+          lexicographic_indices[hierarchic_to_lexicographic[i]] = dof_indices[i];
+
+        // index ranges of the owned nodes
+        std::array<unsigned int, dim> start, size;
+        std::array<bool, dim>         has_upper_neighbor;
+        for(unsigned int d = 0; d < dim; ++d)
+        {
+          const auto has_neighbor = [&](const unsigned int face) {
+            return !cell_it->at_boundary(face) || cell_it->has_periodic_neighbor(face);
+          };
+          start[d]              = has_neighbor(2 * d) ? 1 : 0;
+          size[d]               = nn - start[d];
+          has_upper_neighbor[d] = has_neighbor(2 * d + 1);
+        }
+        for(unsigned int d = 0; d < dim; ++d)
+          block_sizes.push_back(size[d]);
+
+        // unknowns of the block, with periodic constraints resolved
+        for(unsigned int i2 = start[dim - 1]; i2 < nn; ++i2)
+          for(unsigned int i1 = start[1]; i1 < nn; ++i1)
+            for(unsigned int i0 = start[0]; i0 < nn; ++i0)
+            {
+              types::global_dof_index index = lexicographic_indices[(i2 * nn + i1) * nn + i0];
+              if(constraints.is_constrained(index))
+              {
+                const auto * entries = constraints.get_constraint_entries(index);
+                if(!constraints.is_identity_constrained(index) || entries == nullptr ||
+                   entries->size() != 1 || std::abs(entries->front().second - 1.) > 1e-12)
+                {
+                  supported = false;
+                  break;
+                }
+                index = entries->front().first;
+              }
+              AssertThrow(part.in_local_range(index) || part.is_ghost_entry(index),
+                          ExcMessage("Block unknown neither owned nor ghost"));
+              block_indices.push_back(part.global_to_local(index));
+            }
+
+        // extents of the Cartesian surrogate as in LaplaceOperatorDG
+        std::array<double, dim> h;
+        {
+          const unsigned int base = mapping_info.mapping_data_index[cell][lane];
+          double             h0 = 0, h1 = 0, weight_sum = 0;
+          for(unsigned int q = 0; q < n_q_points_2d; ++q)
+          {
+            const double w   = mapping_info.quad_weights_xy[q];
+            const auto & jac = mapping_info.jacobians_xy[base + q];
+            h0 += w * std::sqrt(jac[0][0] * jac[0][0] + jac[1][0] * jac[1][0]);
+            h1 += w * std::sqrt(jac[0][1] * jac[0][1] + jac[1][1] * jac[1][1]);
+            weight_sum += w;
+          }
+          h[0] = h0 / weight_sum;
+          h[1] = h1 / weight_sum;
+          if constexpr(dim == 3)
+            h[2] = mapping_info.h_z_values[base / n_q_points_2d];
+        }
+
+        // 1D matrices of the owned nodes and their eigendecomposition
+        for(unsigned int d = 0; d < dim; ++d)
+        {
+          const unsigned int n = size[d];
+          mass.assign(n * n, 0.);
+          laplace.assign(n * n, 0.);
+          for(unsigned int a = 0; a < n; ++a)
+            for(unsigned int b = 0; b < n; ++b)
+            {
+              const unsigned int ia = a + start[d], ib = b + start[d];
+              mass[a * n + b]    = h[d] * mass_ref[ia * nn + ib];
+              laplace[a * n + b] = factor_laplace / h[d] * stiffness_ref[ia * nn + ib];
+            }
+          if(has_upper_neighbor[d])
+          {
+            mass[n * n - 1] += h[d] * mass_ref[0];
+            laplace[n * n - 1] += factor_laplace / h[d] * stiffness_ref[0];
+          }
+          eigenvalues.resize(n);
+          eigenvectors.resize(n * n);
+          dealii::internal::TensorProductMatrixSymmetricSum::spectral_assembly<double>(
+            mass.data(), laplace.data(), n, n, eigenvalues.data(), eigenvectors.data());
+          for(unsigned int i = 0; i < n * n; ++i)
+            block_eigenvectors.push_back(eigenvectors[i]);
+          for(unsigned int i = 0; i < n; ++i)
+            block_eigenvalues.push_back(eigenvalues[i] + factor_mass / dim);
+        }
+        block_start.push_back(block_indices.size());
+      }
+
+    if(Utilities::MPI::min(supported ? 1 : 0, dof_handler->get_mpi_communicator()) == 0)
+    {
+      block_start.clear();
+      block_sizes.clear();
+      block_indices.clear();
+      block_eigenvectors.clear();
+      block_eigenvalues.clear();
+      return false;
+    }
+    return true;
+  }
+
+  // Variant of setup_block_inverse() with blocks on patches of 2^dim cells,
+  // the children of a cell of the next coarser level: a patch has the nodes
+  // (I_0, I_1, I_2) with I_d in [0, 2 degree] and owns those with I_d in
+  // [s_d, 2 degree], with s_d as for single cells. The 1D matrices of the
+  // surrogate are those of two elements, with the extents of the lower and
+  // upper element in direction d averaged over the children at that
+  // position, plus the contribution of the neighbor patch on the upper face
+  // to the shared node with the extent of the upper element. Returns false
+  // if a child is missing, not active, not locally owned, or if the mesh
+  // has hanging nodes or constraints other than periodicity.
+  template<typename OtherNumber>
+  bool
+  setup_patch_block_inverse(const AffineConstraints<OtherNumber> & constraints)
+  {
+    block_start.clear();
+    block_sizes.clear();
+    block_indices.clear();
+    block_eigenvectors.clear();
+    block_eigenvalues.clear();
+    const MPI_Comm comm = dof_handler->get_mpi_communicator();
+    if(Utilities::MPI::max(has_hanging_nodes() ? 1 : 0, comm) == 1)
+      return false;
+
+    const unsigned int degree        = matrix_free.get_shape_info().data[0].fe_degree;
+    const unsigned int nn            = degree + 1;
+    const unsigned int n_patch       = 2 * degree + 1;
+    const unsigned int n_q_points_1d = matrix_free.get_shape_info().data[0].n_q_points_1d;
+    const unsigned int n_q_points_2d = n_q_points_1d * n_q_points_1d;
+    const auto &       shape_data    = matrix_free.get_shape_info().data[0];
+
+    std::vector<double> mass_ref(nn * nn), stiffness_ref(nn * nn);
+    for(unsigned int i = 0; i < nn; ++i)
+      for(unsigned int j = 0; j < nn; ++j)
+        for(unsigned int q = 0; q < n_q_points_1d; ++q)
+        {
+          const double w = mapping_info.quad_weights_z[q];
+          mass_ref[i * nn + j] += w * shape_data.shape_values[i * n_q_points_1d + q] *
+                                  shape_data.shape_values[j * n_q_points_1d + q];
+          stiffness_ref[i * nn + j] += w * shape_data.shape_gradients[i * n_q_points_1d + q] *
+                                       shape_data.shape_gradients[j * n_q_points_1d + q];
+        }
+
+    // extents of the Cartesian surrogate of each locally owned cell
+    std::vector<std::array<double, dim>> cell_extents(
+      dof_handler->get_triangulation().n_active_cells());
+    for(unsigned int cell = 0; cell < matrix_free.n_cell_batches(); ++cell)
+      for(unsigned int lane = 0; lane < matrix_free.n_active_entries_per_cell_batch(cell); ++lane)
+      {
+        const unsigned int base = mapping_info.mapping_data_index[cell][lane];
+        double             h0 = 0, h1 = 0, weight_sum = 0;
+        for(unsigned int q = 0; q < n_q_points_2d; ++q)
+        {
+          const double w   = mapping_info.quad_weights_xy[q];
+          const auto & jac = mapping_info.jacobians_xy[base + q];
+          h0 += w * std::sqrt(jac[0][0] * jac[0][0] + jac[1][0] * jac[1][0]);
+          h1 += w * std::sqrt(jac[0][1] * jac[0][1] + jac[1][1] * jac[1][1]);
+          weight_sum += w;
+        }
+        std::array<double, dim> & h =
+          cell_extents[matrix_free.get_cell_iterator(cell, lane)->active_cell_index()];
+        h[0] = h0 / weight_sum;
+        h[1] = h1 / weight_sum;
+        if constexpr(dim == 3)
+          h[2] = mapping_info.h_z_values[base / n_q_points_2d];
+      }
+
+    const std::vector<unsigned int> hierarchic_to_lexicographic =
+      FETools::hierarchic_to_lexicographic_numbering<dim>(degree);
+    const Utilities::MPI::Partitioner &  part = *matrix_free.get_dof_info().vector_partitioner;
+    std::vector<types::global_dof_index> dof_indices(dof_handler->get_fe().dofs_per_cell);
+    std::vector<std::vector<types::global_dof_index>> child_indices(
+      GeometryInfo<dim>::max_children_per_cell,
+      std::vector<types::global_dof_index>(dof_indices.size()));
+    std::vector<double> mass, laplace, eigenvalues, eigenvectors;
+    bool                supported = true;
+
+    block_start.push_back(0);
+    for(const auto & cell : dof_handler->active_cell_iterators())
+    {
+      if(!cell->is_locally_owned())
+        continue;
+      if(cell->level() == 0 ||
+         cell->parent()->n_children() != GeometryInfo<dim>::max_children_per_cell)
+      {
+        supported = false;
+        break;
+      }
+      const auto parent = cell->parent();
+      // each patch is handled by its first child
+      if(parent->child(0)->index() != cell->index())
+        continue;
+
+      std::array<std::array<double, 2>, dim> h_patch = {};
+      for(unsigned int c = 0; c < GeometryInfo<dim>::max_children_per_cell; ++c)
+      {
+        const auto child = parent->child(c);
+        if(!child->is_active() || !child->is_locally_owned())
+        {
+          supported = false;
+          break;
+        }
+        child->get_dof_indices(dof_indices);
+        for(unsigned int i = 0; i < dof_indices.size(); ++i)
+          child_indices[c][hierarchic_to_lexicographic[i]] = dof_indices[i];
+        for(unsigned int d = 0; d < dim; ++d)
+          h_patch[d][(c >> d) & 1] += cell_extents[child->active_cell_index()][d] /
+                                      (GeometryInfo<dim>::max_children_per_cell / 2);
+      }
+      if(!supported)
+        break;
+
+      // index ranges of the owned nodes, with the boundary information of
+      // the faces of the first (lower) and last (upper) child
+      std::array<unsigned int, dim> start, size;
+      std::array<bool, dim>         has_upper_neighbor;
+      const auto                    first_child = parent->child(0);
+      const auto last_child = parent->child(GeometryInfo<dim>::max_children_per_cell - 1);
+      for(unsigned int d = 0; d < dim; ++d)
+      {
+        start[d] =
+          !first_child->at_boundary(2 * d) || first_child->has_periodic_neighbor(2 * d) ? 1 : 0;
+        size[d] = n_patch - start[d];
+        has_upper_neighbor[d] =
+          !last_child->at_boundary(2 * d + 1) || last_child->has_periodic_neighbor(2 * d + 1);
+      }
+      for(unsigned int d = 0; d < dim; ++d)
+        block_sizes.push_back(size[d]);
+
+      // unknowns of the patch, from the child containing the node
+      for(unsigned int i2 = start[dim - 1]; i2 < n_patch && supported; ++i2)
+        for(unsigned int i1 = start[1]; i1 < n_patch && supported; ++i1)
+          for(unsigned int i0 = start[0]; i0 < n_patch; ++i0)
+          {
+            const std::array<unsigned int, 3> patch_index = {{i0, i1, i2}};
+            unsigned int                      child = 0, local = 0, stride = 1;
+            for(unsigned int d = 0; d < dim; ++d)
+            {
+              const unsigned int c = std::min(patch_index[d] / degree, 1u);
+              child += c << d;
+              local += (patch_index[d] - c * degree) * stride;
+              stride *= nn;
+            }
+            types::global_dof_index index = child_indices[child][local];
+            if(constraints.is_constrained(index))
+            {
+              const auto * entries = constraints.get_constraint_entries(index);
+              if(!constraints.is_identity_constrained(index) || entries == nullptr ||
+                 entries->size() != 1 || std::abs(entries->front().second - 1.) > 1e-12)
+              {
+                supported = false;
+                break;
+              }
+              index = entries->front().first;
+            }
+            AssertThrow(part.in_local_range(index) || part.is_ghost_entry(index),
+                        ExcMessage("Block unknown neither owned nor ghost"));
+            block_indices.push_back(part.global_to_local(index));
+          }
+      if(!supported)
+        break;
+
+      // 1D matrices of the two elements on the owned nodes
+      for(unsigned int d = 0; d < dim; ++d)
+      {
+        std::vector<double> mass_full(n_patch * n_patch), laplace_full(n_patch * n_patch);
+        for(unsigned int e = 0; e < 2; ++e)
+          for(unsigned int a = 0; a < nn; ++a)
+            for(unsigned int b = 0; b < nn; ++b)
+            {
+              const unsigned int ia = a + e * degree, ib = b + e * degree;
+              mass_full[ia * n_patch + ib] += h_patch[d][e] * mass_ref[a * nn + b];
+              laplace_full[ia * n_patch + ib] +=
+                factor_laplace / h_patch[d][e] * stiffness_ref[a * nn + b];
+            }
+        if(has_upper_neighbor[d])
+        {
+          mass_full[n_patch * n_patch - 1] += h_patch[d][1] * mass_ref[0];
+          laplace_full[n_patch * n_patch - 1] += factor_laplace / h_patch[d][1] * stiffness_ref[0];
+        }
+        const unsigned int n = size[d];
+        mass.resize(n * n);
+        laplace.resize(n * n);
+        for(unsigned int a = 0; a < n; ++a)
+          for(unsigned int b = 0; b < n; ++b)
+          {
+            mass[a * n + b]    = mass_full[(a + start[d]) * n_patch + b + start[d]];
+            laplace[a * n + b] = laplace_full[(a + start[d]) * n_patch + b + start[d]];
+          }
+        eigenvalues.resize(n);
+        eigenvectors.resize(n * n);
+        dealii::internal::TensorProductMatrixSymmetricSum::spectral_assembly<double>(
+          mass.data(), laplace.data(), n, n, eigenvalues.data(), eigenvectors.data());
+        for(unsigned int i = 0; i < n * n; ++i)
+          block_eigenvectors.push_back(eigenvectors[i]);
+        for(unsigned int i = 0; i < n; ++i)
+          block_eigenvalues.push_back(eigenvalues[i] + factor_mass / dim);
+      }
+      block_start.push_back(block_indices.size());
+    }
+
+    if(Utilities::MPI::min(supported ? 1 : 0, comm) == 0)
+    {
+      block_start.clear();
+      block_sizes.clear();
+      block_indices.clear();
+      block_eigenvectors.clear();
+      block_eigenvalues.clear();
+      return false;
+    }
+    return true;
+  }
+
+  bool
+  has_block_inverse() const
+  {
+    return !block_start.empty();
+  }
+
+  unsigned int
+  n_blocks() const
+  {
+    return block_start.empty() ? 0 : block_start.size() - 1;
+  }
+
+  // --- Vectorized block-Jacobi preconditioner embedded in the cell loop ---
+  //
+  // The same blocks and Cartesian surrogates as setup_block_inverse(), but
+  // restricted to the locally owned unknowns and grouped into batches of
+  // n_lanes blocks of arbitrary cells with the same index ranges
+  // ("signature"), with their compressed indices gathered from the cell
+  // batches. Owned unknowns whose block belongs to a cell of another
+  // process ("leftovers") get the point-Jacobi preconditioner. Thus, the
+  // preconditioner needs no communication; it agrees with the global
+  // block-Jacobi preconditioner of setup_block_inverse() in serial.
+  //
+  // In vmult_scratch_with_block_update(), each batch runs right after the
+  // cell batch T_b at which the result of the operator on all its unknowns
+  // has been passed to 'after_loop', reading the residual stored by
+  // 'after_loop' for the chunks flagged in get_block_residual_chunks().
+  // Optionally (EXADG_FE_BLOCK_FROM_SCRATCH=1), the batches compute the
+  // residual from the result of the operator still available in the
+  // scratch array instead, with artificial writes of the entities of the
+  // blocks by cell batch T_b in the scratch layout, determined by a
+  // fixed-point iteration. The batches with unknowns whose result is only
+  // complete after the exchange with other processes ("interface batches")
+  // and the leftovers run after the loop. Lanes without a block
+  // repeat the first lane and are masked out. Returns false (and sets up
+  // nothing) if the mesh has hanging nodes or the degree is 1. Uses the
+  // current factor_mass and factor_laplace.
+  bool
+  setup_block_batches()
+  {
+    block_batch_start.clear();
+    block_batch_fe_indices.clear();
+    block_batch_scratch_indices.clear();
+    block_batch_unconstrained.clear();
+    block_batch_data_offset.clear();
+    block_batch_data.clear();
+    block_batch_mask.clear();
+    block_batch_index.clear();
+    block_batch_order.clear();
+    leftover_indices.clear();
+    leftover_inverse_diagonal.clear();
+    block_residual_chunks.clear();
+    const MPI_Comm     comm   = dof_handler->get_mpi_communicator();
+    const unsigned int degree = matrix_free.get_shape_info().data[0].fe_degree;
+    // the blocks of the cell loop read the residual stored by 'after_loop'
+    // (default), or the result of the operator from the scratch array
+    // (EXADG_FE_BLOCK_FROM_SCRATCH=1), which avoids the residual vector but
+    // extends the lifetime of the entities in the scratch array and was
+    // slower in tests
+    block_from_scratch = std::getenv("EXADG_FE_BLOCK_FROM_SCRATCH") != nullptr &&
+                         std::atoi(std::getenv("EXADG_FE_BLOCK_FROM_SCRATCH")) != 0;
+    setup_scratch();
+    if(Utilities::MPI::max(has_hanging_nodes() || degree < 2 ? 1 : 0, comm) == 1)
+      return false;
+
+    const unsigned int nn            = degree + 1;
+    const unsigned int n_stored      = Utilities::pow(3, dim);
+    const unsigned int n_q_points_1d = matrix_free.get_shape_info().data[0].n_q_points_1d;
+    const unsigned int n_q_points_2d = n_q_points_1d * n_q_points_1d;
+    const auto &       shape_data    = matrix_free.get_shape_info().data[0];
+    const unsigned int n_batches     = matrix_free.n_cell_batches();
+    const unsigned int n_owned =
+      matrix_free.get_dof_info().vector_partitioner->locally_owned_size();
+    constexpr unsigned int chunk = ExaDG::ScratchMatrixVectorProduct<Number>::chunk_size;
+
+    std::vector<double> mass_ref(nn * nn), stiffness_ref(nn * nn);
+    for(unsigned int i = 0; i < nn; ++i)
+      for(unsigned int j = 0; j < nn; ++j)
+        for(unsigned int q = 0; q < n_q_points_1d; ++q)
+        {
+          const double w = mapping_info.quad_weights_z[q];
+          mass_ref[i * nn + j] += w * shape_data.shape_values[i * n_q_points_1d + q] *
+                                  shape_data.shape_values[j * n_q_points_1d + q];
+          stiffness_ref[i * nn + j] += w * shape_data.shape_gradients[i * n_q_points_1d + q] *
+                                       shape_data.shape_gradients[j * n_q_points_1d + q];
+        }
+
+    // cell batch after which each locally owned entry of the result of
+    // vmult_scratch() is passed to 'after_loop', n_batches if only after
+    // the exchange
+    std::vector<unsigned int> finished_after(n_owned, n_batches);
+    const auto                compute_finished_after = [&]() {
+      std::fill(finished_after.begin(), finished_after.end(), n_batches);
+      scratch.for_each_range_finished_in_cell_loop(
+        [&](const unsigned int cell, const unsigned int begin, const unsigned int end) {
+          for(unsigned int i = begin; i < end; ++i)
+            finished_after[i] = cell;
+        });
+    };
+    compute_finished_after();
+
+    struct BlockInfo
+    {
+      unsigned int                  cell, lane;
+      std::array<unsigned int, dim> start;
+      std::vector<unsigned int>     owned_entities;
+      std::vector<unsigned int>     unknowns;
+      std::vector<double>           data;
+    };
+    // blocks per signature, key[0] = 1 for the interface blocks
+    std::map<std::array<unsigned int, dim + 1>, std::vector<BlockInfo>> blocks;
+    std::vector<unsigned char>                                          covered(n_owned, 0);
+    bool                                                                supported = true;
+    std::vector<double> mass, laplace, eigenvalues, eigenvectors;
+    const auto          entity_class = [&](const unsigned int i) {
+      return i == 0 ? 0u : (i == degree ? 2u : 1u);
+    };
+
+    for(unsigned int cell = 0; cell < n_batches; ++cell)
+      for(unsigned int lane = 0; lane < matrix_free.n_active_entries_per_cell_batch(cell); ++lane)
+      {
+        const auto            cell_it = matrix_free.get_cell_iterator(cell, lane);
+        BlockInfo             block;
+        std::array<bool, dim> has_upper_neighbor;
+        block.cell = cell;
+        block.lane = lane;
+        for(unsigned int d = 0; d < dim; ++d)
+        {
+          const auto has_neighbor = [&](const unsigned int face) {
+            return !cell_it->at_boundary(face) || cell_it->has_periodic_neighbor(face);
+          };
+          block.start[d]        = has_neighbor(2 * d) ? 1 : 0;
+          has_upper_neighbor[d] = has_neighbor(2 * d + 1);
+        }
+        for(unsigned int e = 0; e < n_stored; ++e)
+        {
+          bool owned = true;
+          for(unsigned int d = 0, j = e; d < dim; ++d, j /= 3)
+            if(j % 3 == 0 && block.start[d] == 1)
+              owned = false;
+          if(owned)
+            block.owned_entities.push_back(e);
+        }
+
+        // unknowns of the owned nodes via the entities of the compressed
+        // indices; interface blocks have unknowns not owned by this process
+        // or only complete after the exchange
+        bool interface = false;
+        for(unsigned int i2 = block.start[dim - 1]; i2 < nn; ++i2)
+          for(unsigned int i1 = block.start[1]; i1 < nn; ++i1)
+            for(unsigned int i0 = block.start[0]; i0 < nn; ++i0)
+            {
+              const std::array<unsigned int, 3> node   = {{i0, i1, i2}};
+              unsigned int                      entity = 0, offset = 0, stride_e = 1, stride_o = 1;
+              for(unsigned int d = 0; d < dim; ++d)
+              {
+                const unsigned int c = entity_class(node[d]);
+                entity += c * stride_e;
+                stride_e *= 3;
+                if(c == 1)
+                {
+                  offset += (node[d] - 1) * stride_o;
+                  stride_o *= degree - 1;
+                }
+              }
+              const unsigned int start_index =
+                compressed_dof_indices[(cell * n_stored + entity) * n_lanes + lane];
+              if(start_index == numbers::invalid_unsigned_int)
+              {
+                supported = false;
+                continue;
+              }
+              const unsigned int index = start_index + offset;
+              if(index >= n_owned || finished_after[index] == n_batches)
+                interface = true;
+              if(index < n_owned)
+              {
+                block.unknowns.push_back(index);
+                covered[index] = 1;
+              }
+            }
+
+        // Cartesian surrogate as in setup_block_inverse()
+        std::array<double, dim> h;
+        {
+          const unsigned int base = mapping_info.mapping_data_index[cell][lane];
+          double             h0 = 0, h1 = 0, weight_sum = 0;
+          for(unsigned int q = 0; q < n_q_points_2d; ++q)
+          {
+            const double w   = mapping_info.quad_weights_xy[q];
+            const auto & jac = mapping_info.jacobians_xy[base + q];
+            h0 += w * std::sqrt(jac[0][0] * jac[0][0] + jac[1][0] * jac[1][0]);
+            h1 += w * std::sqrt(jac[0][1] * jac[0][1] + jac[1][1] * jac[1][1]);
+            weight_sum += w;
+          }
+          h[0] = h0 / weight_sum;
+          h[1] = h1 / weight_sum;
+          if constexpr(dim == 3)
+            h[2] = mapping_info.h_z_values[base / n_q_points_2d];
+        }
+        std::vector<double> values_data;
+        for(unsigned int d = 0; d < dim; ++d)
+        {
+          const unsigned int n = nn - block.start[d];
+          mass.assign(n * n, 0.);
+          laplace.assign(n * n, 0.);
+          for(unsigned int a = 0; a < n; ++a)
+            for(unsigned int b = 0; b < n; ++b)
+            {
+              const unsigned int ia = a + block.start[d], ib = b + block.start[d];
+              mass[a * n + b]    = h[d] * mass_ref[ia * nn + ib];
+              laplace[a * n + b] = factor_laplace / h[d] * stiffness_ref[ia * nn + ib];
+            }
+          if(has_upper_neighbor[d])
+          {
+            mass[n * n - 1] += h[d] * mass_ref[0];
+            laplace[n * n - 1] += factor_laplace / h[d] * stiffness_ref[0];
+          }
+          eigenvalues.resize(n);
+          eigenvectors.resize(n * n);
+          dealii::internal::TensorProductMatrixSymmetricSum::spectral_assembly<double>(
+            mass.data(), laplace.data(), n, n, eigenvalues.data(), eigenvectors.data());
+          block.data.insert(block.data.end(), eigenvectors.begin(), eigenvectors.end());
+          for(unsigned int i = 0; i < n; ++i)
+            values_data.push_back(eigenvalues[i] + factor_mass / dim);
+        }
+        block.data.insert(block.data.end(), values_data.begin(), values_data.end());
+
+        std::array<unsigned int, dim + 1> key;
+        key[0] = interface ? 1 : 0;
+        for(unsigned int d = 0; d < dim; ++d)
+          key[d + 1] = block.start[d];
+        blocks[key].push_back(std::move(block));
+      }
+
+    if(Utilities::MPI::min(supported ? 1 : 0, comm) == 0)
+    {
+      setup_scratch();
+      return false;
+    }
+
+    // leftovers: owned, unconstrained unknowns not in any local block
+    {
+      std::vector<unsigned char> constrained(n_owned, 0);
+      for(const unsigned int i : matrix_free.get_constrained_dofs(0))
+        if(i < n_owned)
+          constrained[i] = 1;
+      VectorType inverse_diagonal;
+      compute_inverse_diagonal(inverse_diagonal);
+      for(unsigned int i = 0; i < n_owned; ++i)
+        if(!covered[i] && !constrained[i])
+        {
+          leftover_indices.push_back(i);
+          leftover_inverse_diagonal.push_back(inverse_diagonal.local_element(i));
+        }
+    }
+
+    // batches of the blocks of each signature in the order of the cell
+    // batch they get ready after, the interface ones in the order of cells
+    struct BatchInfo
+    {
+      std::vector<const BlockInfo *> members;
+      unsigned int                   time;
+      bool                           interface;
+    };
+    std::vector<BatchInfo> batches;
+    for(auto & [key, list] : blocks)
+    {
+      std::vector<unsigned int> ready(list.size(), 0);
+      for(unsigned int i = 0; i < list.size(); ++i)
+        for(const unsigned int u : list[i].unknowns)
+          ready[i] = std::max(ready[i], finished_after[u]);
+      std::vector<unsigned int> order(list.size());
+      std::iota(order.begin(), order.end(), 0u);
+      std::stable_sort(order.begin(), order.end(), [&](const unsigned int a, const unsigned int b) {
+        return ready[a] < ready[b];
+      });
+      for(unsigned int first = 0; first < list.size(); first += n_lanes)
+      {
+        BatchInfo batch;
+        batch.interface = key[0] == 1;
+        batch.time      = 0;
+        for(unsigned int v = first; v < std::min<unsigned int>(first + n_lanes, list.size()); ++v)
+        {
+          batch.members.push_back(&list[order[v]]);
+          batch.time = std::max(batch.time, ready[order[v]]);
+        }
+        if(batch.interface)
+          batch.time = n_batches;
+        batches.push_back(std::move(batch));
+      }
+    }
+
+    // fixed point of the times of the batches and the scratch layout with
+    // the artificial writes of the entities of the blocks at those times:
+    // the extended lifetimes can delay the chunks passed to 'after_loop'
+    std::vector<std::vector<unsigned int>> batches_at(n_batches);
+    std::vector<unsigned int>              scratch_indices;
+    for(unsigned int iteration = 0;; ++iteration)
+    {
+      AssertThrow(iteration < 100, ExcInternalError("No fixed point of the block schedule"));
+      for(auto & list : batches_at)
+        list.clear();
+      for(unsigned int b = 0; b < batches.size(); ++b)
+        if(!batches[b].interface)
+          batches_at[batches[b].time].push_back(b);
+
+      setup_scratch(
+        [&](const unsigned int cell, const auto & add) {
+          if(!block_from_scratch)
+            return;
+          for(const unsigned int b : batches_at[cell])
+            for(const BlockInfo * block : batches[b].members)
+              for(const unsigned int e : block->owned_entities)
+              {
+                unsigned int length = 1;
+                for(unsigned int d = 0, j = e; d < dim; ++d, j /= 3)
+                  if(j % 3 == 1)
+                    length *= degree - 1;
+                add(compressed_dof_indices[(block->cell * n_stored + e) * n_lanes + block->lane],
+                    length);
+              }
+        },
+        [&]() {
+          compute_finished_after();
+          scratch_indices.resize(batches.size() * n_stored * n_lanes);
+          for(unsigned int b = 0; b < batches.size(); ++b)
+            for(unsigned int e = 0; e < n_stored; ++e)
+              for(unsigned int v = 0; v < n_lanes; ++v)
+              {
+                const BlockInfo * block = batches[b].members[v < batches[b].members.size() ? v : 0];
+                scratch_indices[(b * n_stored + e) * n_lanes + v] = scratch.scratch_index(
+                  compressed_dof_indices[(block->cell * n_stored + e) * n_lanes + block->lane]);
+              }
+        });
+
+      if(!block_from_scratch)
+        break;
+      bool changed = false;
+      for(BatchInfo & batch : batches)
+        if(!batch.interface)
+          for(const BlockInfo * block : batch.members)
+            for(const unsigned int u : block->unknowns)
+              if(finished_after[u] > batch.time)
+              {
+                AssertThrow(finished_after[u] < n_batches, ExcInternalError());
+                batch.time = finished_after[u];
+                changed    = true;
+              }
+      if(!changed)
+        break;
+    }
+
+    // store the batches in the order of execution
+    std::vector<std::vector<unsigned int>> order_after(n_batches + 1);
+    for(unsigned int b = 0; b < batches.size(); ++b)
+      order_after[batches[b].time].push_back(b);
+    for(unsigned int b = 0; b < batches.size(); ++b)
+    {
+      const BatchInfo &              batch  = batches[b];
+      const unsigned int             n_fill = batch.members.size();
+      std::array<unsigned char, dim> start;
+      for(unsigned int d = 0; d < dim; ++d)
+        start[d] = batch.members[0]->start[d];
+      block_batch_start.push_back(start);
+      for(unsigned int e = 0; e < n_stored; ++e)
+      {
+        bool all_valid = true;
+        for(unsigned int v = 0; v < n_lanes; ++v)
+        {
+          const BlockInfo *  block = batch.members[v < n_fill ? v : 0];
+          const unsigned int index =
+            compressed_dof_indices[(block->cell * n_stored + e) * n_lanes + block->lane];
+          block_batch_fe_indices.push_back(index);
+          block_batch_scratch_indices.push_back(scratch_indices[(b * n_stored + e) * n_lanes + v]);
+          all_valid = all_valid && index != numbers::invalid_unsigned_int;
+        }
+        block_batch_unconstrained.push_back(all_valid ? 1 : 0);
+      }
+      block_batch_data_offset.push_back(block_batch_data.size());
+      const unsigned int data_size = batch.members[0]->data.size();
+      const unsigned int offset    = block_batch_data.size();
+      block_batch_data.resize_fast(offset + data_size);
+      for(unsigned int i = 0; i < data_size; ++i)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          block_batch_data[offset + i][v] = batch.members[v < n_fill ? v : 0]->data[i];
+      VectorizedArray<Number> mask = 0.;
+      for(unsigned int v = 0; v < n_fill; ++v)
+        mask[v] = 1.;
+      block_batch_mask.push_back(mask);
+    }
+    block_batch_index.push_back(0);
+    for(const auto & list : order_after)
+    {
+      block_batch_order.insert(block_batch_order.end(), list.begin(), list.end());
+      block_batch_index.push_back(block_batch_order.size());
+    }
+
+    // chunks of the residual needed after the loop
+    block_residual_chunks.assign(n_owned / chunk + 1, 0);
+    for(const BatchInfo & batch : batches)
+      if(batch.interface)
+        for(const BlockInfo * block : batch.members)
+          for(const unsigned int u : block->unknowns)
+            block_residual_chunks[u / chunk] = 1;
+    for(const unsigned int i : leftover_indices)
+      block_residual_chunks[i / chunk] = 1;
+    if(!block_from_scratch)
+      for(const BatchInfo & batch : batches)
+        for(const BlockInfo * block : batch.members)
+          for(const unsigned int u : block->unknowns)
+            block_residual_chunks[u / chunk] = 1;
+
+    matrix_free.initialize_dof_vector(block_input);
+    return true;
+  }
+
+  bool
+  has_block_batches() const
+  {
+    return !block_batch_index.empty();
+  }
+
+  // Flags per chunk of ScratchMatrixVectorProduct::chunk_size locally owned
+  // entries whether the residual must be stored for the block updates after
+  // the loop in vmult_scratch_with_block_update()
+  const std::vector<unsigned char> &
+  get_block_residual_chunks() const
+  {
+    return block_residual_chunks;
+  }
+
+  // Apply the vectorized block-Jacobi preconditioner dst = P^{-1} src on
+  // whole vectors. Entries not part of any block or leftover, i.e.,
+  // constrained ones, are set to zero.
+  void
+  apply_block_inverse_vectorized(VectorType & dst, const VectorType & src) const
+  {
+    Assert(has_block_batches(), ExcMessage("Call setup_block_batches() first"));
+    // the input with zero ghost entries, as the unknowns of other processes
+    // are dropped from the blocks
+    block_input.copy_locally_owned_data_from(src);
+    dst = 0;
+    for(const unsigned int b : block_batch_order)
+      dispatch_block_batch<false>(b, nullptr, block_input, dst, Number(1.));
+    for(unsigned int k = 0; k < leftover_indices.size(); ++k)
+      dst.local_element(leftover_indices[k]) +=
+        leftover_inverse_diagonal[k] * src.local_element(leftover_indices[k]);
+    dst.zero_out_ghost_values();
+  }
+
+  // Variant of vmult_scratch() that, after each cell batch, adds
+  // factor * P^{-1} (rhs - A src) on the blocks of the batches scheduled
+  // there into 'target', with A src taken from the scratch array. The
+  // interface batches and the leftovers run after the loop, with the
+  // residual stored by 'after_loop' in 'residual' for the chunks flagged by
+  // get_block_residual_chunks(). The entries of 'target' must already hold
+  // their final values apart from this addition when the blocks run, which
+  // holds when 'after_loop' writes them.
+  template<typename AfterLoop>
+  void
+  vmult_scratch_with_block_update(const VectorType & src,
+                                  const AfterLoop &  after_loop,
+                                  const VectorType & rhs,
+                                  const VectorType & residual,
+                                  VectorType &       target,
+                                  const Number       factor) const
+  {
+    Assert(has_block_batches(), ExcMessage("Call setup_block_batches() first"));
+    Timer      total_timer, timer;
+    const auto record = [&](const unsigned int phase) {
+      timings[phase] += timer.wall_time();
+      timer.restart();
+    };
+    const bool         src_has_ghosts = src.has_ghost_elements();
+    const unsigned int n_batches      = matrix_free.n_cell_batches();
+
+    if(!src_has_ghosts)
+      src.update_ghost_values_start();
+    scratch.prepare_loop();
+    record(t_ghost_start);
+    if(!src_has_ghosts)
+      src.update_ghost_values_finish();
+    record(t_ghost_wait);
+
+    const auto copy_constrained =
+      [&](const unsigned int begin, const unsigned int end, Number * values) {
+        std::copy(src.begin() + begin, src.begin() + end, values);
+      };
+    const unsigned int degree = matrix_free.get_shape_info().data[0].fe_degree;
+    scratch.cell_loop(
+      [&](const unsigned int cell, Number * scratch_array) {
+        typename ExaDG::ScratchMatrixVectorProduct<Number>::View dst{scratch_array};
+        if(degree == 2)
+          apply_cell_operation<2>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 3)
+          apply_cell_operation<3>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 4)
+          apply_cell_operation<4>(cell, src, scratch_dof_indices, dst);
+#ifndef DEBUG
+        else if(degree == 5)
+          apply_cell_operation<5>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 6)
+          apply_cell_operation<6>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 7)
+          apply_cell_operation<7>(cell, src, scratch_dof_indices, dst);
+        else if(degree == 8)
+          apply_cell_operation<8>(cell, src, scratch_dof_indices, dst);
+#endif
+        else
+          AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+      },
+      after_loop,
+      copy_constrained,
+      [&](const unsigned int cell, const Number * scratch_array) {
+        for(unsigned int i = block_batch_index[cell]; i < block_batch_index[cell + 1]; ++i)
+          if(block_from_scratch)
+            dispatch_block_batch<true>(block_batch_order[i], scratch_array, rhs, target, factor);
+          else
+            dispatch_block_batch<false>(block_batch_order[i], nullptr, residual, target, factor);
+      });
+    record(t_cell_loop);
+
+    scratch.finish_loop(
+      after_loop,
+      [&]() {
+        if(!src_has_ghosts)
+          src.zero_out_ghost_values();
+      },
+      copy_constrained,
+      &timings[t_compress_send]);
+
+    // interface batches and leftovers; the blocks also write into ghost
+    // entries of 'target', which get discarded
+    Timer interface_timer;
+    for(unsigned int i = block_batch_index[n_batches]; i < block_batch_index[n_batches + 1]; ++i)
+      dispatch_block_batch<false>(block_batch_order[i], nullptr, residual, target, factor);
+    for(unsigned int k = 0; k < leftover_indices.size(); ++k)
+      target.local_element(leftover_indices[k]) +=
+        factor * leftover_inverse_diagonal[k] * residual.local_element(leftover_indices[k]);
+    target.zero_out_ghost_values();
+    timings[t_block_interface] += interface_timer.wall_time();
+
+    timings[t_scratch_count] += 1;
+    timings[t_scratch_total] += total_timer.wall_time();
+  }
+
+  // Local vector indices of the unknowns of a block, in lexicographic order
+  // of the owned nodes
+  ArrayView<const unsigned int>
+  get_block_indices(const unsigned int block) const
+  {
+    return ArrayView<const unsigned int>(block_indices.data() + block_start[block],
+                                         block_start[block + 1] - block_start[block]);
+  }
+
+  // Apply the block-Jacobi preconditioner dst = P^{-1} src. Entries that are
+  // not part of any block, i.e., constrained ones, are set to zero.
+  void
+  apply_block_inverse(VectorType & dst, const VectorType & src) const
+  {
+    Assert(has_block_inverse(), ExcMessage("Call setup_block_inverse() first"));
+    const bool src_has_ghosts = src.has_ghost_elements();
+    if(!src_has_ghosts)
+      src.update_ghost_values();
+    dst = 0;
+    dst.zero_out_ghost_values();
+
+    std::vector<double> values, tmp;
+    unsigned int        offset_vectors = 0, offset_values = 0;
+    for(unsigned int block = 0; block < n_blocks(); ++block)
+    {
+      const auto                    indices = get_block_indices(block);
+      std::array<unsigned int, dim> size;
+      for(unsigned int d = 0; d < dim; ++d)
+        size[d] = block_sizes[block * dim + d];
+      values.resize(indices.size());
+      tmp.resize(indices.size());
+      for(unsigned int i = 0; i < indices.size(); ++i)
+        values[i] = src.local_element(indices[i]);
+
+      std::array<const Number *, dim> eigenvectors, eigenvalues;
+      for(unsigned int d = 0; d < dim; ++d)
+      {
+        eigenvectors[d] = block_eigenvectors.data() + offset_vectors;
+        eigenvalues[d]  = block_eigenvalues.data() + offset_values;
+        offset_vectors += size[d] * size[d];
+        offset_values += size[d];
+      }
+
+      // values = S (Lambda^{-1} (S^T values))
+      for(unsigned int d = 0; d < dim; ++d)
+        apply_1d_matrix(eigenvectors[d], true, d, size, values.data(), tmp.data());
+      for(unsigned int i2 = 0, c = 0; i2 < (dim == 3 ? size[2] : 1); ++i2)
+        for(unsigned int i1 = 0; i1 < size[1]; ++i1)
+          for(unsigned int i0 = 0; i0 < size[0]; ++i0, ++c)
+          {
+            const double sum = eigenvalues[0][i0] + eigenvalues[1][i1] +
+                               (dim == 3 ? double(eigenvalues[dim - 1][i2]) : 0.);
+            values[c] = sum > 1e-12 * std::abs(eigenvalues[0][size[0] - 1]) ? values[c] / sum : 0.;
+          }
+      for(unsigned int d = dim; d-- > 0;)
+        apply_1d_matrix(eigenvectors[d], false, d, size, values.data(), tmp.data());
+
+      for(unsigned int i = 0; i < indices.size(); ++i)
+        dst.local_element(indices[i]) += values[i];
+    }
+    dst.compress(VectorOperation::add);
+    if(!src_has_ghosts)
+      src.zero_out_ghost_values();
   }
 
   // Add the cell-local values of the given cell batch into dst. On cells
@@ -1159,8 +2243,16 @@ private:
 
   // Set up the scratch array of vmult_scratch() with the vertices, lines,
   // quads and hexes of the element as entities
+  // Set up the scratch array of vmult_scratch(). Optionally, the cell batch
+  // 'cell' additionally writes the entities given by
+  // 'extra_entities(cell, add)', which keeps them alive in the scratch
+  // array until that cell batch, and 'before_release' runs before the setup
+  // data of the scratch array is released, e.g. to query scratch_index().
   void
-  setup_scratch()
+  setup_scratch(const std::function<void(const unsigned int,
+                                         const typename ExaDG::ScratchMatrixVectorProduct<
+                                           Number>::EntityFunction &)> & extra_entities = {},
+                const std::function<void()> &                            before_release = {})
   {
     const unsigned int fe_degree        = dof_handler->get_fe().degree;
     const unsigned int n_stored_per_dir = fe_degree == 1 ? 2 : 3;
@@ -1183,12 +2275,16 @@ private:
         for(unsigned int i = 0; i < n_stored; ++i)
           for(unsigned int v = 0; v < n_lanes; ++v)
             add(compressed_dof_indices[(cell * n_stored + i) * n_lanes + v], entity_length[i]);
+        if(extra_entities)
+          extra_entities(cell, add);
       },
       true);
 
     scratch_dof_indices = compressed_dof_indices;
     for(unsigned int & idx : scratch_dof_indices)
       idx = scratch.scratch_index(idx);
+    if(before_release)
+      before_release();
     scratch.release_setup_data();
     setup_pre_list();
   }
@@ -1492,9 +2588,9 @@ private:
   }
 
 public:
-  template<int fe_degree, int n_q_points_1d, int n_components>
+  template<int fe_degree, int n_q_points_1d, int n_components, typename SrcVectorType = VectorType>
   static void
-  read_dof_values_compressed(const VectorType &                         vec_in,
+  read_dof_values_compressed(const SrcVectorType &                      vec_in,
                              const std::vector<unsigned int> &          compressed_dof_indices,
                              const std::vector<unsigned char> &         all_indices_unconstrained,
                              const unsigned int                         cell_no,
@@ -1502,7 +2598,7 @@ public:
                              const bool                                 is_collocation,
                              VectorizedArray<Number> * DEAL_II_RESTRICT dof_values)
   {
-    VectorType & vec = const_cast<VectorType &>(vec_in);
+    SrcVectorType & vec = const_cast<SrcVectorType &>(vec_in);
     AssertIndexRange(cell_no * dealii::Utilities::pow(3, dim) * n_lanes,
                      compressed_dof_indices.size());
     const unsigned int * cell_indices =
@@ -2186,10 +3282,309 @@ private:
   }
 
 private:
+  // Multiply the data of a block with sizes 'size' (lexicographic, the
+  // first direction running fastest) by the square matrix of direction
+  // 'direction', stored with rows by node and columns by eigenvalue index,
+  // or its transpose, in place, using 'tmp' of the same size as scratch
+  static void
+  apply_1d_matrix(const Number *                        matrix,
+                  const bool                            transpose,
+                  const unsigned int                    direction,
+                  const std::array<unsigned int, dim> & size,
+                  double *                              data,
+                  double *                              tmp)
+  {
+    const unsigned int n      = size[direction];
+    unsigned int       stride = 1;
+    for(unsigned int d = 0; d < direction; ++d)
+      stride *= size[d];
+    unsigned int n_total = 1;
+    for(unsigned int d = 0; d < dim; ++d)
+      n_total *= size[d];
+    const unsigned int n_outer = n_total / (stride * n);
+    for(unsigned int o = 0; o < n_outer; ++o)
+      for(unsigned int s = 0; s < stride; ++s)
+      {
+        const unsigned int base = o * stride * n + s;
+        for(unsigned int i = 0; i < n; ++i)
+        {
+          double sum = 0;
+          for(unsigned int j = 0; j < n; ++j)
+            sum += (transpose ? matrix[j * n + i] : matrix[i * n + j]) * data[base + j * stride];
+          tmp[base + i * stride] = sum;
+        }
+      }
+    std::copy(tmp, tmp + n_total, data);
+  }
+
+  // data of the block-Jacobi preconditioner, see setup_block_inverse():
+  // per block the start in block_indices, the sizes per direction, the
+  // local indices of the unknowns, and the eigenvectors and eigenvalues per
+  // direction (concatenated over the blocks)
+  std::vector<unsigned int> block_start;
+  std::vector<unsigned int> block_sizes;
+  std::vector<unsigned int> block_indices;
+  std::vector<Number>       block_eigenvectors;
+  std::vector<Number>       block_eigenvalues;
+
+  // data of the vectorized block-Jacobi preconditioner, see
+  // setup_block_batches(): per block batch the start of the owned index
+  // range per direction, the gathered compressed indices into the vector
+  // and into the scratch array (n_stored entries with n_lanes indices each)
+  // with flags whether all lanes are valid, the offset into
+  // block_batch_data (eigenvectors per direction, then eigenvalues per
+  // direction) and the lane mask; the block batches in the order of
+  // execution with the range run after each cell batch (the last one after
+  // the loop); the leftovers with their inverse diagonal; the chunks whose
+  // residual is needed after the loop; and a vector with zero ghost entries
+  std::vector<std::array<unsigned char, dim>> block_batch_start;
+  std::vector<unsigned int>                   block_batch_fe_indices;
+  std::vector<unsigned int>                   block_batch_scratch_indices;
+  std::vector<unsigned char>                  block_batch_unconstrained;
+  std::vector<unsigned int>                   block_batch_data_offset;
+  AlignedVector<VectorizedArray<Number>>      block_batch_data;
+  AlignedVector<VectorizedArray<Number>>      block_batch_mask;
+  std::vector<unsigned int>                   block_batch_index;
+  std::vector<unsigned int>                   block_batch_order;
+  std::vector<unsigned int>                   leftover_indices;
+  std::vector<Number>                         leftover_inverse_diagonal;
+  std::vector<unsigned char>                  block_residual_chunks;
+  mutable VectorType                          block_input;
+  bool                                        block_from_scratch = true;
+
+  template<bool from_scratch>
+  void
+  dispatch_block_batch(const unsigned int b,
+                       const Number *     scratch_array,
+                       const VectorType & src,
+                       VectorType &       dst,
+                       const Number       factor) const
+  {
+    const unsigned int degree = matrix_free.get_shape_info().data[0].fe_degree;
+    if(degree == 2)
+      do_block_batch<2, from_scratch>(b, scratch_array, src, dst, factor);
+    else if(degree == 3)
+      do_block_batch<3, from_scratch>(b, scratch_array, src, dst, factor);
+    else if(degree == 4)
+      do_block_batch<4, from_scratch>(b, scratch_array, src, dst, factor);
+#ifndef DEBUG
+    else if(degree == 5)
+      do_block_batch<5, from_scratch>(b, scratch_array, src, dst, factor);
+    else if(degree == 6)
+      do_block_batch<6, from_scratch>(b, scratch_array, src, dst, factor);
+    else if(degree == 7)
+      do_block_batch<7, from_scratch>(b, scratch_array, src, dst, factor);
+    else if(degree == 8)
+      do_block_batch<8, from_scratch>(b, scratch_array, src, dst, factor);
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  // Read the cell values of a block batch with the gathered indices
+  template<int degree, typename SrcVectorType>
+  void
+  read_block_batch(const SrcVectorType &             src,
+                   const std::vector<unsigned int> & indices_all,
+                   const unsigned int                b,
+                   VectorizedArray<Number> *         values) const
+  {
+    constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
+    constexpr unsigned int n_stored      = Utilities::pow(3, dim);
+    if constexpr(degree <= 2)
+    {
+      const unsigned int *  indices       = indices_all.data() + b * n_stored * n_lanes;
+      const unsigned char * unconstrained = block_batch_unconstrained.data() + b * n_stored;
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        if(unconstrained[i])
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            values[i][v] = src.local_element(indices[i * n_lanes + v]);
+        else
+        {
+          values[i] = 0.;
+          for(unsigned int v = 0; v < n_lanes; ++v)
+            if(indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+              values[i][v] = src.local_element(indices[i * n_lanes + v]);
+        }
+    }
+    else
+      read_dof_values_compressed<degree, degree + 1, 1>(
+        src, indices_all, block_batch_unconstrained, b, {}, true, values);
+  }
+
+  // Run a block batch: with from_scratch, the residual is rhs (in 'src')
+  // minus the result of the operator taken from the scratch array,
+  // otherwise it is read from 'src'. Apply the inverse of the surrogate
+  // blocks on the owned nodes and add factor times the result on the owned
+  // nodes (zero elsewhere) into dst.
+  template<int degree, bool from_scratch>
+  void
+  do_block_batch(const unsigned int b,
+                 const Number *     scratch_array,
+                 const VectorType & src,
+                 VectorType &       dst,
+                 const Number       factor) const
+  {
+    constexpr unsigned int  nn            = degree + 1;
+    constexpr unsigned int  dofs_per_cell = Utilities::pow(nn, dim);
+    constexpr unsigned int  n_stored      = Utilities::pow(3, dim);
+    VectorizedArray<Number> values[dofs_per_cell];
+    read_block_batch<degree>(src, block_batch_fe_indices, b, values);
+
+    // owned sub-tensor of the residual; only the owned nodes are valid in
+    // the scratch array
+    const std::array<unsigned char, dim> & start = block_batch_start[b];
+    std::array<unsigned int, dim>          size;
+    for(unsigned int d = 0; d < dim; ++d)
+      size[d] = nn - start[d];
+    const auto owned_position =
+      [&](const unsigned int i0, const unsigned int i1, const unsigned int i2) {
+        return ((i2 + (dim == 3 ? start[dim - 1] : 0)) * nn + i1 + start[1]) * nn + i0 + start[0];
+      };
+    VectorizedArray<Number> owned[dofs_per_cell];
+    if constexpr(from_scratch)
+    {
+      VectorizedArray<Number>                                  matvec[dofs_per_cell];
+      typename ExaDG::ScratchMatrixVectorProduct<Number>::View view{
+        const_cast<Number *>(scratch_array)};
+      read_block_batch<degree>(view, block_batch_scratch_indices, b, matvec);
+      for(unsigned int i2 = 0, c = 0; i2 < (dim == 3 ? size[dim - 1] : 1); ++i2)
+        for(unsigned int i1 = 0; i1 < size[1]; ++i1)
+          for(unsigned int i0 = 0; i0 < size[0]; ++i0, ++c)
+          {
+            const unsigned int p = owned_position(i0, i1, i2);
+            owned[c]             = values[p] - matvec[p];
+          }
+    }
+    else
+      for(unsigned int i2 = 0, c = 0; i2 < (dim == 3 ? size[dim - 1] : 1); ++i2)
+        for(unsigned int i1 = 0; i1 < size[1]; ++i1)
+          for(unsigned int i0 = 0; i0 < size[0]; ++i0, ++c)
+            owned[c] = values[owned_position(i0, i1, i2)];
+
+    const VectorizedArray<Number> * data = block_batch_data.data() + block_batch_data_offset[b];
+    std::array<const VectorizedArray<Number> *, dim> eigenvectors, eigenvalues;
+    {
+      const VectorizedArray<Number> * ptr = data;
+      for(unsigned int d = 0; d < dim; ++d)
+      {
+        eigenvectors[d] = ptr;
+        ptr += size[d] * size[d];
+      }
+      for(unsigned int d = 0; d < dim; ++d)
+      {
+        eigenvalues[d] = ptr;
+        ptr += size[d];
+      }
+    }
+    bool uniform = true;
+    for(unsigned int d = 0; d < dim; ++d)
+      uniform = uniform && size[d] == degree;
+    if(uniform)
+      dealii::internal::TensorProductMatrixSymmetricSum::apply_inverse<degree>(
+        owned, owned, degree, eigenvectors, eigenvalues);
+    else
+      apply_inverse_anisotropic<nn>(size, eigenvectors, eigenvalues, owned);
+
+    // scatter back with the lane mask and the factor
+    const VectorizedArray<Number> scale = block_batch_mask[b] * factor;
+    for(unsigned int i = 0; i < dofs_per_cell; ++i)
+      values[i] = VectorizedArray<Number>();
+    for(unsigned int i2 = 0, c = 0; i2 < (dim == 3 ? size[dim - 1] : 1); ++i2)
+      for(unsigned int i1 = 0; i1 < size[1]; ++i1)
+        for(unsigned int i0 = 0; i0 < size[0]; ++i0, ++c)
+          values[owned_position(i0, i1, i2)] = owned[c] * scale;
+
+    if constexpr(degree <= 2)
+    {
+      const unsigned int * indices = block_batch_fe_indices.data() + b * n_stored * n_lanes;
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        for(unsigned int v = 0; v < n_lanes; ++v)
+          if(indices[i * n_lanes + v] != numbers::invalid_unsigned_int)
+            dst.local_element(indices[i * n_lanes + v]) += values[i][v];
+    }
+    else
+      distribute_local_to_global_compressed<degree, degree + 1, 1>(
+        dst, block_batch_fe_indices, block_batch_unconstrained, b, {}, true, values);
+  }
+
+  // Fast diagonalization with different sizes per direction (up to
+  // max_size), in place
+  template<int max_size>
+  static void
+  apply_inverse_anisotropic(const std::array<unsigned int, dim> &                    size,
+                            const std::array<const VectorizedArray<Number> *, dim> & eigenvectors,
+                            const std::array<const VectorizedArray<Number> *, dim> & eigenvalues,
+                            VectorizedArray<Number> *                                data)
+  {
+    constexpr unsigned int  max_total = Utilities::pow(max_size, dim);
+    VectorizedArray<Number> tmp[max_total];
+    unsigned int            n_total = 1;
+    for(unsigned int d = 0; d < dim; ++d)
+      n_total *= size[d];
+    const auto apply_1d = [&](const unsigned int direction, const bool transpose) {
+      const unsigned int              n      = size[direction];
+      const VectorizedArray<Number> * matrix = eigenvectors[direction];
+      unsigned int                    stride = 1;
+      for(unsigned int d = 0; d < direction; ++d)
+        stride *= size[d];
+      const unsigned int n_outer = n_total / (stride * n);
+      for(unsigned int o = 0; o < n_outer; ++o)
+        for(unsigned int s = 0; s < stride; ++s)
+        {
+          const unsigned int base = o * stride * n + s;
+          for(unsigned int i = 0; i < n; ++i)
+          {
+            VectorizedArray<Number> sum = VectorizedArray<Number>();
+            for(unsigned int j = 0; j < n; ++j)
+              sum += (transpose ? matrix[j * n + i] : matrix[i * n + j]) * data[base + j * stride];
+            tmp[base + i * stride] = sum;
+          }
+        }
+      for(unsigned int i = 0; i < n_total; ++i)
+        data[i] = tmp[i];
+    };
+    for(unsigned int d = 0; d < dim; ++d)
+      apply_1d(d, true);
+    for(unsigned int i2 = 0, c = 0; i2 < (dim == 3 ? size[2] : 1); ++i2)
+      for(unsigned int i1 = 0; i1 < size[1]; ++i1)
+        for(unsigned int i0 = 0; i0 < size[0]; ++i0, ++c)
+        {
+          VectorizedArray<Number> sum = eigenvalues[0][i0] + eigenvalues[1][i1];
+          if constexpr(dim == 3)
+            sum += eigenvalues[2][i2];
+          data[c] /= sum;
+        }
+    for(unsigned int d = dim; d-- > 0;)
+      apply_1d(d, false);
+  }
+
   ObserverPointer<const DoFHandler<dim>> dof_handler;
   MatrixFree<dim, Number>                matrix_free;
   // node of each entry of the 3^dim entities, starting at
   // scalar_entity_start[i] for entity i, see setup_scalar_read()
+  // timings of vmult_scratch() and vmult(), see print_timings(); the three
+  // entries from t_compress_send on are filled by
+  // ScratchMatrixVectorProduct::finish_loop() and must stay consecutive
+  enum TimingIndex : unsigned int
+  {
+    t_scratch_count,
+    t_before_loop,
+    t_ghost_start,
+    t_ghost_wait,
+    t_cell_loop,
+    t_compress_send,
+    t_compress_wait,
+    t_finish_ranges,
+    t_scratch_total,
+    t_vmult_count,
+    t_vmult_total,
+    t_block_interface,
+    n_timings
+  };
+  static_assert(t_compress_wait == t_compress_send + 1 && t_finish_ranges == t_compress_send + 2);
+  mutable std::array<double, n_timings> timings = {};
+
   mutable std::vector<unsigned int> scalar_entity_start;
   mutable std::vector<unsigned int> scalar_entity_node;
 
@@ -2544,6 +3939,260 @@ public:
     }
   }
 
+  // --- Block-Jacobi preconditioner with fast diagonalization ---
+  //
+  // The block of the operator on a cell, i.e., the cell integral and the
+  // face integrals with zero exterior values on interior faces, is replaced
+  // by the block of a Cartesian surrogate cell, whose inverse is applied by
+  // the fast diagonalization method (Lynch, Rice, Thomas 1964), see also
+  // deal.II's step-59 and TensorProductMatrixSymmetricSum. The surrogate has
+  // the extents h_0, h_1 given by the average length of the columns of the
+  // Jacobian of the deformed xy geometry over the quadrature points, and h_z
+  // in z direction. Per direction d, the 1D matrices are the DG mass matrix
+  // M_d = h_d M^ and the interior penalty matrix L_d with the stiffness
+  // factor_laplace/h_d K^ plus, on the two faces of the direction, the
+  // penalty and consistency terms with the penalty parameters of the actual
+  // operator and the exterior value zero. Boundary faces, where the operator
+  // applies the mirror principle, have no face terms. The block is
+  //   A_K = factor_mass M_2 x M_1 x M_0 + sum_d (prod_{e != d} M_e) x L_d,
+  // whose inverse follows from the generalized eigenvalue problems
+  // L_d S_d = M_d S_d Lambda_d as
+  //   A_K^{-1} = (S_2 x S_1 x S_0) (factor_mass + Lambda_0 + Lambda_1 +
+  //              Lambda_2)^{-1} (S_2 x S_1 x S_0)^T.
+  // The eigenvectors and eigenvalues are stored per cell batch.
+  //
+  // Must be called after set_penalty_parameters() and set_parameters().
+  void
+  setup_block_inverse()
+  {
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    if(degree == 1)
+      do_setup_block_inverse<1>();
+    else if(degree == 2)
+      do_setup_block_inverse<2>();
+    else if(degree == 3)
+      do_setup_block_inverse<3>();
+    else if(degree == 4)
+      do_setup_block_inverse<4>();
+#ifndef DEBUG
+    else if(degree == 5)
+      do_setup_block_inverse<5>();
+    else if(degree == 6)
+      do_setup_block_inverse<6>();
+    else if(degree == 7)
+      do_setup_block_inverse<7>();
+    else if(degree == 8)
+      do_setup_block_inverse<8>();
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  bool
+  has_block_inverse() const
+  {
+    return !block_eigenvalues.empty();
+  }
+
+  unsigned int
+  n_cell_batches() const
+  {
+    return dof_indices.size();
+  }
+
+  unsigned int
+  n_dofs_per_cell() const
+  {
+    return Utilities::pow(shape_info.data[0].fe_degree + 1, dim);
+  }
+
+  unsigned int
+  n_active_lanes(const unsigned int cell) const
+  {
+    return n_active_entries_per_cell_batch(cell);
+  }
+
+  // Read the entries of the cells of a batch from 'vector' into 'values'
+  // in the layout of VectorizedArray, with the lexicographic numbering
+  // within the cells. Lanes without a cell read the entries of the first
+  // lane.
+  void
+  read_cell_dofs(const unsigned int        cell,
+                 const Number *            vector,
+                 VectorizedArray<Number> * values) const
+  {
+    const unsigned int n_active = n_active_entries_per_cell_batch(cell);
+    if(n_active == n_lanes)
+      vectorized_load_and_transpose(n_dofs_per_cell(), vector, dof_indices[cell].data(), values);
+    else
+    {
+      std::array<unsigned int, n_lanes> indices;
+      for(unsigned int v = 0; v < n_lanes; ++v)
+        indices[v] = dof_indices[cell][v < n_active ? v : 0];
+      vectorized_load_and_transpose(n_dofs_per_cell(), vector, indices.data(), values);
+    }
+  }
+
+  // Write the entries of the active lanes of 'values' to the cells of a
+  // batch in 'vector', overwriting the previous content
+  void
+  write_cell_dofs(const unsigned int              cell,
+                  const VectorizedArray<Number> * values,
+                  Number *                        vector) const
+  {
+    const unsigned int n_active      = n_active_entries_per_cell_batch(cell);
+    const unsigned int dofs_per_cell = n_dofs_per_cell();
+    if(n_active == n_lanes)
+      vectorized_transpose_and_store(
+        false, dofs_per_cell, values, dof_indices[cell].data(), vector);
+    else
+      for(unsigned int v = 0; v < n_active; ++v)
+      {
+        Number * dst = vector + dof_indices[cell][v];
+        for(unsigned int i = 0; i < dofs_per_cell; ++i)
+          dst[i] = values[i][v];
+      }
+  }
+
+  // Number of Richardson steps with the actual cell block that correct the
+  // inverse of the surrogate block in apply_block_inverse_cell(), see
+  // do_apply_block_inverse_cell()
+  void
+  set_block_inverse_iterations(const unsigned int n_iterations)
+  {
+    block_inverse_iterations = n_iterations;
+  }
+
+  // Apply the inverse of the surrogate block on the cell batch 'cell' to
+  // the cell values in 'values' (layout as in read_cell_dofs()), in place,
+  // corrected by the number of Richardson steps given by
+  // set_block_inverse_iterations() or the argument, if given
+  void
+  apply_block_inverse_cell(const unsigned int        cell,
+                           VectorizedArray<Number> * values,
+                           const unsigned int n_iterations_in = numbers::invalid_unsigned_int) const
+  {
+    Assert(has_block_inverse(), ExcMessage("Call setup_block_inverse() first"));
+    const unsigned int n_iterations =
+      n_iterations_in == numbers::invalid_unsigned_int ? block_inverse_iterations : n_iterations_in;
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    if(degree == 1)
+      do_apply_block_inverse_cell<1>(cell, values, n_iterations);
+    else if(degree == 2)
+      do_apply_block_inverse_cell<2>(cell, values, n_iterations);
+    else if(degree == 3)
+      do_apply_block_inverse_cell<3>(cell, values, n_iterations);
+    else if(degree == 4)
+      do_apply_block_inverse_cell<4>(cell, values, n_iterations);
+#ifndef DEBUG
+    else if(degree == 5)
+      do_apply_block_inverse_cell<5>(cell, values, n_iterations);
+    else if(degree == 6)
+      do_apply_block_inverse_cell<6>(cell, values, n_iterations);
+    else if(degree == 7)
+      do_apply_block_inverse_cell<7>(cell, values, n_iterations);
+    else if(degree == 8)
+      do_apply_block_inverse_cell<8>(cell, values, n_iterations);
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  // Apply the block diagonal of the operator, dst = A_K src on all cells
+  void
+  apply_block_diagonal(VectorType & dst, const VectorType & src) const
+  {
+    const unsigned int                     n_dofs = n_dofs_per_cell();
+    AlignedVector<VectorizedArray<Number>> in(n_dofs), out(n_dofs);
+    const unsigned int                     degree = shape_info.data[0].fe_degree;
+    for(unsigned int cell = 0; cell < n_cell_batches(); ++cell)
+    {
+      read_cell_dofs(cell, src.begin(), in.data());
+      if(degree == 1)
+        do_apply_cell_block<1>(cell, in.data(), out.data());
+      else if(degree == 2)
+        do_apply_cell_block<2>(cell, in.data(), out.data());
+      else if(degree == 3)
+        do_apply_cell_block<3>(cell, in.data(), out.data());
+      else if(degree == 4)
+        do_apply_cell_block<4>(cell, in.data(), out.data());
+#ifndef DEBUG
+      else if(degree == 5)
+        do_apply_cell_block<5>(cell, in.data(), out.data());
+      else if(degree == 6)
+        do_apply_cell_block<6>(cell, in.data(), out.data());
+      else if(degree == 7)
+        do_apply_cell_block<7>(cell, in.data(), out.data());
+      else if(degree == 8)
+        do_apply_cell_block<8>(cell, in.data(), out.data());
+#endif
+      else
+        AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+      write_cell_dofs(cell, out.data(), dst.begin());
+    }
+  }
+
+  // Quality of the approximate block inverse B with the given number of
+  // Richardson steps: |r - A_K B r| / |r| for a random vector r, i.e., how
+  // far B is from the exact block-Jacobi preconditioner
+  double
+  compute_block_inverse_defect(const unsigned int n_iterations) const
+  {
+    VectorType r, z, az;
+    initialize_dof_vector(r);
+    initialize_dof_vector(z);
+    initialize_dof_vector(az);
+    std::mt19937                           gen(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD));
+    std::uniform_real_distribution<Number> dist(-1., 1.);
+    for(Number & a : r)
+      a = dist(gen);
+    AlignedVector<VectorizedArray<Number>> values(n_dofs_per_cell());
+    for(unsigned int cell = 0; cell < n_cell_batches(); ++cell)
+    {
+      read_cell_dofs(cell, r.begin(), values.data());
+      apply_block_inverse_cell(cell, values.data(), n_iterations);
+      write_cell_dofs(cell, values.data(), z.begin());
+    }
+    apply_block_diagonal(az, z);
+    az -= r;
+    return az.l2_norm() / r.l2_norm();
+  }
+
+  // Apply the block-Jacobi preconditioner dst = P^{-1} src on all cells
+  void
+  apply_block_inverse(VectorType & dst, const VectorType & src) const
+  {
+    AlignedVector<VectorizedArray<Number>> values(n_dofs_per_cell());
+    for(unsigned int cell = 0; cell < n_cell_batches(); ++cell)
+    {
+      read_cell_dofs(cell, src.begin(), values.data());
+      apply_block_inverse_cell(cell, values.data());
+      write_cell_dofs(cell, values.data(), dst.begin());
+    }
+  }
+
+  // Matrix-vector product that hands the result of each cell batch, which
+  // is complete after the batch as each cell only writes into its own
+  // entries, to 'cell_function(cell, values)' in the layout of
+  // read_cell_dofs() instead of writing it into a vector. The array
+  // 'values' can be modified by the function.
+  template<typename CellFunction>
+  void
+  vmult_cellwise(const VectorType & src, const CellFunction & cell_function) const
+  {
+    AssertThrow(factor_laplace != 0., ExcNotImplemented());
+    Timer total_timer;
+    timings[0] += 1;
+    exchange_face_data(src);
+
+    Timer time;
+    for(unsigned int cell = 0; cell < n_cell_batches(); ++cell)
+      dispatch_cell_operation_cellwise(cell, src, cell_function);
+    timings[7] += time.wall_time();
+    timings[8] += time.wall_time();
+    timings[9] += total_timer.wall_time();
+  }
+
   void
   set_penalty_parameters(const Number additional_factor)
   {
@@ -2765,6 +4414,35 @@ public:
                                   const LaplaceOperatorFE<dim, Number> & fe_operator,
                                   const AfterLoop &                      after_loop) const
   {
+    do_vmult_with_prolongation<false>(src, fe_correction, fe_operator, after_loop);
+  }
+
+  // Variant of vmult_scratch_with_prolongation() that hands the result of
+  // each cell batch to 'cell_function' like vmult_cellwise(): the result is
+  // the same as prolongate_and_add() followed by vmult_cellwise(). As each
+  // cell is prolongated before the first cell batch reading it, which is at
+  // the latest the cell batch itself, 'cell_function' sees the updated
+  // entries of src on the cells of the batch.
+  template<typename CellFunction>
+  void
+  vmult_cellwise_with_prolongation(VectorType &                           src,
+                                   const VectorType &                     fe_correction,
+                                   const LaplaceOperatorFE<dim, Number> & fe_operator,
+                                   const CellFunction &                   cell_function) const
+  {
+    do_vmult_with_prolongation<true>(src, fe_correction, fe_operator, cell_function);
+  }
+
+  // Implementation of vmult_scratch_with_prolongation() (cellwise = false,
+  // 'output' is 'after_loop') and vmult_cellwise_with_prolongation()
+  // (cellwise = true, 'output' is 'cell_function')
+  template<bool cellwise, typename Output>
+  void
+  do_vmult_with_prolongation(VectorType &                           src,
+                             const VectorType &                     fe_correction,
+                             const LaplaceOperatorFE<dim, Number> & fe_operator,
+                             const Output &                         output) const
+  {
     AssertThrow(factor_laplace != 0., ExcNotImplemented());
     const unsigned int n_cell_batches = dof_indices.size();
     if(!prolongation_setup_done)
@@ -2783,7 +4461,7 @@ public:
     }
     if(use_prolongation_batches)
     {
-      vmult_scratch_with_prolongation_batches(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<cellwise>(src, fe_correction, output);
       return;
     }
 
@@ -2808,17 +4486,27 @@ public:
       timings[4] += time.wall_time();
     }
 
-    scratch.prepare_loop();
+    if constexpr(!cellwise)
+      scratch.prepare_loop();
     exchange_face_data(src);
 
     Timer time;
-    scratch.cell_loop(
-      [&](const unsigned int cell, Number * scratch_array) {
+    if constexpr(cellwise)
+      for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+      {
         run_prolongation_list(cell);
-        dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
-      },
-      after_loop);
-    scratch.finish_loop(after_loop, {});
+        dispatch_cell_operation_cellwise(cell, src, output);
+      }
+    else
+    {
+      scratch.cell_loop(
+        [&](const unsigned int cell, Number * scratch_array) {
+          run_prolongation_list(cell);
+          dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
+        },
+        output);
+      scratch.finish_loop(output, {});
+    }
     fe_correction.zero_out_ghost_values();
 
     timings[7] += time.wall_time();
@@ -2826,70 +4514,82 @@ public:
     timings[9] += total_timer.wall_time();
   }
 
-  // Part of vmult_scratch_with_prolongation() with the batches of
+  // Part of do_vmult_with_prolongation() with the batches of
   // setup_prolongation_batches()
-  template<typename AfterLoop>
+  template<bool cellwise, typename Output>
   void
-  vmult_scratch_with_prolongation_batches(VectorType &       src,
-                                          const VectorType & fe_correction,
-                                          const AfterLoop &  after_loop) const
+  vmult_with_prolongation_batches(VectorType &       src,
+                                  const VectorType & fe_correction,
+                                  const Output &     output) const
   {
     const unsigned int degree = shape_info.data[0].fe_degree;
     if(degree == 1)
-      vmult_scratch_with_prolongation_batches<1>(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<1, cellwise>(src, fe_correction, output);
     else if(degree == 2)
-      vmult_scratch_with_prolongation_batches<2>(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<2, cellwise>(src, fe_correction, output);
     else if(degree == 3)
-      vmult_scratch_with_prolongation_batches<3>(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<3, cellwise>(src, fe_correction, output);
     else if(degree == 4)
-      vmult_scratch_with_prolongation_batches<4>(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<4, cellwise>(src, fe_correction, output);
 #ifndef DEBUG
     else if(degree == 5)
-      vmult_scratch_with_prolongation_batches<5>(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<5, cellwise>(src, fe_correction, output);
     else if(degree == 6)
-      vmult_scratch_with_prolongation_batches<6>(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<6, cellwise>(src, fe_correction, output);
     else if(degree == 7)
-      vmult_scratch_with_prolongation_batches<7>(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<7, cellwise>(src, fe_correction, output);
     else if(degree == 8)
-      vmult_scratch_with_prolongation_batches<8>(src, fe_correction, after_loop);
+      vmult_with_prolongation_batches<8, cellwise>(src, fe_correction, output);
 #endif
     else
       AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
   }
 
-  template<int degree, typename AfterLoop>
+  template<int degree, bool cellwise, typename Output>
   void
-  vmult_scratch_with_prolongation_batches(VectorType &       src,
-                                          const VectorType & fe_correction,
-                                          const AfterLoop &  after_loop) const
+  vmult_with_prolongation_batches(VectorType &       src,
+                                  const VectorType & fe_correction,
+                                  const Output &     output) const
   {
     Timer              total_timer;
     const unsigned int n_cell_batches = dof_indices.size();
     timings[0] += 1;
 
     fe_correction.update_ghost_values();
-    scratch.prepare_loop();
+    if constexpr(!cellwise)
+      scratch.prepare_loop();
     const auto pack_hook = [&](const unsigned int group) {
       do_prolongate_on_batch<degree>(group, fe_correction, src);
     };
     exchange_face_data(src, &pack_hook);
 
-    Timer time;
-    scratch.cell_loop(
-      [&](const unsigned int cell, Number * scratch_array) {
-        for(unsigned int p = prolongation_batch_index[cell]; p < prolongation_batch_index[cell + 1];
-            ++p)
-          do_prolongate_on_batch<degree>(p, fe_correction, src);
-        dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
-      },
-      after_loop);
-    scratch.finish_loop(after_loop, {});
+    Timer      time;
+    const auto run_prolongation = [&](const unsigned int cell) {
+      for(unsigned int p = prolongation_batch_index[cell]; p < prolongation_batch_index[cell + 1];
+          ++p)
+        do_prolongate_on_batch<degree>(p, fe_correction, src);
+    };
+    if constexpr(cellwise)
+      for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+      {
+        run_prolongation(cell);
+        do_cell_operation_cellwise<degree>(cell, src, output);
+      }
+    else
+    {
+      scratch.cell_loop(
+        [&](const unsigned int cell, Number * scratch_array) {
+          run_prolongation(cell);
+          dispatch_cell_operation(cell, src, scratch_indices[cell], scratch_array);
+        },
+        output);
+      scratch.finish_loop(output, {});
+    }
     fe_correction.zero_out_ghost_values();
 
     timings[7] += time.wall_time();
     timings[8] += time.wall_time();
     timings[9] += total_timer.wall_time();
-    (void)n_cell_batches;
   }
 
   // For benchmarking the kernels of the prolongation from the FE vector
@@ -3319,6 +5019,18 @@ private:
   Number factor_laplace;
 
   AlignedVector<std::array<VectorizedArray<Number>, 2 * dim>> penalty_parameters;
+
+  // eigenvectors (dim x (degree+1)^2 per cell batch, the rows of each matrix
+  // corresponding to the shape functions) and eigenvalues (dim x (degree+1)
+  // per cell batch) of the block-Jacobi preconditioner, see
+  // setup_block_inverse()
+  AlignedVector<VectorizedArray<Number>> block_eigenvectors;
+  AlignedVector<VectorizedArray<Number>> block_eigenvalues;
+  unsigned int                           block_inverse_iterations = 0;
+
+  // empty vector for compute_face() without exterior values, which does
+  // not read the source vector
+  VectorType empty_vector;
 
   // prolongation batches of arbitrary cells, see
   // setup_prolongation_batches(): FE indices in the layout of the FE
@@ -4372,6 +6084,339 @@ private:
 #endif
     else
       AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  // Integrate the quadrature point values of a cell batch against the
+  // shape functions, like integrate_cell_scatter(), but in place in the
+  // layout of read_cell_dofs() instead of adding into a vector
+  template<int nn>
+  void
+  integrate_cell_in_place(VectorizedArray<Number> * values) const
+  {
+    constexpr unsigned int          n_points_1d = nn;
+    constexpr unsigned int          n_points_2d = n_points_1d * n_points_1d;
+    VectorizedArray<Number>         plane[n_points_2d];
+    const Number * DEAL_II_RESTRICT shape_data = shape_info.data[0].shape_values_eo.data();
+    if constexpr(dim == 3)
+      for(unsigned int i = 0; i < n_points_2d; ++i)
+        internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                              internal::EvaluatorQuantity::value,
+                                              nn,
+                                              n_points_1d,
+                                              n_points_2d,
+                                              n_points_2d,
+                                              false,
+                                              false>(shape_data, values + i, values + i);
+    for(unsigned int i_z = 0; i_z < (dim > 2 ? nn : 1); ++i_z)
+    {
+      VectorizedArray<Number> * out_z = values + i_z * n_points_2d;
+      for(unsigned int i_x = 0; i_x < n_points_1d; ++i_x)
+        internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                              internal::EvaluatorQuantity::value,
+                                              nn,
+                                              n_points_1d,
+                                              n_points_1d,
+                                              n_points_1d,
+                                              false,
+                                              false>(shape_data, out_z + i_x, out_z + i_x);
+      for(unsigned int i_y = 0; i_y < nn; ++i_y)
+        internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                              internal::EvaluatorQuantity::value,
+                                              nn,
+                                              n_points_1d,
+                                              1,
+                                              1,
+                                              false,
+                                              false>(shape_data,
+                                                     out_z + i_y * n_points_1d,
+                                                     plane + i_y * nn);
+      for(unsigned int i = 0; i < n_points_2d; ++i)
+        out_z[i] = plane[i];
+    }
+  }
+
+  template<typename CellFunction>
+  void
+  dispatch_cell_operation_cellwise(const unsigned int   cell,
+                                   const VectorType &   src,
+                                   const CellFunction & cell_function) const
+  {
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    if(degree == 1)
+      do_cell_operation_cellwise<1>(cell, src, cell_function);
+    else if(degree == 2)
+      do_cell_operation_cellwise<2>(cell, src, cell_function);
+    else if(degree == 3)
+      do_cell_operation_cellwise<3>(cell, src, cell_function);
+    else if(degree == 4)
+      do_cell_operation_cellwise<4>(cell, src, cell_function);
+#ifndef DEBUG
+    else if(degree == 5)
+      do_cell_operation_cellwise<5>(cell, src, cell_function);
+    else if(degree == 6)
+      do_cell_operation_cellwise<6>(cell, src, cell_function);
+    else if(degree == 7)
+      do_cell_operation_cellwise<7>(cell, src, cell_function);
+    else if(degree == 8)
+      do_cell_operation_cellwise<8>(cell, src, cell_function);
+#endif
+    else
+      AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
+  }
+
+  // Apply the operator on a cell batch like do_cell_operation() and pass
+  // the result in the layout of read_cell_dofs() to cell_function
+  template<int degree, typename CellFunction>
+  void
+  do_cell_operation_cellwise(const unsigned int   cell,
+                             const VectorType &   src,
+                             const CellFunction & cell_function) const
+  {
+    constexpr unsigned int n_q_points_1d = degree + 1;
+    constexpr unsigned int n_points      = Utilities::pow(n_q_points_1d, dim);
+    const auto &           shape_data    = shape_info.data[0];
+
+    VectorizedArray<Number> quad_values[n_points], out_values[n_points];
+    read_cell_values<degree + 1, n_q_points_1d>(src.begin(), dof_indices[cell], quad_values);
+    compute_cell_lapl<n_q_points_1d>(
+      shape_data, mapping_info, cell, factor_mass, factor_laplace, quad_values, out_values);
+    for(unsigned int f = 0; f < 2 * dim; ++f)
+      compute_face<degree, true>(shape_data, src, cell, f, quad_values, out_values);
+    integrate_cell_in_place<degree + 1>(out_values);
+    cell_function(cell, static_cast<VectorizedArray<Number> *>(out_values));
+  }
+
+  // Compute the eigenvectors and eigenvalues of the 1D matrices of the
+  // Cartesian surrogate of each cell, see setup_block_inverse()
+  template<int degree>
+  void
+  do_setup_block_inverse()
+  {
+    constexpr unsigned int nn            = degree + 1;
+    constexpr unsigned int n_q_points_1d = degree + 1;
+    constexpr unsigned int n_q_points_2d = n_q_points_1d * n_q_points_1d;
+    const auto &           shape_data    = shape_info.data[0];
+
+    // traces of the shape functions and their derivatives on the left and
+    // right end of the unit interval as in compute_diagonal_cell()
+    double trace_value[2][nn], trace_derivative[2][nn];
+    for(unsigned int side = 0; side < 2; ++side)
+      for(unsigned int i = 0; i < nn; ++i)
+      {
+        double value = 0, derivative = 0;
+        for(unsigned int q = 0; q < n_q_points_1d; ++q)
+        {
+          value += interpolate_quad_to_boundary[side][q][0] * shape_data.shape_values[i * nn + q];
+          derivative +=
+            interpolate_quad_to_boundary[side][q][1] * shape_data.shape_values[i * nn + q];
+        }
+        trace_value[side][i]      = value;
+        trace_derivative[side][i] = derivative;
+      }
+
+    // 1D mass and stiffness matrices on the unit interval
+    std::array<double, nn * nn> mass_ref, stiffness_ref;
+    for(unsigned int i = 0; i < nn; ++i)
+      for(unsigned int j = 0; j < nn; ++j)
+      {
+        double m = 0, k = 0;
+        for(unsigned int q = 0; q < n_q_points_1d; ++q)
+        {
+          const double w = mapping_info.quad_weights_z[q];
+          m += w * shape_data.shape_values[i * nn + q] * shape_data.shape_values[j * nn + q];
+          k += w * shape_data.shape_gradients[i * nn + q] * shape_data.shape_gradients[j * nn + q];
+        }
+        mass_ref[i * nn + j]      = m;
+        stiffness_ref[i * nn + j] = k;
+      }
+
+    const unsigned int n_batches = n_cell_batches();
+    block_eigenvectors.resize_fast(n_batches * dim * nn * nn);
+    block_eigenvalues.resize_fast(n_batches * dim * nn);
+    std::array<double, nn * nn> mass, laplace, eigenvectors;
+    std::array<double, nn>      eigenvalues;
+    for(unsigned int cell = 0; cell < n_batches; ++cell)
+    {
+      const unsigned int n_active = n_active_entries_per_cell_batch(cell);
+      for(unsigned int v = 0; v < n_lanes; ++v)
+      {
+        const unsigned int lane = v < n_active ? v : 0;
+
+        // extents of the Cartesian surrogate
+        std::array<double, dim> h;
+        {
+          const unsigned int base = mapping_info.mapping_data_index[cell][lane];
+          double             h0 = 0, h1 = 0, weight_sum = 0;
+          for(unsigned int q = 0; q < n_q_points_2d; ++q)
+          {
+            const double w   = mapping_info.quad_weights_xy[q];
+            const auto & jac = mapping_info.jacobians_xy[base + q];
+            h0 += w * std::sqrt(jac[0][0] * jac[0][0] + jac[1][0] * jac[1][0]);
+            h1 += w * std::sqrt(jac[0][1] * jac[0][1] + jac[1][1] * jac[1][1]);
+            weight_sum += w;
+          }
+          h[0] = h0 / weight_sum;
+          h[1] = h1 / weight_sum;
+          if constexpr(dim == 3)
+            h[2] = mapping_info.h_z;
+        }
+
+        for(unsigned int d = 0; d < dim; ++d)
+        {
+          for(unsigned int i = 0; i < nn * nn; ++i)
+          {
+            mass[i]    = h[d] * mass_ref[i];
+            laplace[i] = factor_laplace / h[d] * stiffness_ref[i];
+          }
+          for(unsigned int side = 0; side < 2; ++side)
+          {
+            const unsigned int f = 2 * d + side;
+            // faces in z direction are always interior faces, see
+            // compute_face()
+            const bool interior =
+              d == 2 || neighbor_cells[cell][f][lane] != numbers::invalid_unsigned_int;
+            if(!interior)
+              continue;
+            const double sigma             = penalty_parameters[cell][f][lane] * factor_laplace;
+            const double factor_derivative = 0.5 * factor_laplace * (side == 1 ? 1. : -1.) / h[d];
+            for(unsigned int i = 0; i < nn; ++i)
+              for(unsigned int j = 0; j < nn; ++j)
+                laplace[i * nn + j] +=
+                  sigma * trace_value[side][i] * trace_value[side][j] -
+                  factor_derivative * (trace_derivative[side][i] * trace_value[side][j] +
+                                       trace_value[side][i] * trace_derivative[side][j]);
+          }
+          dealii::internal::TensorProductMatrixSymmetricSum::spectral_assembly<double>(
+            mass.data(), laplace.data(), nn, nn, eigenvalues.data(), eigenvectors.data());
+
+          VectorizedArray<Number> * stored_vectors =
+            block_eigenvectors.data() + (cell * dim + d) * nn * nn;
+          VectorizedArray<Number> * stored_values =
+            block_eigenvalues.data() + (cell * dim + d) * nn;
+          for(unsigned int i = 0; i < nn * nn; ++i)
+            stored_vectors[i][v] = eigenvectors[i];
+          // the mass term is the identity in the eigenbasis of all
+          // directions, so add it in equal parts to each direction
+          for(unsigned int i = 0; i < nn; ++i)
+            stored_values[i][v] = eigenvalues[i] + factor_mass / dim;
+        }
+      }
+    }
+  }
+
+  // Apply the inverse of the surrogate block by fast diagonalization in
+  // place
+  template<int degree>
+  void
+  do_apply_fdm_cell(const unsigned int cell, VectorizedArray<Number> * values) const
+  {
+    constexpr unsigned int                           nn = degree + 1;
+    std::array<const VectorizedArray<Number> *, dim> eigenvectors, eigenvalues;
+    for(unsigned int d = 0; d < dim; ++d)
+    {
+      eigenvectors[d] = block_eigenvectors.data() + (cell * dim + d) * nn * nn;
+      eigenvalues[d]  = block_eigenvalues.data() + (cell * dim + d) * nn;
+    }
+    dealii::internal::TensorProductMatrixSymmetricSum::apply_inverse<nn>(
+      values, values, nn, eigenvectors, eigenvalues);
+  }
+
+  // Apply the approximate inverse of the cell block A_K: the fast
+  // diagonalization z = P^{-1} r, followed by 'n_iterations' steps of the
+  // preconditioned Richardson iteration z += P^{-1} (r - A_K z) with the
+  // actual cell block. With a fixed number of steps, the result is a
+  // linear and symmetric operator in r, as needed by the Chebyshev
+  // iteration.
+  template<int degree>
+  void
+  do_apply_block_inverse_cell(const unsigned int        cell,
+                              VectorizedArray<Number> * values,
+                              const unsigned int        n_iterations) const
+  {
+    constexpr unsigned int dofs_per_cell = Utilities::pow(degree + 1, dim);
+    if(n_iterations == 0)
+    {
+      do_apply_fdm_cell<degree>(cell, values);
+      return;
+    }
+    VectorizedArray<Number> rhs[dofs_per_cell], correction[dofs_per_cell];
+    for(unsigned int i = 0; i < dofs_per_cell; ++i)
+      rhs[i] = values[i];
+    do_apply_fdm_cell<degree>(cell, values);
+    for(unsigned int it = 0; it < n_iterations; ++it)
+    {
+      do_apply_cell_block<degree>(cell, values, correction);
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        correction[i] = rhs[i] - correction[i];
+      do_apply_fdm_cell<degree>(cell, correction);
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        values[i] += correction[i];
+    }
+  }
+
+  // Apply the block of the operator on the cells of a batch to the cell
+  // values 'in' (layout of read_cell_dofs()) and write the result to 'out':
+  // the cell integral and the face integrals with zero exterior values on
+  // interior faces and the mirror principle on boundary faces
+  template<int degree>
+  void
+  do_apply_cell_block(const unsigned int              cell,
+                      const VectorizedArray<Number> * in,
+                      VectorizedArray<Number> *       out) const
+  {
+    constexpr unsigned int          nn            = degree + 1;
+    constexpr unsigned int          n_q_points_1d = degree + 1;
+    constexpr unsigned int          n_points      = Utilities::pow(n_q_points_1d, dim);
+    constexpr unsigned int          n_points_2d   = n_q_points_1d * n_q_points_1d;
+    const auto &                    shape_data    = shape_info.data[0];
+    const Number * DEAL_II_RESTRICT shape         = shape_data.shape_values_eo.data();
+
+    // interpolate to the quadrature points as in read_cell_values()
+    VectorizedArray<Number> quad_values[n_points], out_values[n_points];
+    for(unsigned int i_z = 0; i_z < (dim > 2 ? nn : 1); ++i_z)
+    {
+      const VectorizedArray<Number> * in_z  = in + i_z * nn * nn;
+      VectorizedArray<Number> *       out_z = quad_values + i_z * n_points_2d;
+      for(unsigned int i_y = 0; i_y < nn; ++i_y)
+        internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                              internal::EvaluatorQuantity::value,
+                                              nn,
+                                              n_q_points_1d,
+                                              1,
+                                              1,
+                                              true,
+                                              false>(shape,
+                                                     in_z + i_y * nn,
+                                                     out_z + i_y * n_q_points_1d);
+      for(unsigned int i_x = 0; i_x < n_q_points_1d; ++i_x)
+        internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                              internal::EvaluatorQuantity::value,
+                                              nn,
+                                              n_q_points_1d,
+                                              n_q_points_1d,
+                                              n_q_points_1d,
+                                              true,
+                                              false>(shape, out_z + i_x, out_z + i_x);
+    }
+    if constexpr(dim == 3)
+      for(unsigned int i = 0; i < n_points_2d; ++i)
+        internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                              internal::EvaluatorQuantity::value,
+                                              nn,
+                                              n_q_points_1d,
+                                              n_points_2d,
+                                              n_points_2d,
+                                              true,
+                                              false>(shape, quad_values + i, quad_values + i);
+
+    compute_cell_lapl<n_q_points_1d>(
+      shape_data, mapping_info, cell, factor_mass, factor_laplace, quad_values, out_values);
+    if(factor_laplace != 0.)
+      for(unsigned int f = 0; f < 2 * dim; ++f)
+        compute_face<degree, false>(shape_data, empty_vector, cell, f, quad_values, out_values);
+    integrate_cell_in_place<nn>(out_values);
+    for(unsigned int i = 0; i < n_points; ++i)
+      out[i] = out_values[i];
   }
 
   // Set up the scratch array of vmult_scratch() with the cells as entities

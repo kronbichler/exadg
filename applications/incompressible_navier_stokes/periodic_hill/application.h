@@ -457,6 +457,11 @@ public:
       prm.add_parameter("MomentumLinearSolver",
                         momentum_solver_type,
                         "Iterative solver chosen for the momentum (viscous) solver");
+      prm.add_parameter("PressureSmootherPreconditioner",
+                        pressure_smoother_preconditioner,
+                        "Preconditioner within the Chebyshev smoother on the DG level of the "
+                        "pressure multigrid: PointJacobi or BlockJacobi (fast diagonalization "
+                        "on a Cartesian surrogate of each cell), only for the extruded schemes");
       prm.add_parameter("Inviscid",
                         inviscid,
                         "Consider inviscid flow, i.e., zero viscosity.",
@@ -687,6 +692,8 @@ private:
       SolverData(1000, abs_tol_lin, rel_tol_lin_ppe, LinearSolver::CG, 100);
     this->param.preconditioner_pressure_poisson      = PreconditionerPressurePoisson::Multigrid;
     this->param.multigrid_data_pressure_poisson.type = MultigridType::cphMG;
+    this->param.multigrid_data_pressure_poisson.smoother_data.preconditioner =
+      pressure_smoother_preconditioner;
     this->param.multigrid_data_pressure_poisson.coarse_problem.solver =
       MultigridCoarseGridSolver::Chebyshev;
     this->param.multigrid_data_pressure_poisson.coarse_problem.preconditioner =
@@ -1604,6 +1611,8 @@ private:
   TriangulationType      triangulation_type      = TriangulationType::Distributed;
   SpatialDiscretization  spatial_discretization  = SpatialDiscretization::L2;
   LinearSolver           momentum_solver_type    = LinearSolver::CG;
+
+  PreconditionerSmoother pressure_smoother_preconditioner = PreconditionerSmoother::BlockJacobi;
 
   // postprocessing
 

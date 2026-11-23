@@ -293,6 +293,14 @@ private:
   Utilities::StatisticalQuantity stat_pressure_time_rhs;
   Utilities::StatisticalQuantity stat_pressure_time_projection;
   Utilities::StatisticalQuantity stat_pressure_time_solve;
+  // residual after the first V-cycle relative to the target residual, and
+  // the residual reduction of the first V-cycle, plus a histogram of the
+  // former (bin limits in pressure_first_vcycle_bins, last bin open)
+  Utilities::StatisticalQuantity stat_pressure_first_vcycle_vs_target;
+  Utilities::StatisticalQuantity stat_pressure_first_vcycle_reduction;
+  std::vector<double>            pressure_first_vcycle_bins;
+  std::vector<unsigned long>     pressure_first_vcycle_histogram;
+  std::vector<double>            pressure_residual_history;
 
   Utilities::StatisticalQuantity stat_momentum_iterations_cg;
   Utilities::StatisticalQuantity stat_momentum_iterations_cheby;

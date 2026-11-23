@@ -23,6 +23,39 @@ DG degree 1, double, 768 cells, 6144 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
 
 DG degree 1, float, 768 cells, 6144 DoFs
  factor mass 0, factor Laplace 1
@@ -49,6 +82,39 @@ DG degree 1, float, 768 cells, 6144 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
 
 DG degree 2, double, 768 cells, 20736 DoFs
  factor mass 0, factor Laplace 1
@@ -75,6 +141,39 @@ DG degree 2, double, 768 cells, 20736 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
 
 DG degree 2, float, 768 cells, 20736 DoFs
  factor mass 0, factor Laplace 1
@@ -101,6 +200,39 @@ DG degree 2, float, 768 cells, 20736 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
 
 DG degree 3, double, 768 cells, 49152 DoFs
  factor mass 0, factor Laplace 1
@@ -127,6 +259,39 @@ DG degree 3, double, 768 cells, 49152 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
 
 DG degree 3, float, 768 cells, 49152 DoFs
  factor mass 0, factor Laplace 1
@@ -153,4 +318,37 @@ DG degree 3, float, 768 cells, 49152 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
 

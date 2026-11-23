@@ -5462,6 +5462,14 @@ private:
     constexpr unsigned int n_pressure    = Utilities::pow(degree, dim);
     const auto &           shape_data    = convective_shape_info.data;
 
+    // TODO: Do all of 'face_data', 'values_y', 'dof_values', 'pressure_y',
+    // 'pressure_dofs' need to live at the same time? We should try to have
+    // 'values_y' and 'dof_values' share the data (it means we need to
+    // slightly rework the 'compute_face_convective' as we have a mix of
+    // collocated/non-collocated setup). The evaluators support the in-place
+    // update, if we manage to sweep through in forward/backward mode
+    // appropriately (check FEEvaluationImplBasisChange in deal.II's
+    // evaluation_kernels.h).
     VectorizedArray<Number> values_y[n_layered];
     VectorizedArray<Number> derivatives_y[n_layered];
     VectorizedArray<Number> pressure_y[3 * n_q_points_1d * degree * degree];

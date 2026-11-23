@@ -300,4 +300,128 @@ check_chebyshev(dealii::ConditionalOStream &      pcout,
   }
 }
 
+// Compare the fourth-kind variants of ExaDG::PreconditionChebyshevScratch:
+// the plain fourth kind against the fourth_kind variant of
+// dealii::PreconditionChebyshev, and the variant with optimized weights
+// against a direct implementation of the algorithm with the vectors x, r,
+// d as in Lottes (2023) and PETSc's KSP_CHEBYSHEV_OPT_FOURTH. The vectors
+// are set up as in check_chebyshev().
+template<typename Operator, typename VectorType>
+void
+check_chebyshev_fourth_kind(dealii::ConditionalOStream &      pcout,
+                            const Operator &                  op,
+                            const VectorType &                inverse_diagonal,
+                            const double                      tolerance,
+                            const std::vector<unsigned int> & constrained_dofs = {})
+{
+  using PreconditionerType = dealii::DiagonalMatrix<VectorType>;
+  using Number             = typename VectorType::value_type;
+  using Scratch            = ExaDG::PreconditionChebyshevScratch<Operator>;
+
+  typename Scratch::AdditionalData data;
+  typename dealii::PreconditionChebyshev<Operator, VectorType, PreconditionerType>::AdditionalData
+    data_dealii;
+  data_dealii.preconditioner               = std::make_shared<PreconditionerType>();
+  data_dealii.preconditioner->get_vector() = inverse_diagonal;
+  if constexpr(std::is_same_v<Number, float>)
+    ExaDG::round_to_bf16(data_dealii.preconditioner->get_vector(), data.preconditioner_bf16);
+  data_dealii.degree              = 5;
+  data_dealii.max_eigenvalue      = 2.5;
+  data_dealii.smoothing_range     = 20.;
+  data_dealii.eig_cg_n_iterations = 0;
+  data_dealii.polynomial_type =
+    dealii::PreconditionChebyshev<Operator, VectorType, PreconditionerType>::AdditionalData::
+      PolynomialType::fourth_kind;
+  dealii::PreconditionChebyshev<Operator, VectorType, PreconditionerType> chebyshev_dealii;
+  chebyshev_dealii.initialize(op, data_dealii);
+
+  if constexpr(!std::is_same_v<Number, float>)
+    data.preconditioner = data_dealii.preconditioner;
+  data.degree          = data_dealii.degree;
+  data.smoothing_range = data_dealii.smoothing_range;
+  data.max_eigenvalue  = data_dealii.max_eigenvalue;
+
+  VectorType rhs, initial, reference, result;
+  op.initialize_dof_vector(rhs);
+  op.initialize_dof_vector(initial);
+  fill_vector(rhs, 1);
+  fill_vector(initial, 2);
+  for(const unsigned int i : constrained_dofs)
+  {
+    rhs.local_element(i)     = 0;
+    initial.local_element(i) = 0;
+  }
+
+  // the optimized fourth-kind iteration with x, r, d
+  const VectorType & diagonal = data_dealii.preconditioner->get_vector();
+  const auto         reference_optimized =
+    [&](VectorType & x, const bool zero_initial_guess, const unsigned int degree) {
+      const std::vector<double> betas = Scratch::get_optimized_fourth_kind_weights(degree);
+      const double              rho   = data.max_eigenvalue;
+      VectorType                r, d, tmp;
+      op.initialize_dof_vector(r);
+      op.initialize_dof_vector(d);
+      op.initialize_dof_vector(tmp);
+      if(zero_initial_guess)
+      {
+        x = 0;
+        r = rhs;
+      }
+      else
+      {
+        op.vmult(r, x);
+        r.sadd(-1., 1., rhs);
+      }
+      d.equ(4. / (3. * rho), r);
+      d.scale(diagonal);
+      for(unsigned int i = 1; i < degree; ++i)
+      {
+        x.add(betas[i - 1], d);
+        op.vmult(tmp, d);
+        r -= tmp;
+        tmp = r;
+        tmp.scale(diagonal);
+        d.sadd((2. * i - 1.) / (2. * i + 3.), (8. * i + 4.) / ((2. * i + 3.) * rho), tmp);
+      }
+      x.add(betas[degree - 1], d);
+    };
+
+  for(const auto type :
+      {Scratch::PolynomialType::fourth_kind, Scratch::PolynomialType::fourth_kind_optimized})
+  {
+    data.polynomial_type = type;
+    Scratch chebyshev;
+    chebyshev.initialize(op, data);
+    const std::string kind =
+      type == Scratch::PolynomialType::fourth_kind ? "4th kind" : "opt. 4th kind";
+
+    for(const unsigned int degree : {1, 2, 5})
+    {
+      chebyshev_dealii.set_degree(degree);
+      chebyshev.set_degree(degree);
+      const std::string name = "Chebyshev " + kind + " degree " + std::to_string(degree) + " ";
+
+      op.initialize_dof_vector(reference);
+      op.initialize_dof_vector(result);
+      if(type == Scratch::PolynomialType::fourth_kind)
+        chebyshev_dealii.vmult(reference, rhs);
+      else
+        reference_optimized(reference, true, degree);
+      chebyshev.vmult(result, rhs);
+      result -= reference;
+      print_check(pcout, name + "vmult", result.linfty_norm(), reference.linfty_norm(), tolerance);
+
+      reference = initial;
+      result    = initial;
+      if(type == Scratch::PolynomialType::fourth_kind)
+        chebyshev_dealii.step(reference, rhs);
+      else
+        reference_optimized(reference, false, degree);
+      chebyshev.step(result, rhs);
+      result -= reference;
+      print_check(pcout, name + "step", result.linfty_norm(), reference.linfty_norm(), tolerance);
+    }
+  }
+}
+
 } // namespace ExtrudedTest

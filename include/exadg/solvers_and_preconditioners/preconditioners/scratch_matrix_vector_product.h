@@ -25,6 +25,7 @@
 #include <deal.II/base/exceptions.h>
 #include <deal.II/base/mpi.h>
 #include <deal.II/base/partitioner.h>
+#include <deal.II/base/timer.h>
 #include <deal.II/lac/la_parallel_vector.h>
 
 #include <algorithm>
@@ -207,13 +208,21 @@ public:
    * batch into the scratch array at the positions given by scratch_index(),
    * and pass the finished ranges to 'after_loop'. If given, the function
    * 'gap_operation(begin, end, values)' sets the result for the ranges of
-   * entries not part of any entity, which are zero otherwise.
+   * entries not part of any entity, which are zero otherwise. If given,
+   * 'after_batch(cell, scratch)' runs at the end of the step of each cell
+   * batch, after the ranges finished by it have been passed to
+   * 'after_loop', with the scratch array, whose entries of entities written
+   * last by this cell batch are still valid.
    */
-  template<typename CellOperation, typename AfterLoop, typename GapOperation = std::nullptr_t>
+  template<typename CellOperation,
+           typename AfterLoop,
+           typename GapOperation = std::nullptr_t,
+           typename AfterBatch   = std::nullptr_t>
   void
   cell_loop(const CellOperation & cell_operation,
             const AfterLoop &     after_loop,
-            const GapOperation &  gap_operation = nullptr) const
+            const GapOperation &  gap_operation = nullptr,
+            const AfterBatch &    after_batch   = nullptr) const
   {
     Number *           scratch        = scratch_data.data();
     const unsigned int n_cell_batches = layout.zero_list_index.size() - 1;
@@ -246,6 +255,9 @@ public:
         const auto & [dof, offset, length] = layout.finalize_list[r];
         after_loop(dof, dof + length, scratch + offset);
       }
+
+      if constexpr(!std::is_same_v<AfterBatch, std::nullptr_t>)
+        after_batch(cell, scratch);
     }
   }
 
@@ -253,14 +265,26 @@ public:
    * Send the contributions to ghost entries to their owners, if enabled,
    * and pass the remaining ranges to 'after_loop'. The function
    * 'work_during_compress' is run while the messages are in flight. The
-   * function 'gap_operation' is the same as for cell_loop().
+   * function 'gap_operation' is the same as for cell_loop(). If
+   * 'phase_times' is given, the wall times of the three phases are added to
+   * its entries: [0] packing and sending including 'work_during_compress',
+   * [1] waiting for the messages, [2] passing the remaining ranges on.
    */
   template<typename AfterLoop, typename GapOperation = std::nullptr_t>
   void
   finish_loop(const AfterLoop &             after_loop,
               const std::function<void()> & work_during_compress,
-              const GapOperation &          gap_operation = nullptr) const
+              const GapOperation &          gap_operation = nullptr,
+              double *                      phase_times   = nullptr) const
   {
+    dealii::Timer timer;
+    const auto    record = [&](const unsigned int phase) {
+      if(phase_times != nullptr)
+      {
+        phase_times[phase] += timer.wall_time();
+        timer.restart();
+      }
+    };
     Number * scratch = scratch_data.data();
     if(compress_ghosts)
     {
@@ -269,7 +293,9 @@ public:
       compress_vector.compress_start(0, dealii::VectorOperation::add);
       if(work_during_compress)
         work_during_compress();
+      record(0);
       compress_vector.compress_finish(dealii::VectorOperation::add);
+      record(1);
 
       // add the local contributions to the ones received from the other
       // processes
@@ -281,16 +307,19 @@ public:
           gap_operation(dof, dof + length, mpi_dst + dof);
       for(const auto & [dof, offset, length] : layout.mpi_list)
         after_loop(dof, dof + length, mpi_dst + dof);
+      record(2);
     }
     else
     {
       if(work_during_compress)
         work_during_compress();
+      record(0);
       if constexpr(!std::is_same_v<GapOperation, std::nullptr_t>)
         for(const auto & [dof, offset, length] : layout.mpi_gap_list)
           gap_operation(dof, dof + length, scratch + offset);
       for(const auto & [dof, offset, length] : layout.mpi_list)
         after_loop(dof, dof + length, scratch + offset);
+      record(2);
     }
   }
 

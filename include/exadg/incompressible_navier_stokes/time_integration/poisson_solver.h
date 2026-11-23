@@ -1719,7 +1719,8 @@ public:
     const std::function<std::vector<dealii::Point<dim>>(
                                                         typename dealii::Triangulation<dim>::cell_iterator const)> & mapping_function,
                           const Number ip_factor,
-                          const bool is_test)
+                          const bool is_test,
+                          const bool dg_block_jacobi = false)
     : coarse_triangulations(
         dealii::MGTransferGlobalCoarseningTools::create_geometric_coarsening_sequence(
           dof_handler.get_triangulation()/*,
@@ -1728,6 +1729,7 @@ public:
       min_level(0),
       max_level(dof_handler.get_triangulation().n_global_levels() - 1 + fe_hierarchy.max_level()),
       is_test(is_test),
+      dg_block_jacobi(dg_block_jacobi),
       factor_for_zero_mean_with_constraints_l0(1.0)
   {
     dof_handler_hierarchy.resize(min_level, max_level);
@@ -1826,7 +1828,8 @@ public:
     const std::function<std::vector<dealii::Point<dim>>(
       typename dealii::Triangulation<dim>::cell_iterator const)> & mapping_function,
     const Number                                                   ip_factor,
-    const bool                                                     is_test)
+    const bool                                                     is_test,
+    const bool                                                     dg_block_jacobi = false)
     : coarse_triangulations(
         dealii::
           MGTransferGlobalCoarseningTools::create_geometric_coarsening_sequence(coarser_triangulations
@@ -1841,6 +1844,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       max_level(coarser_triangulations.size() + dof_handler.get_triangulation().n_global_levels() -
                 1 + fe_hierarchy.max_level()),
       is_test(is_test),
+      dg_block_jacobi(dg_block_jacobi),
       factor_for_zero_mean_with_constraints_l0(1.0)
   {
     dof_handler_hierarchy.resize(min_level, max_level);
@@ -2080,6 +2084,70 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
                           const Number                      ip_factor,
                           const std::vector<unsigned int> & cell_vectorization_category)
   {
+    // Settings of the Chebyshev smoothers, with overrides by environment
+    // variables for parameter studies:
+    // EXADG_PMG_CHEBYSHEV_KIND_DG / _FE = first | fourth | opt_fourth,
+    // EXADG_PMG_DEGREE_DG / _FE (FE levels of degree > 1) / _LINEAR,
+    // EXADG_PMG_EIG_FACTOR (safety factor on the eigenvalue estimate),
+    // EXADG_PMG_SMOOTHING_RANGE_DG (smoothing range on the DG level),
+    // EXADG_PMG_BLOCK_ITERATIONS (correction steps of the block inverse),
+    // EXADG_PMG_FE_BLOCK_JACOBI (block Jacobi on the FE levels: 1 on cells,
+    // 2 on patches of 2^dim cells, both basic, 3 on cells vectorized and
+    // embedded in the cell loop),
+    // EXADG_PMG_SMOOTHING_RANGE_FE (smoothing range on the FE levels).
+    const auto get_kind = [](const char * name) {
+      using PolynomialType = typename SmootherType::PolynomialType;
+      static_assert(std::is_same_v<PolynomialType, typename SmootherTypeDG::PolynomialType>);
+      const char * value = std::getenv(name);
+      if(value == nullptr || std::string(value) == "first")
+        return PolynomialType::first_kind;
+      else if(std::string(value) == "fourth")
+        return PolynomialType::fourth_kind;
+      else if(std::string(value) == "opt_fourth")
+        return PolynomialType::fourth_kind_optimized;
+      AssertThrow(false,
+                  ExcMessage(std::string("Unknown Chebyshev kind '") + value + "' in " + name));
+      return PolynomialType::first_kind;
+    };
+    const auto get_unsigned = [](const char * name, const unsigned int default_value) {
+      const char * value = std::getenv(name);
+      return value == nullptr ? default_value : static_cast<unsigned int>(std::atoi(value));
+    };
+    const auto kind_dg = get_kind("EXADG_PMG_CHEBYSHEV_KIND_DG");
+    const auto kind_fe = get_kind("EXADG_PMG_CHEBYSHEV_KIND_FE");
+    // Defaults on the DG level from a parameter study on the periodic hill
+    // (pressure degrees 4, 5, 7): with point Jacobi degree 4 and smoothing
+    // range 20; with block Jacobi degree 2 up to pressure degree 5 and
+    // degree 3 above, and smoothing range 6
+    const unsigned int pressure_degree = dof_handler.get_fe().degree;
+    // 1: blocks on single cells, 2: blocks on patches of 2^dim cells
+    const unsigned int fe_block_jacobi = get_unsigned("EXADG_PMG_FE_BLOCK_JACOBI", 0);
+    const double       range_fe        = std::getenv("EXADG_PMG_SMOOTHING_RANGE_FE") ?
+                                           std::atof(std::getenv("EXADG_PMG_SMOOTHING_RANGE_FE")) :
+                                           20.;
+    const auto         degree_dg =
+      get_unsigned("EXADG_PMG_DEGREE_DG", dg_block_jacobi ? (pressure_degree <= 5 ? 2 : 3) : 4);
+    const double range_dg      = std::getenv("EXADG_PMG_SMOOTHING_RANGE_DG") ?
+                                   std::atof(std::getenv("EXADG_PMG_SMOOTHING_RANGE_DG")) :
+                                   (dg_block_jacobi ? 6. : 20.);
+    const auto   degree_fe     = get_unsigned("EXADG_PMG_DEGREE_FE", 5);
+    const auto   degree_linear = get_unsigned("EXADG_PMG_DEGREE_LINEAR", 3);
+    const double eig_factor =
+      std::getenv("EXADG_PMG_EIG_FACTOR") ? std::atof(std::getenv("EXADG_PMG_EIG_FACTOR")) : 1.05;
+    if(not this->is_test && Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+    {
+      const auto name = [](const auto kind) {
+        using PolynomialType = typename SmootherType::PolynomialType;
+        return kind == PolynomialType::first_kind  ? "first" :
+               kind == PolynomialType::fourth_kind ? "fourth" :
+                                                     "opt_fourth";
+      };
+      std::cout << "Pressure MG Chebyshev smoothers: DG " << name(kind_dg) << " kind degree "
+                << degree_dg << " range " << range_dg << ", FE " << name(kind_fe) << " kind degree "
+                << degree_fe << " (linear " << degree_linear << "), eigenvalue factor "
+                << eig_factor << std::endl;
+    }
+
     // initialize levels
     for(unsigned int level = min_level; level <= max_level; level++)
     {
@@ -2094,9 +2162,34 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         ExaDG::round_to_bf16(smoother_data.preconditioner->get_vector(),
                              smoother_data.preconditioner_bf16);
 
-      smoother_data.smoothing_range = 20.;
+      smoother_data.smoothing_range = range_fe;
+      smoother_data.polynomial_type = kind_fe;
+
+      // basic block-Jacobi preconditioner with fast diagonalization on the
+      // FE levels of degree > 1 without hanging nodes, applied on whole
+      // vectors (EXADG_PMG_FE_BLOCK_JACOBI)
+      const bool try_block_jacobi =
+        fe_block_jacobi > 0 &&
+        mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree > 1;
+      // vectorized blocks embedded in the cell loop
+      const bool level_embedded_jacobi =
+        try_block_jacobi && fe_block_jacobi == 3 && mg_matrices[level].setup_block_batches();
+      const bool level_patch_jacobi =
+        try_block_jacobi && fe_block_jacobi == 2 &&
+        mg_matrices[level].setup_patch_block_inverse(level_constraints[level]);
+      const bool level_block_jacobi =
+        level_embedded_jacobi || level_patch_jacobi ||
+        (try_block_jacobi && mg_matrices[level].setup_block_inverse(level_constraints[level]));
+      const auto apply_block = [&matrix = mg_matrices[level],
+                                level_embedded_jacobi](VectorType & dst, const VectorType & src) {
+        if(level_embedded_jacobi)
+          matrix.apply_block_inverse_vectorized(dst, src);
+        else
+          matrix.apply_block_inverse(dst, src);
+      };
       smoother_data.degree =
-        mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree > 1 ? 5 : 3;
+        mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree > 1 ? degree_fe :
+                                                                                     degree_linear;
 
       // manually compute the eigenvalue estimate for Chebyshev because we
       // need to be careful with the constrained indices
@@ -2115,19 +2208,57 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
 
       dealii::internal::set_initial_guess(rhs[level]);
       make_zero_mean(mg_matrices[level].get_matrix_free().get_constrained_dofs(), rhs[level]);
-      solver.solve(mg_matrices[level],
-                   temp_vector[level],
-                   rhs[level],
-                   *smoother_data.preconditioner);
+      if(level_block_jacobi)
+      {
+        struct BlockInverse
+        {
+          void
+          vmult(VectorType & dst, const VectorType & src) const
+          {
+            function(dst, src);
+          }
+          std::function<void(VectorType &, const VectorType &)> function;
+        };
+        solver.solve(mg_matrices[level], temp_vector[level], rhs[level], BlockInverse{apply_block});
+      }
+      else
+        solver.solve(mg_matrices[level],
+                     temp_vector[level],
+                     rhs[level],
+                     *smoother_data.preconditioner);
 
       if(eigenvalue_tracker.values.empty())
         smoother_data.max_eigenvalue = 1.0;
       else
-        smoother_data.max_eigenvalue = 1.05 * eigenvalue_tracker.values.back();
+        smoother_data.max_eigenvalue = eig_factor * eigenvalue_tracker.values.back();
+
+      if(level_block_jacobi && not this->is_test &&
+         Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+        std::cout << "Pressure MG FE level " << level << " (degree "
+                  << mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree
+                  << "): block Jacobi (fast diagonalization) on "
+                  << (level_patch_jacobi    ? "patches of 2^dim cells" :
+                      level_embedded_jacobi ? "cells, vectorized in the cell loop" :
+                                              "cells")
+                  << ", max eigenvalue estimate "
+                  << (eigenvalue_tracker.values.empty() ? 0. : eigenvalue_tracker.values.back())
+                  << std::endl;
 
       // For float, we use the bf16 representation
       if constexpr(std::is_same_v<Number, float>)
         smoother_data.preconditioner.reset();
+      if(level_embedded_jacobi)
+      {
+        smoother_data.use_embedded_block_inverse = true;
+        smoother_data.preconditioner.reset();
+        smoother_data.preconditioner_bf16.clear();
+      }
+      else if(level_block_jacobi)
+      {
+        smoother_data.global_preconditioner = apply_block;
+        smoother_data.preconditioner.reset();
+        smoother_data.preconditioner_bf16.clear();
+      }
 
       mg_smoother[level].initialize(mg_matrices[level], smoother_data);
 
@@ -2167,8 +2298,9 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       if constexpr(std::is_same_v<Number, float>)
         ExaDG::round_to_bf16(smoother_data_dg.preconditioner->get_vector(),
                              smoother_data_dg.preconditioner_bf16);
-      smoother_data_dg.smoothing_range = 20.;
-      smoother_data_dg.degree          = 4;
+      smoother_data_dg.smoothing_range = range_dg;
+      smoother_data_dg.degree          = degree_dg;
+      smoother_data_dg.polynomial_type = kind_dg;
 
       // manually compute the eigenvalue estimate for Chebyshev because of
       // mean values
@@ -2186,16 +2318,59 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
 
       dealii::internal::set_initial_guess(rhs_dg);
       make_zero_mean({}, rhs_dg);
-      solver.solve(dg_matrix, solution_update_dg, rhs_dg, *smoother_data_dg.preconditioner);
+      if(dg_block_jacobi)
+      {
+        // block-Jacobi preconditioner with fast diagonalization on a
+        // Cartesian surrogate of each cell
+        dg_matrix.setup_block_inverse();
+        // optional correction of the inverse of the Cartesian surrogate by
+        // Richardson steps with the actual cell block
+        dg_matrix.set_block_inverse_iterations(get_unsigned("EXADG_PMG_BLOCK_ITERATIONS", 0));
+        if(not this->is_test)
+        {
+          std::array<double, 3> defects;
+          for(unsigned int i = 0; i < 3; ++i)
+            defects[i] = dg_matrix.compute_block_inverse_defect(i);
+          if(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+            std::cout << "Block inverse defect |r - A_K B r| / |r| with 0/1/2 correction steps: "
+                      << defects[0] << " / " << defects[1] << " / " << defects[2] << ", using "
+                      << get_unsigned("EXADG_PMG_BLOCK_ITERATIONS", 0) << std::endl;
+        }
+        struct BlockInverse
+        {
+          void
+          vmult(VectorType & dst, const VectorType & src) const
+          {
+            matrix.apply_block_inverse(dst, src);
+          }
+          const MatrixTypeDG & matrix;
+        };
+        solver.solve(dg_matrix, solution_update_dg, rhs_dg, BlockInverse{dg_matrix});
+      }
+      else
+        solver.solve(dg_matrix, solution_update_dg, rhs_dg, *smoother_data_dg.preconditioner);
 
       if(eigenvalue_tracker.values.empty())
         smoother_data_dg.max_eigenvalue = 1.0;
       else
-        smoother_data_dg.max_eigenvalue = 1.05 * eigenvalue_tracker.values.back();
+        smoother_data_dg.max_eigenvalue = eig_factor * eigenvalue_tracker.values.back();
+
+      if(not this->is_test && Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+        std::cout << "Pressure MG DG smoother preconditioner: "
+                  << (dg_block_jacobi ? "block Jacobi (fast diagonalization)" : "point Jacobi")
+                  << ", max eigenvalue estimate "
+                  << (eigenvalue_tracker.values.empty() ? 0. : eigenvalue_tracker.values.back())
+                  << std::endl;
 
       // For float, we use the bf16 representation
       if constexpr(std::is_same_v<Number, float>)
         smoother_data_dg.preconditioner.reset();
+      if(dg_block_jacobi)
+      {
+        smoother_data_dg.use_cell_block_inverse = true;
+        smoother_data_dg.preconditioner.reset();
+        smoother_data_dg.preconditioner_bf16.clear();
+      }
 
       mg_smoother_dg.initialize(dg_matrix, smoother_data_dg);
     }
@@ -2286,6 +2461,10 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
       }
       std::cout << std::endl;
     }
+    // phases of the FE level operators, finest level first (collective)
+    if(not this->is_test)
+      for(unsigned int level = mg_matrices.max_level() + 1; level-- > mg_matrices.min_level();)
+        mg_matrices[level].print_timings("on level " + std::to_string(level));
   }
 
   static dealii::MGLevelObject<std::unique_ptr<dealii::FE_Q<dim>>>
@@ -2328,7 +2507,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         const VectorTypeOuter & rhs,
         VectorTypeOuter &       sol,
         const unsigned int      n_max_iterations,
-        const double            target_residual) const
+        const double            target_residual,
+        std::vector<double> *   residual_history = nullptr) const
   {
     using Number2 = typename VectorTypeOuter::value_type;
     matrix.vmult_scratch(
@@ -2343,6 +2523,17 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
 
     dealii::IterationNumberControl control(n_max_iterations, target_residual);
     dealii::SolverCG<VectorType>   solver_cg(control);
+    // optionally record the (unpreconditioned) residual norm of every CG
+    // step, with entry 0 the initial residual
+    if(residual_history != nullptr)
+    {
+      residual_history->clear();
+      solver_cg.connect(
+        [residual_history](const unsigned int, const double check_value, const VectorType &) {
+          residual_history->push_back(check_value);
+          return dealii::SolverControl::success;
+        });
+    }
     solver_cg.solve(dg_matrix, solution_update_dg, rhs_dg, *this);
     DEAL_II_OPENMP_SIMD_PRAGMA
     for(unsigned int i = 0; i < solution_update_dg.locally_owned_size(); ++i)
@@ -2514,11 +2705,20 @@ private:
                                      const VectorType & rhs_dg,
                                      const VectorType & fe_correction) const
   {
-    mg_smoother_dg.step_with_first_product(solution, rhs_dg, [&](const auto & after_loop) {
-      dg_matrix.vmult_scratch_with_prolongation(solution,
-                                                fe_correction,
-                                                mg_matrices[max_level],
-                                                after_loop);
+    // the smoother hands over 'after_loop' for the ranges of the scratch
+    // array, or the cell function with the block-Jacobi preconditioner
+    mg_smoother_dg.step_with_first_product(solution, rhs_dg, [&](const auto & output) {
+      using Output = std::decay_t<decltype(output)>;
+      if constexpr(std::is_invocable_v<Output, unsigned int, VectorizedArrayType *>)
+        dg_matrix.vmult_cellwise_with_prolongation(solution,
+                                                   fe_correction,
+                                                   mg_matrices[max_level],
+                                                   output);
+      else
+        dg_matrix.vmult_scratch_with_prolongation(solution,
+                                                  fe_correction,
+                                                  mg_matrices[max_level],
+                                                  output);
     });
   }
 
@@ -2646,6 +2846,10 @@ private:
   const unsigned int max_level;
 
   bool const is_test;
+
+  // use the block-Jacobi preconditioner with fast diagonalization of
+  // LaplaceOperatorDG instead of the diagonal in the smoother of the DG level
+  bool const dg_block_jacobi;
 
   dealii::MGLevelObject<dealii::DoFHandler<dim>> dof_handler_hierarchy;
 

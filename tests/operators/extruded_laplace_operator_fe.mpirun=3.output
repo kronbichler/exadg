@@ -16,6 +16,18 @@ FE degree 1, double, 768 cells, 1053 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
   with before_loop within the cell loop
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
@@ -29,6 +41,18 @@ FE degree 1, double, 768 cells, 1053 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
 
 FE degree 1, float, 768 cells, 1053 DoFs
   vmult vs. Poisson::LaplaceOperator            : OK
@@ -48,6 +72,18 @@ FE degree 1, float, 768 cells, 1053 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
   with before_loop within the cell loop
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
@@ -61,6 +97,18 @@ FE degree 1, float, 768 cells, 1053 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
 
 FE degree 2, double, 768 cells, 7225 DoFs
   vmult vs. Poisson::LaplaceOperator            : OK
@@ -80,6 +128,18 @@ FE degree 2, double, 768 cells, 7225 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
   with before_loop within the cell loop
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
@@ -93,6 +153,71 @@ FE degree 2, double, 768 cells, 7225 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
 
 FE degree 2, float, 768 cells, 7225 DoFs
   vmult vs. Poisson::LaplaceOperator            : OK
@@ -112,6 +237,18 @@ FE degree 2, float, 768 cells, 7225 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
   with before_loop within the cell loop
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
@@ -125,6 +262,71 @@ FE degree 2, float, 768 cells, 7225 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
 
 FE degree 3, double, 768 cells, 23125 DoFs
   vmult vs. Poisson::LaplaceOperator            : OK
@@ -144,6 +346,18 @@ FE degree 3, double, 768 cells, 23125 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
   with before_loop within the cell loop
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
@@ -157,6 +371,71 @@ FE degree 3, double, 768 cells, 23125 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
 
 FE degree 3, float, 768 cells, 23125 DoFs
   vmult vs. Poisson::LaplaceOperator            : OK
@@ -176,6 +455,18 @@ FE degree 3, float, 768 cells, 23125 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
   with before_loop within the cell loop
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
@@ -189,6 +480,71 @@ FE degree 3, float, 768 cells, 23125 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
 
 FE degree 4, double, 768 cells, 53361 DoFs
   vmult vs. Poisson::LaplaceOperator            : OK
@@ -208,6 +564,18 @@ FE degree 4, double, 768 cells, 53361 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
   with before_loop within the cell loop
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
@@ -221,6 +589,71 @@ FE degree 4, double, 768 cells, 53361 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
 
 FE degree 4, float, 768 cells, 53361 DoFs
   vmult vs. Poisson::LaplaceOperator            : OK
@@ -240,6 +673,18 @@ FE degree 4, float, 768 cells, 53361 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
   with before_loop within the cell loop
   Chebyshev degree 1 vmult                      : OK
   Chebyshev degree 1 step                       : OK
@@ -253,4 +698,505 @@ FE degree 4, float, 768 cells, 53361 DoFs
   Chebyshev degree 4 step                       : OK
   Chebyshev degree 4 vmult_with_residual        : OK
   Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+
+Cartesian mesh, FE degree 2, double, 768 cells, 7225 DoFs
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  with before_loop within the cell loop
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+
+Cartesian mesh, FE degree 2, float, 768 cells, 7225 DoFs
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  with before_loop within the cell loop
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+
+Cartesian mesh, FE degree 3, double, 768 cells, 23125 DoFs
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  with before_loop within the cell loop
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+
+Cartesian mesh, FE degree 3, float, 768 cells, 23125 DoFs
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  with before_loop within the cell loop
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse set up                          : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  vectorized block inverse set up               : OK
+  vectorized block inverse symmetric            : OK
+  vectorized block inverse positive             : OK
+  Chebyshev embedded block 1st kind degree 1 vmult: OK
+  Chebyshev embedded block 1st kind degree 1 step: OK
+  Chebyshev embedded block 1st kind degree 1 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 2 vmult: OK
+  Chebyshev embedded block 1st kind degree 2 step: OK
+  Chebyshev embedded block 1st kind degree 2 last residual norm: OK
+  Chebyshev embedded block 1st kind degree 4 vmult: OK
+  Chebyshev embedded block 1st kind degree 4 step: OK
+  Chebyshev embedded block 1st kind degree 4 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 1 vmult: OK
+  Chebyshev embedded block 4th kind degree 1 step: OK
+  Chebyshev embedded block 4th kind degree 1 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 2 vmult: OK
+  Chebyshev embedded block 4th kind degree 2 step: OK
+  Chebyshev embedded block 4th kind degree 2 last residual norm: OK
+  Chebyshev embedded block 4th kind degree 4 vmult: OK
+  Chebyshev embedded block 4th kind degree 4 step: OK
+  Chebyshev embedded block 4th kind degree 4 last residual norm: OK
+  patch block inverse set up                    : OK
+  blocks: unknowns not in exactly one block     : 0
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
 

@@ -41,9 +41,318 @@
 
 using namespace ExtrudedTest;
 
+// Wrapper of the block-Jacobi preconditioner of LaplaceOperatorFE for
+// dealii::PreconditionChebyshev
+template<typename Operator>
+struct BlockInverseFE
+{
+  template<typename VectorType>
+  void
+  vmult(VectorType & dst, const VectorType & src) const
+  {
+    op->apply_block_inverse(dst, src);
+  }
+  const Operator * op;
+};
+
+// Checks of the block-Jacobi preconditioner of LaplaceOperatorFE: the
+// blocks form a partition of the unconstrained unknowns, the inverse is
+// symmetric and positive, the vector-based Chebyshev iteration agrees with
+// dealii::PreconditionChebyshev, and on a Cartesian mesh (in serial) the
+// inverse of the surrogate is the exact inverse of the blocks
+template<typename Operator>
+void
+check_block_inverse_fe(dealii::ConditionalOStream & pcout,
+                       const Operator &             op,
+                       const bool                   check_exactness)
+{
+  using VectorType = typename Operator::VectorType;
+  using Number     = typename VectorType::value_type;
+
+  // partition of the unknowns
+  {
+    VectorType count;
+    op.initialize_dof_vector(count);
+    for(unsigned int b = 0; b < op.n_blocks(); ++b)
+      for(const unsigned int i : op.get_block_indices(b))
+        count.local_element(i) += 1;
+    count.compress(dealii::VectorOperation::add);
+    std::vector<bool> constrained(count.locally_owned_size(), false);
+    for(const unsigned int i : op.get_matrix_free().get_constrained_dofs())
+      constrained[i] = true;
+    unsigned int n_wrong = 0;
+    for(unsigned int i = 0; i < count.locally_owned_size(); ++i)
+      if(count.local_element(i) != (constrained[i] ? 0 : 1))
+        ++n_wrong;
+    n_wrong = dealii::Utilities::MPI::sum(n_wrong, count.get_mpi_communicator());
+    pcout << "  " << std::left << std::setw(46) << "blocks: unknowns not in exactly one block"
+          << ": " << n_wrong << std::endl;
+  }
+
+  // symmetry and positivity
+  VectorType u, v, inverse_u, inverse_v;
+  op.initialize_dof_vector(u);
+  op.initialize_dof_vector(v);
+  op.initialize_dof_vector(inverse_u);
+  op.initialize_dof_vector(inverse_v);
+  fill_vector(u, 1);
+  fill_vector(v, 2);
+  for(const unsigned int i : op.get_matrix_free().get_constrained_dofs())
+  {
+    u.local_element(i) = 0;
+    v.local_element(i) = 0;
+  }
+  op.apply_block_inverse(inverse_u, u);
+  op.apply_block_inverse(inverse_v, v);
+  const double uv = inverse_u * v;
+  const double vu = inverse_v * u;
+  print_check(pcout,
+              "block inverse symmetric",
+              std::abs(uv - vu),
+              std::abs(uv) + std::abs(vu),
+              10. * tolerance<Number>());
+  pcout << "  " << std::left << std::setw(46) << "block inverse positive"
+        << ": " << ((inverse_u * u) > 0 ? "OK" : "FAILED") << std::endl;
+
+  // exactness on single blocks
+  if(check_exactness && dealii::Utilities::MPI::n_mpi_processes(u.get_mpi_communicator()) == 1)
+  {
+    double max_error = 0, max_value = 0;
+    for(const unsigned int b : {0u, op.n_blocks() / 3, (2 * op.n_blocks()) / 3, op.n_blocks() - 1})
+    {
+      const auto indices = op.get_block_indices(b);
+      u                  = 0;
+      for(unsigned int i = 0; i < indices.size(); ++i)
+        u.local_element(indices[i]) = std::sin(1. + i);
+      op.apply_block_inverse(inverse_u, u);
+      op.vmult(v, inverse_u);
+      for(const unsigned int i : indices)
+      {
+        max_error = std::max(max_error, std::abs<double>(v.local_element(i) - u.local_element(i)));
+        max_value = std::max(max_value, std::abs<double>(u.local_element(i)));
+      }
+    }
+    print_check(pcout,
+                "block times block inverse = identity",
+                max_error,
+                max_value,
+                (std::is_same_v<Number, double> ? 1e3 : 1e1) * tolerance<Number>());
+  }
+
+  // vector-based Chebyshev iteration
+  using Scratch = ExaDG::PreconditionChebyshevScratch<Operator>;
+  using DealII  = dealii::PreconditionChebyshev<Operator, VectorType, BlockInverseFE<Operator>>;
+  VectorType rhs, initial, reference, result;
+  op.initialize_dof_vector(rhs);
+  op.initialize_dof_vector(initial);
+  fill_vector(rhs, 1);
+  fill_vector(initial, 2);
+  for(const unsigned int i : op.get_matrix_free().get_constrained_dofs())
+  {
+    rhs.local_element(i)     = 0;
+    initial.local_element(i) = 0;
+  }
+  for(const auto type : {Scratch::PolynomialType::first_kind, Scratch::PolynomialType::fourth_kind})
+  {
+    typename DealII::AdditionalData data_dealii;
+    data_dealii.preconditioner      = std::make_shared<BlockInverseFE<Operator>>();
+    data_dealii.preconditioner->op  = &op;
+    data_dealii.degree              = 4;
+    data_dealii.smoothing_range     = 20.;
+    data_dealii.max_eigenvalue      = 2.;
+    data_dealii.eig_cg_n_iterations = 0;
+    data_dealii.polynomial_type     = type == Scratch::PolynomialType::first_kind ?
+                                        DealII::AdditionalData::PolynomialType::first_kind :
+                                        DealII::AdditionalData::PolynomialType::fourth_kind;
+    DealII chebyshev_dealii;
+    chebyshev_dealii.initialize(op, data_dealii);
+
+    typename Scratch::AdditionalData data;
+    data.polynomial_type       = type;
+    data.global_preconditioner = [&op](VectorType & dst, const VectorType & src) {
+      op.apply_block_inverse(dst, src);
+    };
+    data.degree          = data_dealii.degree;
+    data.smoothing_range = data_dealii.smoothing_range;
+    data.max_eigenvalue  = data_dealii.max_eigenvalue;
+    Scratch chebyshev;
+    chebyshev.initialize(op, data);
+
+    for(const unsigned int degree : {1, 2, 4})
+    {
+      chebyshev_dealii.set_degree(degree);
+      chebyshev.set_degree(degree);
+      const std::string name = std::string("Chebyshev block ") +
+                               (type == Scratch::PolynomialType::first_kind ? "1st" : "4th") +
+                               " kind degree " + std::to_string(degree) + " ";
+      op.initialize_dof_vector(reference);
+      op.initialize_dof_vector(result);
+      chebyshev_dealii.vmult(reference, rhs);
+      chebyshev.vmult(result, rhs);
+      result -= reference;
+      print_check(
+        pcout, name + "vmult", result.linfty_norm(), reference.linfty_norm(), tolerance<Number>());
+
+      reference = initial;
+      result    = initial;
+      chebyshev_dealii.step(reference, rhs);
+      chebyshev.step(result, rhs);
+      result -= reference;
+      print_check(
+        pcout, name + "step", result.linfty_norm(), reference.linfty_norm(), tolerance<Number>());
+    }
+  }
+}
+
+// Wrapper of the vectorized block-Jacobi preconditioner of
+// LaplaceOperatorFE for dealii::PreconditionChebyshev
+template<typename Operator>
+struct BlockInverseVectorizedFE
+{
+  template<typename VectorType>
+  void
+  vmult(VectorType & dst, const VectorType & src) const
+  {
+    op->apply_block_inverse_vectorized(dst, src);
+  }
+  const Operator * op;
+};
+
+// Checks of the vectorized block-Jacobi preconditioner embedded in the
+// cell loop: in serial, the application on whole vectors agrees with the
+// basic version of setup_block_inverse(), which must be set up (in
+// parallel, the vectorized version drops the unknowns of other
+// processes); it is symmetric and positive; and the Chebyshev iteration
+// with the embedded block updates agrees with dealii::PreconditionChebyshev
+// with the vectorized version applied on whole vectors
+template<typename Operator>
+void
+check_embedded_block_inverse_fe(dealii::ConditionalOStream & pcout, const Operator & op)
+{
+  using VectorType = typename Operator::VectorType;
+  using Number     = typename VectorType::value_type;
+
+  VectorType u, reference, result;
+  op.initialize_dof_vector(u);
+  op.initialize_dof_vector(reference);
+  op.initialize_dof_vector(result);
+  fill_vector(u, 3);
+  for(const unsigned int i : op.get_matrix_free().get_constrained_dofs())
+    u.local_element(i) = 0;
+  if(dealii::Utilities::MPI::n_mpi_processes(u.get_mpi_communicator()) == 1)
+  {
+    op.apply_block_inverse(reference, u);
+    op.apply_block_inverse_vectorized(result, u);
+    result -= reference;
+    print_check(pcout,
+                "vectorized vs. basic block inverse",
+                result.linfty_norm(),
+                reference.linfty_norm(),
+                10. * tolerance<Number>());
+  }
+  {
+    VectorType v, inverse_u, inverse_v;
+    op.initialize_dof_vector(v);
+    op.initialize_dof_vector(inverse_u);
+    op.initialize_dof_vector(inverse_v);
+    fill_vector(v, 4);
+    for(const unsigned int i : op.get_matrix_free().get_constrained_dofs())
+      v.local_element(i) = 0;
+    op.apply_block_inverse_vectorized(inverse_u, u);
+    op.apply_block_inverse_vectorized(inverse_v, v);
+    const double uv = inverse_u * v;
+    const double vu = inverse_v * u;
+    print_check(pcout,
+                "vectorized block inverse symmetric",
+                std::abs(uv - vu),
+                std::abs(uv) + std::abs(vu),
+                10. * tolerance<Number>());
+    pcout << "  " << std::left << std::setw(46) << "vectorized block inverse positive"
+          << ": " << ((inverse_u * u) > 0 ? "OK" : "FAILED") << std::endl;
+  }
+
+  using Scratch = ExaDG::PreconditionChebyshevScratch<Operator>;
+  using DealII =
+    dealii::PreconditionChebyshev<Operator, VectorType, BlockInverseVectorizedFE<Operator>>;
+  VectorType rhs, initial;
+  op.initialize_dof_vector(rhs);
+  op.initialize_dof_vector(initial);
+  fill_vector(rhs, 1);
+  fill_vector(initial, 2);
+  for(const unsigned int i : op.get_matrix_free().get_constrained_dofs())
+  {
+    rhs.local_element(i)     = 0;
+    initial.local_element(i) = 0;
+  }
+  for(const auto type : {Scratch::PolynomialType::first_kind, Scratch::PolynomialType::fourth_kind})
+  {
+    typename DealII::AdditionalData data_dealii;
+    data_dealii.preconditioner      = std::make_shared<BlockInverseVectorizedFE<Operator>>();
+    data_dealii.preconditioner->op  = &op;
+    data_dealii.degree              = 4;
+    data_dealii.smoothing_range     = 20.;
+    data_dealii.max_eigenvalue      = 2.;
+    data_dealii.eig_cg_n_iterations = 0;
+    data_dealii.polynomial_type     = type == Scratch::PolynomialType::first_kind ?
+                                        DealII::AdditionalData::PolynomialType::first_kind :
+                                        DealII::AdditionalData::PolynomialType::fourth_kind;
+    DealII chebyshev_dealii;
+    chebyshev_dealii.initialize(op, data_dealii);
+
+    typename Scratch::AdditionalData data;
+    data.polynomial_type            = type;
+    data.use_embedded_block_inverse = true;
+    data.degree                     = data_dealii.degree;
+    data.smoothing_range            = data_dealii.smoothing_range;
+    data.max_eigenvalue             = data_dealii.max_eigenvalue;
+    Scratch chebyshev;
+    chebyshev.initialize(op, data);
+
+    for(const unsigned int degree : {1, 2, 4})
+    {
+      chebyshev_dealii.set_degree(degree);
+      chebyshev.set_degree(degree);
+      const std::string name = std::string("Chebyshev embedded block ") +
+                               (type == Scratch::PolynomialType::first_kind ? "1st" : "4th") +
+                               " kind degree " + std::to_string(degree) + " ";
+      op.initialize_dof_vector(reference);
+      op.initialize_dof_vector(result);
+      chebyshev_dealii.vmult(reference, rhs);
+      chebyshev.vmult(result, rhs);
+      result -= reference;
+      print_check(pcout,
+                  name + "vmult",
+                  result.linfty_norm(),
+                  reference.linfty_norm(),
+                  10. * tolerance<Number>());
+
+      reference = initial;
+      result    = initial;
+      chebyshev_dealii.step(reference, rhs);
+      chebyshev.step(result, rhs);
+      result -= reference;
+      print_check(pcout,
+                  name + "step",
+                  result.linfty_norm(),
+                  reference.linfty_norm(),
+                  10. * tolerance<Number>());
+
+      op.initialize_dof_vector(reference);
+      op.initialize_dof_vector(result);
+      const double norm_reference = chebyshev_dealii.vmult_with_last_residual_norm(reference, rhs);
+      const double norm           = chebyshev.vmult_with_last_residual_norm(result, rhs);
+      print_check(pcout,
+                  name + "last residual norm",
+                  std::abs(norm - norm_reference),
+                  norm_reference,
+                  10. * tolerance<Number>());
+    }
+  }
+}
+
 template<typename Number>
 void
-test(const unsigned int degree, const unsigned int n_refinements)
+test(const unsigned int degree, const unsigned int n_refinements, const bool cartesian = false)
 {
   using VectorType = dealii::LinearAlgebra::distributed::Vector<Number>;
 
@@ -53,7 +362,8 @@ test(const unsigned int degree, const unsigned int n_refinements)
   dealii::parallel::distributed::Triangulation<dim> tria(comm);
   PeriodicFaces                                     periodic_faces;
   create_grid(tria, periodic_faces, n_refinements);
-  const auto mapping = create_mapping(tria, 3);
+  const std::shared_ptr<dealii::Mapping<dim>> mapping =
+    cartesian ? std::make_shared<dealii::MappingQ<dim>>(1) : create_mapping(tria, 3);
 
   dealii::FE_Q<dim>                 fe(degree);
   dealii::DoFHandler<dim>           dof_handler(tria);
@@ -86,9 +396,9 @@ test(const unsigned int degree, const unsigned int n_refinements)
   }
   make_constraints();
 
-  pcout << "FE degree " << degree << ", " << number_name<Number>() << ", "
-        << tria.n_global_active_cells() << " cells, " << dof_handler.n_dofs() << " DoFs"
-        << std::endl;
+  pcout << (cartesian ? "Cartesian mesh, " : "") << "FE degree " << degree << ", "
+        << number_name<Number>() << ", " << tria.n_global_active_cells() << " cells, "
+        << dof_handler.n_dofs() << " DoFs" << std::endl;
 
   LaplaceOperator::LaplaceOperatorFE<dim, Number> op;
   op.reinit(
@@ -157,10 +467,38 @@ test(const unsigned int degree, const unsigned int n_refinements)
     ExaDG::internal::has_vmult_scratch_with_before_loop<std::decay_t<decltype(op)>>::value);
   check_chebyshev(
     pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
+  check_chebyshev_fourth_kind(
+    pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
   op.set_min_size_for_pre_list(0);
   pcout << "  with before_loop within the cell loop" << std::endl;
   check_chebyshev(
     pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
+  check_chebyshev_fourth_kind(
+    pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
+
+  // block-Jacobi preconditioner with fast diagonalization
+  if(degree > 1)
+  {
+    const bool supported = op.setup_block_inverse(constraints);
+    pcout << "  " << std::left << std::setw(46) << "block inverse set up"
+          << ": " << (supported ? "OK" : "FAILED") << std::endl;
+    if(supported)
+      check_block_inverse_fe(pcout, op, cartesian);
+
+    // vectorized blocks embedded in the cell loop
+    const bool supported_embedded = op.setup_block_batches();
+    pcout << "  " << std::left << std::setw(46) << "vectorized block inverse set up"
+          << ": " << (supported_embedded ? "OK" : "FAILED") << std::endl;
+    if(supported && supported_embedded)
+      check_embedded_block_inverse_fe(pcout, op);
+
+    // blocks on patches of 2^dim cells
+    const bool supported_patch = op.setup_patch_block_inverse(constraints);
+    pcout << "  " << std::left << std::setw(46) << "patch block inverse set up"
+          << ": " << (supported_patch ? "OK" : "not supported") << std::endl;
+    if(supported_patch)
+      check_block_inverse_fe(pcout, op, cartesian);
+  }
   pcout << std::endl;
 }
 
@@ -173,5 +511,10 @@ main(int argc, char ** argv)
   {
     test<double>(degree, 2);
     test<float>(degree, 2);
+  }
+  for(const unsigned int degree : {2, 3})
+  {
+    test<double>(degree, 2, true);
+    test<float>(degree, 2, true);
   }
 }

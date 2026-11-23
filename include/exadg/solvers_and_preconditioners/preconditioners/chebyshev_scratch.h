@@ -30,10 +30,12 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace ExaDG
 {
@@ -73,6 +75,39 @@ struct has_vmult_scratch_with_before_loop<
                           const unsigned int,
                           const typename OperatorType::VectorType::value_type *)>()))>>
   : std::true_type
+{
+};
+
+// Detect operators that provide a block-Jacobi preconditioner applied cell
+// batch by cell batch, see LaplaceOperatorDG::apply_block_inverse_cell()
+template<typename OperatorType, typename = void>
+struct has_cell_block_inverse : std::false_type
+{
+};
+
+template<typename OperatorType>
+struct has_cell_block_inverse<
+  OperatorType,
+  std::void_t<decltype(std::declval<const OperatorType &>().apply_block_inverse_cell(
+    0u,
+    std::declval<dealii::VectorizedArray<typename OperatorType::VectorType::value_type> *>()))>>
+  : std::true_type
+{
+};
+// Detect operators with a block-Jacobi preconditioner embedded in the cell
+// loop of vmult_scratch(), see
+// LaplaceOperatorFE::vmult_scratch_with_block_update()
+template<typename OperatorType, typename = void>
+struct has_block_update : std::false_type
+{
+};
+
+template<typename OperatorType>
+struct has_block_update<
+  OperatorType,
+  std::void_t<decltype(std::declval<const OperatorType &>().apply_block_inverse_vectorized(
+    std::declval<typename OperatorType::VectorType &>(),
+    std::declval<const typename OperatorType::VectorType &>()))>> : std::true_type
 {
 };
 } // namespace internal
@@ -208,10 +243,32 @@ round_to_bf16(dealii::LinearAlgebra::distributed::Vector<float> & diagonal,
 
 
 
+// Polynomial of the iteration in PreconditionChebyshevScratch:
+// - first_kind: Chebyshev polynomial of the first kind on the interval
+//   [max_eigenvalue / smoothing_range, max_eigenvalue], as in
+//   dealii::PreconditionChebyshev;
+// - fourth_kind: Chebyshev polynomial of the fourth kind on the interval
+//   [0, max_eigenvalue] (Lottes, Numer. Linear Algebra Appl. 30:e2518,
+//   2023), identical to the fourth_kind variant of
+//   dealii::PreconditionChebyshev; smoothing_range is not used;
+// - fourth_kind_optimized: the fourth-kind polynomial with the weights
+//   beta_i optimized for multigrid smoothing by Lottes (2023), with the
+//   values from PETSc's KSP_CHEBYSHEV_OPT_FOURTH, for degree <= 12. It
+//   needs one additional vector to accumulate the weighted updates.
+enum class ChebyshevPolynomialType
+{
+  first_kind,
+  fourth_kind,
+  fourth_kind_optimized
+};
+
+
+
 /**
- * Chebyshev iteration of the first kind with a point-Jacobi preconditioner,
- * with the same coefficients as dealii::PreconditionChebyshev for given
- * bounds of the eigenvalues. The difference is in the vector updates: The
+ * Chebyshev iteration with a point-Jacobi preconditioner and a polynomial
+ * of the kind given by ChebyshevPolynomialType, with the same coefficients
+ * as dealii::PreconditionChebyshev for given bounds of the eigenvalues for
+ * the first and fourth kind. The difference is in the vector updates: The
  * operator provides a function template
  *
  *   vmult_scratch(src, after_loop(begin, end, values))
@@ -232,8 +289,12 @@ public:
   using VectorType = typename OperatorType::VectorType;
   using Number     = typename VectorType::value_type;
 
+  using PolynomialType = ChebyshevPolynomialType;
+
   struct AdditionalData
   {
+    PolynomialType polynomial_type = PolynomialType::first_kind;
+
     // inverse of the diagonal; if not set, the iteration uses
     // 'preconditioner_bf16' instead
     std::shared_ptr<dealii::DiagonalMatrix<VectorType>> preconditioner;
@@ -253,6 +314,36 @@ public:
 
     // number of matrix-vector products and preconditioner applications
     unsigned int degree = 1;
+
+    // Use the block-Jacobi preconditioner of the operator applied cell by
+    // cell instead of the diagonal: the operator provides
+    // vmult_cellwise(src, cell_function(cell, values)), handing over the
+    // matrix-vector product of each cell batch, read_cell_dofs(),
+    // write_cell_dofs(), apply_block_inverse_cell(), n_cell_batches(),
+    // n_active_lanes() and n_dofs_per_cell(), see LaplaceOperatorDG. Then,
+    // 'preconditioner' and 'preconditioner_bf16' are not used, the optimized
+    // fourth kind is not available, and step_with_first_product() passes a
+    // cell function instead of 'after_loop'.
+    bool use_cell_block_inverse = false;
+
+    // If set, a preconditioner dst = P^{-1} src applied on whole vectors,
+    // used with the plain vector-based Chebyshev iteration with the
+    // operator's vmult(): a basic variant for assessing preconditioners,
+    // without the scratch layout and without step_with_first_product() or
+    // the optimized fourth kind
+    std::function<void(VectorType &, const VectorType &)> global_preconditioner;
+
+    // Use the block-Jacobi preconditioner embedded in the cell loop of the
+    // operator, with blocks spanning several cells: the operator provides
+    // vmult_scratch_with_block_update(src, after_loop, rhs, residual,
+    // target, factor), which adds factor * P^{-1} (rhs - A src) into target
+    // as soon as the result is complete on a block,
+    // get_block_residual_chunks(), and apply_block_inverse_vectorized(dst,
+    // src), see LaplaceOperatorFE. The update in 'after_loop' then stores
+    // the part of the new iterate without the preconditioned residual, and
+    // the residual for the chunks the operator needs after the loop. Not
+    // available with the optimized fourth kind or step_with_first_product().
+    bool use_embedded_block_inverse = false;
   };
 
   void
@@ -262,8 +353,35 @@ public:
     // without 'preconditioner', the BF16 diagonal is used, which is only
     // available for float
     constexpr bool is_float = std::is_same_v<Number, float>;
-    AssertThrow(additional_data.preconditioner.get() != nullptr || is_float,
+    AssertThrow(additional_data.preconditioner.get() != nullptr || is_float ||
+                  additional_data.use_cell_block_inverse || additional_data.global_preconditioner ||
+                  additional_data.use_embedded_block_inverse,
                 dealii::ExcMessage("Chebyshev iteration needs a preconditioner"));
+    if(additional_data.use_embedded_block_inverse)
+    {
+      AssertThrow(internal::has_block_update<OperatorType>::value,
+                  dealii::ExcMessage("The operator does not provide an embedded block inverse"));
+      AssertThrow(additional_data.polynomial_type != PolynomialType::fourth_kind_optimized,
+                  dealii::ExcNotImplemented(
+                    "Optimized fourth kind with the embedded block inverse"));
+      matrix.initialize_dof_vector(global_residual);
+    }
+    if(additional_data.global_preconditioner)
+    {
+      AssertThrow(additional_data.polynomial_type != PolynomialType::fourth_kind_optimized,
+                  dealii::ExcNotImplemented(
+                    "Optimized fourth kind with the global preconditioner"));
+      matrix.initialize_dof_vector(global_residual);
+      matrix.initialize_dof_vector(global_update);
+    }
+    if(additional_data.use_cell_block_inverse)
+    {
+      AssertThrow(internal::has_cell_block_inverse<OperatorType>::value,
+                  dealii::ExcMessage("The operator does not provide a cell-wise block inverse"));
+      AssertThrow(additional_data.polynomial_type != PolynomialType::fourth_kind_optimized,
+                  dealii::ExcNotImplemented(
+                    "Optimized fourth kind with the cell-wise block inverse"));
+    }
     // solution_old may hold the source vector of the last product, which
     // other processes may still read
     if constexpr(internal::has_pending_source_reads<OperatorType>::value)
@@ -271,6 +389,16 @@ public:
         this->matrix->wait_until_source_vector_free();
     this->matrix = &matrix;
     data         = additional_data;
+    if(data.polynomial_type == PolynomialType::fourth_kind_optimized)
+    {
+      AssertThrow(data.degree <= max_optimized_degree,
+                  dealii::ExcMessage("Optimized fourth-kind weights are only available up to "
+                                     "degree " +
+                                     std::to_string(max_optimized_degree)));
+      matrix.initialize_dof_vector(accumulated_update);
+    }
+    else
+      accumulated_update.reinit(0);
 
     // lower end of the eigenvalue range as in dealii::PreconditionChebyshev
     const double alpha = data.smoothing_range > 1. ? data.max_eigenvalue / data.smoothing_range :
@@ -296,7 +424,95 @@ public:
   set_degree(const unsigned int degree)
   {
     Assert(degree > 0, dealii::ExcMessage("The degree must be positive"));
+    AssertThrow(data.polynomial_type != PolynomialType::fourth_kind_optimized ||
+                  degree <= max_optimized_degree,
+                dealii::ExcMessage("Optimized fourth-kind weights are only available up to "
+                                   "degree " +
+                                   std::to_string(max_optimized_degree)));
     data.degree = degree;
+  }
+
+  static constexpr unsigned int max_optimized_degree = 12;
+
+  // The weights beta_1, ..., beta_degree of the optimized fourth-kind
+  // Chebyshev smoother of the given degree (Lottes 2023, Table in PETSc's
+  // src/ksp/ksp/impls/cheby/betas.c)
+  static std::vector<double>
+  get_optimized_fourth_kind_weights(const unsigned int degree)
+  {
+    static const std::vector<std::vector<double>> weights = {
+      {1.12500000000000},
+      {1.02387287570313, 1.26408905371085},
+      {1.00842544782028, 1.08867839208730, 1.33753125909618},
+      {1.00391310427285, 1.04035811188593, 1.14863498546254, 1.38268869241000},
+      {1.00212930146164, 1.02173711549260, 1.07872433192603, 1.19810065292663, 1.41322542791682},
+      {1.00128517255940,
+       1.01304293035233,
+       1.04678215124113,
+       1.11616489419675,
+       1.23829020218444,
+       1.43524297106744},
+      {1.00083464397912,
+       1.00843949430122,
+       1.03008707768713,
+       1.07408384092003,
+       1.15036186707366,
+       1.27116474046139,
+       1.45186658649364},
+      {1.00057246631197,
+       1.00577427662415,
+       1.02050187922941,
+       1.05019803444565,
+       1.10115572984941,
+       1.18086042806856,
+       1.29838585382576,
+       1.46486073151099},
+      {1.00040960072832,
+       1.00412439506106,
+       1.01460212148266,
+       1.03561113626671,
+       1.07139972529194,
+       1.12688273710962,
+       1.20785219140729,
+       1.32121930716746,
+       1.47529642820699},
+      {1.00030312229652,
+       1.00304840660796,
+       1.01077022715387,
+       1.02619011597640,
+       1.05231724933755,
+       1.09255743207549,
+       1.15083376663972,
+       1.23172250870894,
+       1.34060802024460,
+       1.48386124407011},
+      {1.00023058595209,
+       1.00231675024028,
+       1.00817245396304,
+       1.01982986566342,
+       1.03950210235324,
+       1.06965042700541,
+       1.11305754295742,
+       1.17290876275564,
+       1.25288300576792,
+       1.35725579919519,
+       1.49101672564139},
+      {1.00017947200828,
+       1.00180189139619,
+       1.00634861907307,
+       1.01537864566306,
+       1.03056942830760,
+       1.05376019693943,
+       1.08699862592072,
+       1.13259183097913,
+       1.19316273358172,
+       1.27171293675110,
+       1.37169337969799,
+       1.49708418575562}};
+    AssertThrow(degree >= 1 && degree <= weights.size(),
+                dealii::ExcMessage("No optimized fourth-kind weights for degree " +
+                                   std::to_string(degree)));
+    return weights[degree - 1];
   }
 
   // Run the Chebyshev iteration with zero initial guess, like
@@ -321,7 +537,10 @@ public:
   // within the product before its entries are read. The function must call
   // 'after_loop' like vmult_scratch() and leave the final content of the
   // entries of solution passed to 'after_loop', which is the initial guess
-  // of the iteration.
+  // of the iteration. With 'use_cell_block_inverse', the function is
+  // called with the cell function of vmult_cellwise() instead, i.e.,
+  // 'first_product(cell_function)', and must hand over the product of each
+  // cell batch to it like vmult_cellwise().
   template<typename FirstProduct>
   void
   step_with_first_product(VectorType &         solution,
@@ -343,6 +562,16 @@ public:
   AdditionalData data;
 
 private:
+  // How the vector update accumulates the weighted updates of the optimized
+  // fourth-kind iteration, see update()
+  struct Accumulation
+  {
+    int    mode           = 0;
+    bool   read           = false;
+    Number scale_solution = 0;
+    Number beta_minus_1   = 0;
+  };
+
   template<typename FirstProduct = std::nullptr_t>
   double
   apply(const bool           zero_initial_guess,
@@ -354,6 +583,36 @@ private:
     constexpr bool has_first_product = !std::is_same_v<FirstProduct, std::nullptr_t>;
     if constexpr(has_first_product)
       AssertThrow(!zero_initial_guess, dealii::ExcNotImplemented());
+    if(data.use_embedded_block_inverse)
+    {
+      if constexpr(has_first_product || !internal::has_block_update<OperatorType>::value)
+      {
+        AssertThrow(false, dealii::ExcNotImplemented());
+        return 0.;
+      }
+      else
+        return apply_embedded_block(zero_initial_guess, solution, rhs, compute_final_norm);
+    }
+    if(data.global_preconditioner)
+    {
+      if constexpr(has_first_product)
+      {
+        AssertThrow(false, dealii::ExcNotImplemented());
+        return 0.;
+      }
+      else
+        return apply_global(zero_initial_guess, solution, rhs, compute_final_norm);
+    }
+    if(data.use_cell_block_inverse)
+    {
+      if constexpr(!internal::has_cell_block_inverse<OperatorType>::value)
+      {
+        AssertThrow(false, dealii::ExcNotImplemented());
+        return 0.;
+      }
+      else
+        return apply_block(zero_initial_guess, solution, rhs, compute_final_norm, first_product);
+    }
     const Number * rhs_ptr = rhs.begin();
     const Number * diagonal =
       data.preconditioner ? data.preconditioner->get_vector().begin() : nullptr;
@@ -374,8 +633,23 @@ private:
       internal::has_vmult_scratch_with_before_loop<OperatorType>::value;
     const bool fuse_first_step =
       can_fuse_first_step && zero_initial_guess && data.degree >= 2 && std::abs(delta) >= 1e-40;
-    const Number factor_first_step = 1. / theta;
-    const auto   run_first_step    = [&](const unsigned int begin, const unsigned int end) {
+
+    // The fourth-kind iteration of Lottes (2023) with the vectors x, r, d,
+    //   d_0 = 4/(3 rho) P^{-1} r_0,  y_{i} = y_{i-1} + d_{i-1},
+    //   d_i = (2i-1)/(2i+3) d_{i-1} + (8i+4)/((2i+3) rho) P^{-1} (b - A y_i),
+    // is written as the same three-term recurrence on y as for the first
+    // kind, using d_{i-1} = y_i - y_{i-1}. With optimized weights, the result
+    // is x = x_0 + sum_i beta_i d_{i-1} = y_degree + sum_i (beta_i - 1)
+    // d_{i-1}, where the sum is accumulated in a separate vector.
+    const bool fourth_kind = data.polynomial_type != PolynomialType::first_kind;
+    const bool optimized   = data.polynomial_type == PolynomialType::fourth_kind_optimized;
+    const std::vector<double> betas =
+      optimized ? get_optimized_fourth_kind_weights(data.degree) : std::vector<double>();
+    const double rho = data.max_eigenvalue;
+    const Number factor_first_step =
+      fourth_kind ? 4. / (3. * rho) * ((optimized && data.degree == 1) ? betas[0] : 1.) :
+                    1. / theta;
+    const auto run_first_step = [&](const unsigned int begin, const unsigned int end) {
       if constexpr(std::is_same_v<Number, float>)
         if(use_bf16)
         {
@@ -390,29 +664,43 @@ private:
     // One iteration with the matrix-vector product, where the first update
     // after a zero initial guess does not read the old solution. Returns the
     // residual norm if requested.
-    const auto iterate = [&](const bool   first_update,
-                             const bool   compute_norm,
-                             const Number factor1,
-                             const Number factor2,
-                             const bool   with_first_step = false) {
+    const auto iterate = [&](const bool           first_update,
+                             const bool           compute_norm,
+                             const Number         factor1,
+                             const Number         factor2,
+                             const bool           with_first_step = false,
+                             const Accumulation & accumulation    = Accumulation()) {
       const Number * solution_ptr = solution.begin();
       Number *       new_solution = solution_old.begin();
+      Number *       accumulated  = accumulated_update.begin();
       double         residual_sqr = 0;
       const auto     product      = [&](auto first_tag, auto norm_tag, auto bf16_tag) {
         const auto after_loop =
           [&](const unsigned int begin, const unsigned int end, const Number * matvec) {
-            const Number sum = update<decltype(first_tag)::value,
-                                      decltype(norm_tag)::value,
-                                      decltype(bf16_tag)::value>(begin,
-                                                                 end,
-                                                                 factor1,
-                                                                 factor2,
-                                                                 matvec,
-                                                                 rhs_ptr,
-                                                                 diagonal,
-                                                                 diagonal_bf16,
-                                                                 solution_ptr,
-                                                                 new_solution);
+            const auto run_update = [&](auto mode_tag) {
+              return update<decltype(first_tag)::value,
+                            decltype(norm_tag)::value,
+                            decltype(bf16_tag)::value,
+                            decltype(mode_tag)::value>(begin,
+                                                       end,
+                                                       factor1,
+                                                       factor2,
+                                                       matvec,
+                                                       rhs_ptr,
+                                                       diagonal,
+                                                       diagonal_bf16,
+                                                       solution_ptr,
+                                                       new_solution,
+                                                       accumulation,
+                                                       accumulated);
+            };
+            Number sum;
+            if(accumulation.mode == 0)
+              sum = run_update(std::integral_constant<int, 0>());
+            else if(accumulation.mode == 1)
+              sum = run_update(std::integral_constant<int, 1>());
+            else
+              sum = run_update(std::integral_constant<int, 2>());
             if constexpr(decltype(norm_tag)::value)
               residual_sqr += sum;
           };
@@ -487,7 +775,17 @@ private:
         residual_norm = rhs.l2_norm();
     }
     else
-      residual_norm = iterate(true, compute_final_norm && data.degree < 2, 0., 1. / theta);
+    {
+      // with optimized weights, start the accumulation of (beta_1 - 1) d_0
+      Accumulation accumulation;
+      if(optimized && data.degree >= 2)
+      {
+        accumulation.mode         = 1;
+        accumulation.beta_minus_1 = betas[0] - 1.;
+      }
+      residual_norm = iterate(
+        true, compute_final_norm && data.degree < 2, 0., factor_first_step, false, accumulation);
+    }
 
     // if delta is zero, we do not need to iterate because the updates will
     // be zero
@@ -498,18 +796,327 @@ private:
     const double sigma = theta / delta;
     for(unsigned int k = 0; k < data.degree - 1; ++k)
     {
-      const double rhokp = 1. / (2. * sigma - rhok);
-      const Number factor1(rhokp * rhok);
-      const Number factor2(2. * rhokp / delta);
-      rhok = rhokp;
+      Number factor1, factor2;
+      if(fourth_kind)
+      {
+        factor1 = (2. * k + 1.) / (2. * k + 5.);
+        factor2 = (8. * k + 12.) / ((2. * k + 5.) * rho);
+      }
+      else
+      {
+        const double rhokp = 1. / (2. * sigma - rhok);
+        factor1            = rhokp * rhok;
+        factor2            = 2. * rhokp / delta;
+        rhok               = rhokp;
+      }
+
+      // with optimized weights, add (beta_{k+2} - 1) d_{k+1} to the
+      // accumulated updates, which start from (beta_1 - 1) d_0 = (beta_1 - 1)
+      // y_1 after the first step with zero initial guess, and write the
+      // final result in the last iteration
+      Accumulation accumulation;
+      if(optimized)
+      {
+        accumulation.mode         = k + 2 == data.degree ? 2 : 1;
+        accumulation.beta_minus_1 = betas[k + 1] - 1.;
+        if(k == 0 && zero_initial_guess)
+          accumulation.scale_solution = betas[0] - 1.;
+        else
+          accumulation.read = true;
+      }
 
       residual_norm = iterate(zero_initial_guess && k == 0,
                               compute_final_norm && k + 2 == data.degree,
                               factor1,
                               factor2,
-                              fuse_first_step && k == 0);
+                              fuse_first_step && k == 0,
+                              accumulation);
     }
 
+    return residual_norm;
+  }
+
+  // Variant of apply() with the block-Jacobi preconditioner of the operator
+  // applied cell batch by cell batch: In each iteration, the operator hands
+  // the matrix-vector product of a cell batch to the update, which computes
+  // the residual on the cells, applies the inverse of the cell blocks, and
+  // writes x^{n+1} = x^n + f_1 (x^n - x^{n-1}) + f_2 P^{-1} (b - A x^n) over
+  // x^{n-1} as in update(). This is possible because the cells of a batch
+  // only write into their own entries. If given, the product of the first
+  // iteration with nonzero initial guess is computed by
+  // 'first_product(cell_function)' instead of
+  // matrix.vmult_cellwise(solution, cell_function), see
+  // step_with_first_product().
+  template<typename FirstProduct = std::nullptr_t>
+  double
+  apply_block(const bool           zero_initial_guess,
+              VectorType &         solution,
+              const VectorType &   rhs,
+              const bool           compute_final_norm,
+              const FirstProduct * first_product = nullptr) const
+  {
+    constexpr bool has_first_product     = !std::is_same_v<FirstProduct, std::nullptr_t>;
+    using VectorizedArrayType            = dealii::VectorizedArray<Number>;
+    const unsigned int n_dofs            = matrix->n_dofs_per_cell();
+    const bool         fourth_kind       = data.polynomial_type != PolynomialType::first_kind;
+    const double       rho               = data.max_eigenvalue;
+    const Number       factor_first_step = fourth_kind ? 4. / (3. * rho) : 1. / theta;
+    if(block_buffer.size() < 3 * n_dofs)
+      block_buffer.resize_fast(3 * n_dofs);
+    VectorizedArrayType * residual     = block_buffer.data();
+    VectorizedArrayType * sol          = block_buffer.data() + n_dofs;
+    VectorizedArrayType * sol_old      = block_buffer.data() + 2 * n_dofs;
+    const Number *        rhs_ptr      = rhs.begin();
+    const unsigned int    n_batches    = matrix->n_cell_batches();
+    double                residual_sqr = 0;
+
+    const auto iterate = [&](const bool   first_update,
+                             const bool   compute_norm,
+                             const Number factor1,
+                             const Number factor2) {
+      const Number * solution_ptr = solution.begin();
+      Number *       new_solution = solution_old.begin();
+      residual_sqr                = 0;
+      const auto cell_function    = [&](const unsigned int cell, VectorizedArrayType * matvec) {
+        matrix->read_cell_dofs(cell, rhs_ptr, residual);
+        for(unsigned int i = 0; i < n_dofs; ++i)
+          residual[i] -= matvec[i];
+        if(compute_norm)
+        {
+          VectorizedArrayType sum = VectorizedArrayType();
+          for(unsigned int i = 0; i < n_dofs; ++i)
+            sum += residual[i] * residual[i];
+          for(unsigned int v = 0; v < matrix->n_active_lanes(cell); ++v)
+            residual_sqr += sum[v];
+        }
+        matrix->apply_block_inverse_cell(cell, residual);
+        matrix->read_cell_dofs(cell, solution_ptr, sol);
+        const Number factor1_plus_1 = 1. + factor1;
+        if(first_update)
+          for(unsigned int i = 0; i < n_dofs; ++i)
+            residual[i] = factor1_plus_1 * sol[i] + factor2 * residual[i];
+        else
+        {
+          matrix->read_cell_dofs(cell, new_solution, sol_old);
+          for(unsigned int i = 0; i < n_dofs; ++i)
+            residual[i] = factor1_plus_1 * sol[i] - factor1 * sol_old[i] + factor2 * residual[i];
+        }
+        matrix->write_cell_dofs(cell, residual, new_solution);
+      };
+      if constexpr(has_first_product)
+      {
+        if(first_update && !zero_initial_guess)
+          (*first_product)(cell_function);
+        else
+          matrix->vmult_cellwise(solution, cell_function);
+      }
+      else
+        matrix->vmult_cellwise(solution, cell_function);
+      solution.swap(solution_old);
+      return compute_norm ?
+               std::sqrt(
+                 dealii::Utilities::MPI::sum(residual_sqr, solution.get_mpi_communicator())) :
+               0.;
+    };
+
+    // first iteration: x^1 = x^0 + f P^{-1} (b - A x^0)
+    double residual_norm = 0;
+    if(zero_initial_guess)
+    {
+      for(unsigned int cell = 0; cell < n_batches; ++cell)
+      {
+        matrix->read_cell_dofs(cell, rhs_ptr, residual);
+        matrix->apply_block_inverse_cell(cell, residual);
+        for(unsigned int i = 0; i < n_dofs; ++i)
+          residual[i] *= factor_first_step;
+        matrix->write_cell_dofs(cell, residual, solution.begin());
+      }
+      if(compute_final_norm && data.degree < 2)
+        residual_norm = rhs.l2_norm();
+    }
+    else
+      residual_norm = iterate(true, compute_final_norm && data.degree < 2, 0., factor_first_step);
+
+    if(data.degree < 2 || std::abs(delta) < 1e-40)
+      return residual_norm;
+
+    double       rhok  = delta / theta;
+    const double sigma = theta / delta;
+    for(unsigned int k = 0; k < data.degree - 1; ++k)
+    {
+      Number factor1, factor2;
+      if(fourth_kind)
+      {
+        factor1 = (2. * k + 1.) / (2. * k + 5.);
+        factor2 = (8. * k + 12.) / ((2. * k + 5.) * rho);
+      }
+      else
+      {
+        const double rhokp = 1. / (2. * sigma - rhok);
+        factor1            = rhokp * rhok;
+        factor2            = 2. * rhokp / delta;
+        rhok               = rhokp;
+      }
+      residual_norm = iterate(zero_initial_guess && k == 0,
+                              compute_final_norm && k + 2 == data.degree,
+                              factor1,
+                              factor2);
+    }
+    return residual_norm;
+  }
+
+  // Chebyshev iteration with the block-Jacobi preconditioner embedded in the
+  // cell loop of the operator: 'after_loop' stores w = x^n + f_1 (x^n -
+  // x^{n-1}) over x^{n-1} (and r = b - A x^n in global_residual for the
+  // chunks flagged by the operator), and the operator adds f_2 P^{-1} r on
+  // each block once r is complete there, which gives x^{n+1} = w + f_2
+  // P^{-1} r.
+  double
+  apply_embedded_block(const bool         zero_initial_guess,
+                       VectorType &       solution,
+                       const VectorType & rhs,
+                       const bool         compute_final_norm) const
+  {
+    const bool     fourth_kind       = data.polynomial_type != PolynomialType::first_kind;
+    const double   rho               = data.max_eigenvalue;
+    const Number   factor_first_step = fourth_kind ? 4. / (3. * rho) : 1. / theta;
+    const Number * rhs_ptr           = rhs.begin();
+
+    const auto iterate = [&](const bool   first_update,
+                             const bool   compute_norm,
+                             const Number factor1,
+                             const Number factor2) {
+      const Number *         solution_ptr   = solution.begin();
+      Number *               new_solution   = solution_old.begin();
+      Number *               residual       = global_residual.begin();
+      const unsigned char *  residual_flags = matrix->get_block_residual_chunks().data();
+      constexpr unsigned int chunk_size     = ScratchMatrixVectorProduct<Number>::chunk_size;
+      double                 residual_sqr   = 0;
+      const Number           factor1_plus_1 = 1. + factor1;
+      const auto             after_loop =
+        [&](const unsigned int begin, const unsigned int end, const Number * matvec) {
+          for(unsigned int i = begin; i < end; ++i)
+          {
+            const Number r = rhs_ptr[i] - matvec[i - begin];
+            if(residual_flags[i / chunk_size])
+              residual[i] = r;
+            if(compute_norm)
+              residual_sqr += r * r;
+            new_solution[i] = first_update ?
+                                factor1_plus_1 * solution_ptr[i] :
+                                factor1_plus_1 * solution_ptr[i] - factor1 * new_solution[i];
+          }
+        };
+      matrix->vmult_scratch_with_block_update(
+        solution, after_loop, rhs, global_residual, solution_old, factor2);
+      solution.swap(solution_old);
+      return compute_norm ?
+               std::sqrt(
+                 dealii::Utilities::MPI::sum(residual_sqr, solution.get_mpi_communicator())) :
+               0.;
+    };
+
+    double residual_norm = 0;
+    if(zero_initial_guess)
+    {
+      matrix->apply_block_inverse_vectorized(solution, rhs);
+      solution *= factor_first_step;
+      if(compute_final_norm && data.degree < 2)
+        residual_norm = rhs.l2_norm();
+    }
+    else
+      residual_norm = iterate(true, compute_final_norm && data.degree < 2, 0., factor_first_step);
+    if(data.degree < 2 || std::abs(delta) < 1e-40)
+      return residual_norm;
+
+    double       rhok  = delta / theta;
+    const double sigma = theta / delta;
+    for(unsigned int k = 0; k < data.degree - 1; ++k)
+    {
+      Number factor1, factor2;
+      if(fourth_kind)
+      {
+        factor1 = (2. * k + 1.) / (2. * k + 5.);
+        factor2 = (8. * k + 12.) / ((2. * k + 5.) * rho);
+      }
+      else
+      {
+        const double rhokp = 1. / (2. * sigma - rhok);
+        factor1            = rhokp * rhok;
+        factor2            = 2. * rhokp / delta;
+        rhok               = rhokp;
+      }
+      residual_norm = iterate(zero_initial_guess && k == 0,
+                              compute_final_norm && k + 2 == data.degree,
+                              factor1,
+                              factor2);
+    }
+    return residual_norm;
+  }
+
+  // Plain Chebyshev iteration on whole vectors with the operator's vmult()
+  // and data.global_preconditioner, with the same coefficients as apply()
+  double
+  apply_global(const bool         zero_initial_guess,
+               VectorType &       solution,
+               const VectorType & rhs,
+               const bool         compute_final_norm) const
+  {
+    const bool   fourth_kind       = data.polynomial_type != PolynomialType::first_kind;
+    const double rho               = data.max_eigenvalue;
+    const Number factor_first_step = fourth_kind ? 4. / (3. * rho) : 1. / theta;
+    double       residual_norm     = 0;
+
+    // first iteration x^1 = x^0 + f P^{-1} (b - A x^0), keeping x^0 in
+    // solution_old
+    if(zero_initial_guess)
+    {
+      data.global_preconditioner(global_update, rhs);
+      solution.equ(factor_first_step, global_update);
+      solution_old = 0;
+      if(compute_final_norm && data.degree < 2)
+        residual_norm = rhs.l2_norm();
+    }
+    else
+    {
+      matrix->vmult(global_residual, solution);
+      global_residual.sadd(-1., 1., rhs);
+      if(compute_final_norm && data.degree < 2)
+        residual_norm = global_residual.l2_norm();
+      data.global_preconditioner(global_update, global_residual);
+      solution_old = solution;
+      solution.add(factor_first_step, global_update);
+    }
+    if(data.degree < 2 || std::abs(delta) < 1e-40)
+      return residual_norm;
+
+    double       rhok  = delta / theta;
+    const double sigma = theta / delta;
+    for(unsigned int k = 0; k < data.degree - 1; ++k)
+    {
+      double factor1, factor2;
+      if(fourth_kind)
+      {
+        factor1 = (2. * k + 1.) / (2. * k + 5.);
+        factor2 = (8. * k + 12.) / ((2. * k + 5.) * rho);
+      }
+      else
+      {
+        const double rhokp = 1. / (2. * sigma - rhok);
+        factor1            = rhokp * rhok;
+        factor2            = 2. * rhokp / delta;
+        rhok               = rhokp;
+      }
+      matrix->vmult(global_residual, solution);
+      global_residual.sadd(-1., 1., rhs);
+      if(compute_final_norm && k + 2 == data.degree)
+        residual_norm = global_residual.l2_norm();
+      data.global_preconditioner(global_update, global_residual);
+      // x^{n+1} = (1 + f_1) x^n - f_1 x^{n-1} + f_2 P^{-1} r^n
+      solution_old.sadd(-factor1, 1. + factor1, solution);
+      solution_old.add(factor2, global_update);
+      solution.swap(solution_old);
+    }
     return residual_norm;
   }
 
@@ -554,7 +1161,15 @@ private:
   // can have a remainder. Returns the sum of the squares of the residual
   // entries if requested. With use_bf16, the inverse diagonal is read from
   // diagonal_bf16, otherwise from diagonal.
-  template<bool first_update, bool compute_norm, bool use_bf16>
+  //
+  // For the optimized fourth-kind weights, 'accumulation_mode' selects the
+  // treatment of the weighted updates with d = x^{n+1} - x^n:
+  // 0: none;
+  // 1: e = e_old + (beta - 1) d stored in 'accumulated';
+  // 2: like 1, but x^{n+1} + e is stored in new_solution as the final result,
+  // where e_old is read from 'accumulated' if accumulation.read is set, and
+  // otherwise computed as accumulation.scale_solution * x^n.
+  template<bool first_update, bool compute_norm, bool use_bf16, int accumulation_mode>
   static Number
   update(const unsigned int    begin,
          const unsigned int    end,
@@ -565,12 +1180,63 @@ private:
          const Number *        diagonal,
          const std::uint16_t * diagonal_bf16,
          const Number *        solution,
-         Number *              new_solution)
+         Number *              new_solution,
+         const Accumulation &  accumulation,
+         Number *              accumulated)
   {
     constexpr unsigned int          n_lanes        = dealii::VectorizedArray<Number>::size();
     const Number                    factor1_plus_1 = 1. + factor1;
     const unsigned int              end_regular    = begin + (end - begin) / n_lanes * n_lanes;
     dealii::VectorizedArray<Number> sum            = 0;
+    const bool                      read_acc       = accumulation.read;
+    const Number                    scale_solution = accumulation.scale_solution;
+    const Number                    beta_minus_1   = accumulation.beta_minus_1;
+    // store the new iterate, including the accumulated weighted updates if
+    // requested
+    const auto store = [&](const auto & sol_i, const auto & result_i, const unsigned int i) {
+      using VectorizedType = std::remove_cv_t<std::remove_reference_t<decltype(sol_i)>>;
+      if constexpr(accumulation_mode == 0)
+      {
+        if constexpr(std::is_same_v<VectorizedType, Number>)
+          new_solution[i] = result_i;
+        else
+          result_i.store(new_solution + i);
+      }
+      else
+      {
+        VectorizedType acc_i;
+        if constexpr(std::is_same_v<VectorizedType, Number>)
+          acc_i = read_acc ? accumulated[i] : scale_solution * sol_i;
+        else
+        {
+          if(read_acc)
+            acc_i.load(accumulated + i);
+          else
+            acc_i = scale_solution * sol_i;
+        }
+        acc_i += beta_minus_1 * (result_i - sol_i);
+        if constexpr(std::is_same_v<VectorizedType, Number>)
+        {
+          if constexpr(accumulation_mode == 1)
+          {
+            new_solution[i] = result_i;
+            accumulated[i]  = acc_i;
+          }
+          else
+            new_solution[i] = result_i + acc_i;
+        }
+        else
+        {
+          if constexpr(accumulation_mode == 1)
+          {
+            result_i.store(new_solution + i);
+            acc_i.store(accumulated + i);
+          }
+          else
+            (result_i + acc_i).store(new_solution + i);
+        }
+      }
+    };
     for(unsigned int i = begin; i < end_regular; i += n_lanes)
     {
       dealii::VectorizedArray<Number> rhs_i, sol_i, tmp_i, diag_i;
@@ -593,7 +1259,7 @@ private:
         sol_old_i.load(new_solution + i);
         result_i = factor1_plus_1 * sol_i - factor1 * sol_old_i + factor2 * diag_i * residual_i;
       }
-      result_i.store(new_solution + i);
+      store(sol_i, result_i, i);
     }
     for(unsigned int i = end_regular; i < end; ++i)
     {
@@ -606,11 +1272,13 @@ private:
       else
         diag_i = diagonal[i];
 
+      Number result_i;
       if constexpr(first_update)
-        new_solution[i] = factor1_plus_1 * solution[i] + factor2 * diag_i * residual_i;
+        result_i = factor1_plus_1 * solution[i] + factor2 * diag_i * residual_i;
       else
-        new_solution[i] =
+        result_i =
           factor1_plus_1 * solution[i] - factor1 * new_solution[i] + factor2 * diag_i * residual_i;
+      store(solution[i], result_i, i);
     }
     if constexpr(compute_norm)
       return sum.sum();
@@ -625,6 +1293,17 @@ private:
   // holds x^{n-1} on entry to the matrix-vector product and the new
   // solution x^{n+1} on exit
   mutable VectorType solution_old;
+
+  // accumulated weighted updates sum_i (beta_i - 1) d_{i-1} of the
+  // optimized fourth-kind iteration, empty otherwise
+  mutable VectorType accumulated_update;
+
+  // residual and preconditioned residual in apply_global()
+  mutable VectorType global_residual;
+  mutable VectorType global_update;
+
+  // cell values of the residual, solution and old solution in apply_block()
+  mutable dealii::AlignedVector<dealii::VectorizedArray<Number>> block_buffer;
 };
 
 } // namespace ExaDG

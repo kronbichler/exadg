@@ -19,6 +19,9 @@
  *  ______________________________________________________________________
  */
 
+#include <algorithm>
+#include <sstream>
+
 #include <deal.II/dofs/dof_renumbering.h>
 #include <deal.II/numerics/vector_tools_mean_value.h>
 
@@ -180,6 +183,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
     momentum_rhs_norm_interval = std::max(1, std::atoi(interval));
   check_fused_momentum_rhs = std::getenv("EXADG_CHECK_FUSED_MOMENTUM_RHS") != nullptr;
 
+  pressure_first_vcycle_bins = {0.25, 0.5, 0.75, 1., 1.25, 1.5, 2., 3., 5., 10.};
+  pressure_first_vcycle_histogram.resize(pressure_first_vcycle_bins.size() + 1);
+
   pde_operator->momentum_operator = op_rt;
   pde_operator->velocity_vector   = &velocity[0];
 }
@@ -289,7 +295,7 @@ template<int dim, typename Number>
 void
 TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
 {
-  Timer time;
+  dealii::Timer time;
   Base::allocate_vectors();
 
   // The restart of this class serializes the velocity only and recomputes the
@@ -475,7 +481,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
       cell_vectorization_category,
       pde_operator->get_grid().mapping_function,
       this->param.IP_factor_pressure,
-      this->is_test);
+      this->is_test,
+      this->param.multigrid_data_pressure_poisson.smoother_data.preconditioner ==
+        PreconditionerSmoother::BlockJacobi);
   else
     poisson_preconditioner = std::make_shared<LaplaceOperator::PoissonPreconditionerMG<dim, float>>(
       *pde_operator->get_mapping(),
@@ -485,7 +493,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
       pde_operator->get_grid().coarse_mappings,
       pde_operator->get_grid().mapping_function,
       this->param.IP_factor_pressure,
-      this->is_test);
+      this->is_test,
+      this->param.multigrid_data_pressure_poisson.smoother_data.preconditioner ==
+        PreconditionerSmoother::BlockJacobi);
 
   for(unsigned int i = 0; i < pressure.size(); ++i)
     poisson_preconditioner->get_dg_matrix().initialize_dof_vector(pressure[i]);
@@ -720,12 +730,31 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
   // expected error reduction). If we fail, use SolverCG in double precision
   // as the more robust choice.
   std::pair<unsigned int, double> n_iter{0, 1.};
+  const double                    target_residual =
+    extrapolate_accuracy.first * this->param.solver_data_pressure_poisson.rel_tol;
   n_iter = poisson_preconditioner->solve(*laplace_op,
                                          pressure_rhs,
                                          pressure_np,
                                          4 /* n_max_iterations */,
-                                         extrapolate_accuracy.first *
-                                           this->param.solver_data_pressure_poisson.rel_tol);
+                                         target_residual,
+                                         &pressure_residual_history);
+
+  // How close does a single V-cycle get to the tolerance? Entry 0 of the
+  // history is the initial residual, entry 1 the residual after the first
+  // CG step with one V-cycle.
+  if(pressure_residual_history.size() > 1 && target_residual > 0.)
+  {
+    const double ratio = pressure_residual_history[1] / target_residual;
+    stat_pressure_first_vcycle_vs_target.add_sample(ratio);
+    if(pressure_residual_history[1] > 0.)
+      stat_pressure_first_vcycle_reduction.add_sample(pressure_residual_history[0] /
+                                                      pressure_residual_history[1]);
+    const unsigned int bin = std::upper_bound(pressure_first_vcycle_bins.begin(),
+                                              pressure_first_vcycle_bins.end(),
+                                              ratio) -
+                             pressure_first_vcycle_bins.begin();
+    ++pressure_first_vcycle_histogram[bin];
+  }
   if(n_iter.second > extrapolate_accuracy.first * this->param.solver_data_pressure_poisson.rel_tol)
   {
     dealii::SolverControl        control(this->param.solver_data_pressure_poisson.max_iter,
@@ -758,7 +787,11 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
                 << " s, solve " << t_sol << std::endl
                 << "Solve pressure step (projection reduced residual from "
                 << extrapolate_accuracy.first << " to " << extrapolate_accuracy.second
-                << " solve to " << n_iter.second << "):";
+                << " solve to " << n_iter.second;
+    if(pressure_residual_history.size() > 1 && target_residual > 0.)
+      this->pcout << ", 1st V-cycle to " << pressure_residual_history[1] << " = "
+                  << pressure_residual_history[1] / target_residual << " x target";
+    this->pcout << "):";
     print_solver_info_linear(this->pcout, n_iter.first, timer.wall_time());
   }
 
@@ -1815,6 +1848,34 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::print_iterations() const
                                                  25,
                                                  &this->mpi_comm);
   stat_pressure_time_solve.print_statistics(this->pcout, "P time solve [s]", 25, &this->mpi_comm);
+  stat_pressure_first_vcycle_vs_target.print_statistics(this->pcout, "P res 1st Vc / target", 25);
+  stat_pressure_first_vcycle_reduction.print_statistics(this->pcout, "P reduction 1st Vc", 25);
+  {
+    unsigned long n_total = 0;
+    for(const unsigned long count : pressure_first_vcycle_histogram)
+      n_total += count;
+    if(n_total > 0)
+    {
+      this->pcout << "  Histogram residual after 1st V-cycle / target (<= 1: done in 1 V-cycle):"
+                  << std::endl;
+      for(unsigned int b = 0; b < pressure_first_vcycle_histogram.size(); ++b)
+      {
+        std::ostringstream range;
+        range << std::defaultfloat;
+        if(b == 0)
+          range << "     < " << pressure_first_vcycle_bins[0];
+        else if(b == pressure_first_vcycle_bins.size())
+          range << "    >= " << pressure_first_vcycle_bins.back();
+        else
+          range << pressure_first_vcycle_bins[b - 1] << " - " << pressure_first_vcycle_bins[b];
+        this->pcout << "    " << std::setw(12) << std::left << range.str() << std::right
+                    << std::setw(10) << pressure_first_vcycle_histogram[b] << "  " << std::fixed
+                    << std::setprecision(1) << std::setw(5)
+                    << 100. * pressure_first_vcycle_histogram[b] / n_total << " %"
+                    << std::scientific << std::endl;
+      }
+    }
+  }
   this->pcout << std::endl;
   stat_momentum_iterations_cg.print_statistics(this->pcout, "Momentum iterations CG", 25);
   stat_momentum_iterations_cheby.print_statistics(this->pcout, "Momentum iterations Cheby", 25);
@@ -2079,7 +2140,7 @@ template<int dim, typename Number>
 void
 TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
 {
-  Timer time;
+  dealii::Timer time;
   // Restart vectors need to be stored in a format compatible with the
   // DoFHandler, so the vectors written for
   // `RTOperator::RaviartThomasOperator` need to be converted
@@ -2132,7 +2193,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
 
   this->pcout << "Reading restart velocity[0]->norm: " << std::setprecision(8)
               << velocity[0].l2_norm() << std::endl;
-  this->pcout << "Time for restart: " << time.wall_time() << " s" << std::endl;
+  this->pcout << "Time for restart: " << std::defaultfloat << std::setprecision(3) <<
+    time.wall_time() << " s" << std::endl;
 }
 
 // instantiations
