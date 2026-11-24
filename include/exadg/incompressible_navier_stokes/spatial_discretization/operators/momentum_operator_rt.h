@@ -2267,6 +2267,17 @@ private:
     convective_and_divergence
   };
 
+  // Source of the data on the interior side of a face in
+  // compute_face_convective(): the values at the cell quadrature points of
+  // read_cell_values(), the dofs of the cell, or the layered representation
+  // of read_cell_values_layered()
+  enum class FaceInteriorData
+  {
+    quadrature_points,
+    cell_dofs,
+    layered
+  };
+
   bool                                                             is_test;
   ObserverPointer<const Mapping<dim>>                              mapping;
   ObserverPointer<const DoFHandler<dim>>                           dof_handler;
@@ -3202,13 +3213,12 @@ private:
   // starting at layered_component_offset(c), i.e., for each plane qy of
   // constant y the dofs in x and z direction with x running fastest. The
   // remaining interpolation in x and z direction then works plane by plane.
-  // 'dof_values' gets the dofs of the cell per component in lexicographic
-  // order, as for read_cell_values().
+  // The dofs are contracted plane by plane in z direction right after
+  // loading them, so that only the dofs of one plane are held at a time.
   template<int n_t, int n_points_1d>
   void
   read_cell_values_layered(const Number *                                              src_vector,
                            const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dof_indices,
-                           VectorizedArray<Number> *                                   dof_values,
                            VectorizedArray<Number> *                                   values_y,
                            VectorizedArray<Number> * derivatives_y) const
   {
@@ -3218,115 +3228,111 @@ private:
     constexpr unsigned int dofs_per_face      = n_t * n_t;
     constexpr unsigned int dofs_per_plane     = n_t * (n_t - 1);
     constexpr unsigned int cell_dofs_per_comp = dofs_per_plane * n_t;
-    constexpr unsigned int dofs_per_comp      = n_n * dofs_per_face;
+    const auto &           shape_data         = convective_shape_info.data;
+    AssertDimension(n_points_1d, shape_data[0].n_q_points_1d);
 
-    // load the dofs
+    // Contract the dofs of component c in the plane i_z of constant z
+    // ('plane', n_y rows of n_x entries) in y direction, with the normal
+    // shape functions for the y component and the tangential ones for the
+    // other two
+    const auto contract_plane =
+      [&](auto component, const VectorizedArray<Number> * plane, const unsigned int i_z)
+        DEAL_II_ALWAYS_INLINE {
+          constexpr unsigned int c      = decltype(component)::value;
+          constexpr unsigned int nx     = c == 0 ? n_n : n_t;
+          constexpr unsigned int ny     = c == 1 ? n_n : n_t;
+          constexpr unsigned int nz     = c == 2 ? n_n : n_t;
+          const auto &           sh_y   = shape_data[c == 1 ? 0 : 1];
+          const unsigned int     offset = layered_component_offset<n_t, n_points_1d>(c) + i_z * nx;
+          VectorizedArray<Number> * out_val = values_y + offset;
+          VectorizedArray<Number> * out_der = derivatives_y + offset;
+          for(unsigned int ix = 0; ix < nx; ++ix)
+          {
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  ny,
+                                                  n_points_1d,
+                                                  nx,
+                                                  nx * nz,
+                                                  true,
+                                                  false>(sh_y.shape_values_eo.data(),
+                                                         plane + ix,
+                                                         out_val + ix);
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::gradient,
+                                                  ny,
+                                                  n_points_1d,
+                                                  nx,
+                                                  nx * nz,
+                                                  true,
+                                                  false>(sh_y.shape_gradients_eo.data(),
+                                                         plane + ix,
+                                                         out_der + ix);
+          }
+        };
+    using comp_x = std::integral_constant<unsigned int, 0>;
+    using comp_y = std::integral_constant<unsigned int, 1>;
+    using comp_z = std::integral_constant<unsigned int, 2>;
+
+    VectorizedArray<Number> data_f[2][dofs_per_face];
+    VectorizedArray<Number> data_cell[dofs_per_plane];
+    VectorizedArray<Number> plane[n_n * n_t];
+
+    // x component: faces in x direction, interior dofs per plane of constant
+    // z with x running fastest
+    for(unsigned int f = 0; f < 2; ++f)
+      load_face_dofs(src_vector, dof_indices, f, dofs_per_face, data_f[f]);
+    for(unsigned int i_z = 0; i_z < n_t; ++i_z)
     {
-      VectorizedArray<Number> data_f[2][dofs_per_face];
-      VectorizedArray<Number> data_cell[dofs_per_plane];
-
-      // x component: faces in x direction, interior dofs per plane of
-      // constant z with x running fastest
-      for(unsigned int f = 0; f < 2; ++f)
-        load_face_dofs(src_vector, dof_indices, f, dofs_per_face, data_f[f]);
-      for(unsigned int i_z = 0; i_z < n_t; ++i_z)
+      vectorized_load_and_transpose(dofs_per_plane,
+                                    src_vector + i_z * dofs_per_plane,
+                                    dof_indices[2 * dim].data(),
+                                    data_cell);
+      for(unsigned int i_y = 0; i_y < n_t; ++i_y)
       {
-        vectorized_load_and_transpose(dofs_per_plane,
-                                      src_vector + i_z * dofs_per_plane,
-                                      dof_indices[2 * dim].data(),
-                                      data_cell);
-        for(unsigned int i_y = 0; i_y < n_t; ++i_y)
-        {
-          VectorizedArray<Number> * out = dof_values + (i_z * n_t + i_y) * n_n;
-          out[0]                        = data_f[0][i_z * n_t + i_y];
-          for(unsigned int i = 0; i < n_t - 1; ++i)
-            out[1 + i] = data_cell[i_y * (n_t - 1) + i];
-          out[n_t] = data_f[1][i_z * n_t + i_y];
-        }
+        VectorizedArray<Number> * row = plane + i_y * n_n;
+        row[0]                        = data_f[0][i_z * n_t + i_y];
+        for(unsigned int i = 0; i < n_t - 1; ++i)
+          row[1 + i] = data_cell[i_y * (n_t - 1) + i];
+        row[n_t] = data_f[1][i_z * n_t + i_y];
       }
-
-      // y component: faces in y direction, interior dofs per plane of
-      // constant z with x running fastest
-      for(unsigned int f = 0; f < 2; ++f)
-        load_face_dofs(src_vector, dof_indices, 2 + f, dofs_per_face, data_f[f]);
-      for(unsigned int i_z = 0; i_z < n_t; ++i_z)
-      {
-        vectorized_load_and_transpose(dofs_per_plane,
-                                      src_vector + cell_dofs_per_comp + i_z * dofs_per_plane,
-                                      dof_indices[2 * dim].data(),
-                                      data_cell);
-        VectorizedArray<Number> * out = dof_values + dofs_per_comp + i_z * n_n * n_t;
-        for(unsigned int i_x = 0; i_x < n_t; ++i_x)
-        {
-          out[i_x] = data_f[0][i_z * n_t + i_x];
-          for(unsigned int i = 0; i < n_t - 1; ++i)
-            out[(1 + i) * n_t + i_x] = data_cell[i * n_t + i_x];
-          out[n_t * n_t + i_x] = data_f[1][i_z * n_t + i_x];
-        }
-      }
-
-      // z component: faces in z direction, interior dofs per plane of
-      // constant z, which are in lexicographic order already
-      VectorizedArray<Number> * out = dof_values + 2 * dofs_per_comp;
-      load_face_dofs(src_vector, dof_indices, 4, dofs_per_face, out);
-      for(unsigned int i_z = 0; i_z < n_t - 1; ++i_z)
-        vectorized_load_and_transpose(dofs_per_face,
-                                      src_vector + 2 * cell_dofs_per_comp + i_z * dofs_per_face,
-                                      dof_indices[2 * dim].data(),
-                                      out + (i_z + 1) * dofs_per_face);
-      load_face_dofs(src_vector, dof_indices, 5, dofs_per_face, out + n_t * dofs_per_face);
+      contract_plane(comp_x(), plane, i_z);
     }
 
-    // contract in y direction, with the normal shape functions for the y
-    // component and the tangential ones for the other two. The extents of
-    // the component in x and y direction are compile-time constants, n_z
-    // follows from n_x + n_y + n_z = 3 n_t + 1.
-    const auto & shape_data = convective_shape_info.data;
-    AssertDimension(n_points_1d, shape_data[0].n_q_points_1d);
-    const auto contract =
-      [&](const unsigned int                                                 c,
-          auto                                                               n_x_c,
-          auto                                                               n_y_c,
-          const internal::MatrixFreeFunctions::UnivariateShapeData<Number> & shape)
-        DEAL_II_ALWAYS_INLINE {
-          constexpr unsigned int          nx = decltype(n_x_c)::value;
-          constexpr unsigned int          ny = decltype(n_y_c)::value;
-          constexpr unsigned int          nz = 3 * n_t + 1 - nx - ny;
-          const VectorizedArray<Number> * in = dof_values + c * dofs_per_comp;
-          VectorizedArray<Number> *       out_val =
-            values_y + layered_component_offset<n_t, n_points_1d>(c);
-          VectorizedArray<Number> * out_der =
-            derivatives_y + layered_component_offset<n_t, n_points_1d>(c);
-          for(unsigned int iz = 0; iz < nz; ++iz)
-            for(unsigned int ix = 0; ix < nx; ++ix)
-            {
-              internal::apply_matrix_vector_product<internal::evaluate_evenodd,
-                                                    internal::EvaluatorQuantity::value,
-                                                    ny,
-                                                    n_points_1d,
-                                                    nx,
-                                                    nx * nz,
-                                                    true,
-                                                    false>(shape.shape_values_eo.data(),
-                                                           in + iz * ny * nx + ix,
-                                                           out_val + iz * nx + ix);
-              internal::apply_matrix_vector_product<internal::evaluate_evenodd,
-                                                    internal::EvaluatorQuantity::gradient,
-                                                    ny,
-                                                    n_points_1d,
-                                                    nx,
-                                                    nx * nz,
-                                                    true,
-                                                    false>(shape.shape_gradients_eo.data(),
-                                                           in + iz * ny * nx + ix,
-                                                           out_der + iz * nx + ix);
-            }
-        };
-    using n_t_c = std::integral_constant<unsigned int, n_t>;
-    using n_n_c = std::integral_constant<unsigned int, n_n>;
-    contract(0, n_n_c(), n_t_c(), shape_data[1]);
-    contract(1, n_t_c(), n_n_c(), shape_data[0]);
-    contract(2, n_t_c(), n_t_c(), shape_data[1]);
+    // y component: faces in y direction, interior dofs per plane of constant
+    // z with x running fastest
+    for(unsigned int f = 0; f < 2; ++f)
+      load_face_dofs(src_vector, dof_indices, 2 + f, dofs_per_face, data_f[f]);
+    for(unsigned int i_z = 0; i_z < n_t; ++i_z)
+    {
+      vectorized_load_and_transpose(dofs_per_plane,
+                                    src_vector + cell_dofs_per_comp + i_z * dofs_per_plane,
+                                    dof_indices[2 * dim].data(),
+                                    data_cell);
+      for(unsigned int i_x = 0; i_x < n_t; ++i_x)
+      {
+        plane[i_x] = data_f[0][i_z * n_t + i_x];
+        for(unsigned int i = 0; i < n_t - 1; ++i)
+          plane[(1 + i) * n_t + i_x] = data_cell[i * n_t + i_x];
+        plane[n_t * n_t + i_x] = data_f[1][i_z * n_t + i_x];
+      }
+      contract_plane(comp_y(), plane, i_z);
+    }
+
+    // z component: the faces in z direction and the interior dofs per plane
+    // of constant z are in lexicographic order already
+    load_face_dofs(src_vector, dof_indices, 4, dofs_per_face, plane);
+    contract_plane(comp_z(), plane, 0);
+    for(unsigned int i_z = 0; i_z < n_t - 1; ++i_z)
+    {
+      vectorized_load_and_transpose(dofs_per_face,
+                                    src_vector + 2 * cell_dofs_per_comp + i_z * dofs_per_face,
+                                    dof_indices[2 * dim].data(),
+                                    plane);
+      contract_plane(comp_z(), plane, i_z + 1);
+    }
+    load_face_dofs(src_vector, dof_indices, 5, dofs_per_face, plane);
+    contract_plane(comp_z(), plane, n_t);
   }
 
   // Call 'f' with std::integral_constant<unsigned int, c> for each velocity
@@ -3391,103 +3397,38 @@ private:
         }
   }
 
-  // Add the cell dofs in 'dof_values', in the layout of
-  // read_cell_values_layered(), to 'dst_vector'; transpose of the loading
-  // part of read_cell_values_layered()
-  template<int n_t>
-  void
-  scatter_cell_dofs(const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dof_indices,
-                    const unsigned int                                          n_filled_lanes,
-                    const VectorizedArray<Number> *                             dof_values,
-                    Number *                                                    dst_vector) const
-  {
-    static_assert(dim == 3, "Only implemented for 3D");
-    constexpr unsigned int n_n                = n_t + 1;
-    constexpr unsigned int dofs_per_face      = n_t * n_t;
-    constexpr unsigned int dofs_per_plane     = n_t * (n_t - 1);
-    constexpr unsigned int cell_dofs_per_comp = dofs_per_plane * n_t;
-    constexpr unsigned int dofs_per_comp      = n_n * dofs_per_face;
-
-    VectorizedArray<Number> data_f[2][dofs_per_face];
-    VectorizedArray<Number> data_cell[dofs_per_plane];
-
-    // x component
-    for(unsigned int i_z = 0; i_z < n_t; ++i_z)
-    {
-      for(unsigned int i_y = 0; i_y < n_t; ++i_y)
-      {
-        const VectorizedArray<Number> * in = dof_values + (i_z * n_t + i_y) * n_n;
-        data_f[0][i_z * n_t + i_y]         = in[0];
-        for(unsigned int i = 0; i < n_t - 1; ++i)
-          data_cell[i_y * (n_t - 1) + i] = in[1 + i];
-        data_f[1][i_z * n_t + i_y] = in[n_t];
-      }
-      add_cell_dofs(data_cell,
-                    dofs_per_plane,
-                    i_z * dofs_per_plane,
-                    dof_indices[2 * dim],
-                    n_filled_lanes,
-                    dst_vector);
-    }
-    for(unsigned int f = 0; f < 2; ++f)
-      add_face_dofs(data_f[f], dof_indices, f, dofs_per_face, n_filled_lanes, dst_vector);
-
-    // y component
-    for(unsigned int i_z = 0; i_z < n_t; ++i_z)
-    {
-      const VectorizedArray<Number> * in = dof_values + dofs_per_comp + i_z * n_n * n_t;
-      for(unsigned int i_x = 0; i_x < n_t; ++i_x)
-      {
-        data_f[0][i_z * n_t + i_x] = in[i_x];
-        for(unsigned int i = 0; i < n_t - 1; ++i)
-          data_cell[i * n_t + i_x] = in[(1 + i) * n_t + i_x];
-        data_f[1][i_z * n_t + i_x] = in[n_t * n_t + i_x];
-      }
-      add_cell_dofs(data_cell,
-                    dofs_per_plane,
-                    cell_dofs_per_comp + i_z * dofs_per_plane,
-                    dof_indices[2 * dim],
-                    n_filled_lanes,
-                    dst_vector);
-    }
-    for(unsigned int f = 0; f < 2; ++f)
-      add_face_dofs(data_f[f], dof_indices, 2 + f, dofs_per_face, n_filled_lanes, dst_vector);
-
-    // z component
-    const VectorizedArray<Number> * in = dof_values + 2 * dofs_per_comp;
-    add_face_dofs(in, dof_indices, 4, dofs_per_face, n_filled_lanes, dst_vector);
-    for(unsigned int i_z = 0; i_z < n_t - 1; ++i_z)
-      add_cell_dofs(in + (i_z + 1) * dofs_per_face,
-                    dofs_per_face,
-                    2 * cell_dofs_per_comp + i_z * dofs_per_face,
-                    dof_indices[2 * dim],
-                    n_filled_lanes,
-                    dst_vector);
-    add_face_dofs(
-      in + n_t * dofs_per_face, dof_indices, 5, dofs_per_face, n_filled_lanes, dst_vector);
-  }
-
   // Last step of the integration of the convective term in the layered
   // representation of read_cell_values_layered(): integrate the terms tested
   // by the values in y direction ('values_y') and, if given, by the
   // derivatives in y direction ('derivatives_y'), both already integrated in
   // x and z direction by compute_cell_convective_layered(), over the planes
-  // of constant y, and add the face integrals on the faces in y direction
-  // from 'face_data' (in the layout of compute_face_convective()). The result
-  // goes to 'dof_values' in the layout of read_cell_values_layered().
+  // of constant y, add the face integrals on the faces in y direction from
+  // 'face_data' (in the layout of compute_face_convective()), and add the
+  // result to 'dst_vector'. Transpose of read_cell_values_layered(): the
+  // dofs are integrated plane by plane in z direction and added to the
+  // vector right away, so that only the dofs of one plane are held at a
+  // time.
   template<int n_t, int n_points_1d>
   void
-  integrate_cell_layered(const VectorizedArray<Number> * values_y,
-                         const VectorizedArray<Number> * derivatives_y,
-                         const VectorizedArray<Number> * face_data,
-                         VectorizedArray<Number> *       dof_values) const
+  integrate_scatter_layered(const VectorizedArray<Number> * values_y,
+                            const VectorizedArray<Number> * derivatives_y,
+                            const VectorizedArray<Number> * face_data,
+                            const dealii::ndarray<unsigned int, 2 * dim + 1, n_lanes> & dof_indices,
+                            const unsigned int n_filled_lanes,
+                            Number *           dst_vector) const
   {
-    constexpr unsigned int n_n            = n_t + 1;
-    constexpr unsigned int nq             = n_points_1d;
-    constexpr unsigned int n_q_points_2d  = nq * nq;
-    constexpr unsigned int face_data_size = (dim + 1) * n_q_points_2d;
-    constexpr unsigned int dofs_per_comp  = n_n * n_t * n_t;
-    const auto &           shape_data     = convective_shape_info.data;
+    constexpr unsigned int n_n                = n_t + 1;
+    constexpr unsigned int nq                 = n_points_1d;
+    constexpr unsigned int n_q_points_2d      = nq * nq;
+    constexpr unsigned int face_data_size     = (dim + 1) * n_q_points_2d;
+    constexpr unsigned int dofs_per_face      = n_t * n_t;
+    constexpr unsigned int dofs_per_plane     = n_t * (n_t - 1);
+    constexpr unsigned int cell_dofs_per_comp = dofs_per_plane * n_t;
+    const auto &           shape_data         = convective_shape_info.data;
+
+    VectorizedArray<Number> data_f[2][dofs_per_face];
+    VectorizedArray<Number> data_cell[dofs_per_plane];
+    VectorizedArray<Number> plane[n_n * n_t];
 
     for_each_component([&](auto component) DEAL_II_ALWAYS_INLINE {
       constexpr unsigned int c    = decltype(component)::value;
@@ -3533,13 +3474,14 @@ private:
       const VectorizedArray<Number> * val = values_y + layered_component_offset<n_t, nq>(c);
       const VectorizedArray<Number> * der =
         derivatives_y != nullptr ? derivatives_y + layered_component_offset<n_t, nq>(c) : nullptr;
-      VectorizedArray<Number> * out   = dof_values + c * dofs_per_comp;
-      const Number *            phi_0 = sh_y.shape_data_on_face[0].data();
-      const Number *            phi_1 = sh_y.shape_data_on_face[1].data();
-      for(unsigned int iz = 0; iz < nz; ++iz)
+      const Number * phi_0 = sh_y.shape_data_on_face[0].data();
+      const Number * phi_1 = sh_y.shape_data_on_face[1].data();
+
+      // integrate the plane i_z of constant z in y direction into 'plane'
+      // (n_y rows of n_x entries)
+      const auto integrate_plane = [&](const unsigned int i_z) DEAL_II_ALWAYS_INLINE {
         for(unsigned int ix = 0; ix < nx; ++ix)
         {
-          VectorizedArray<Number> * out_line = out + iz * ny * nx + ix;
           internal::apply_matrix_vector_product<internal::evaluate_evenodd,
                                                 internal::EvaluatorQuantity::value,
                                                 ny,
@@ -3548,8 +3490,8 @@ private:
                                                 nx,
                                                 false,
                                                 false>(sh_y.shape_values_eo.data(),
-                                                       val + iz * nx + ix,
-                                                       out_line);
+                                                       val + i_z * nx + ix,
+                                                       plane + ix);
           if(der != nullptr)
             internal::apply_matrix_vector_product<internal::evaluate_evenodd,
                                                   internal::EvaluatorQuantity::gradient,
@@ -3559,13 +3501,77 @@ private:
                                                   nx,
                                                   false,
                                                   true>(sh_y.shape_gradients_eo.data(),
-                                                        der + iz * nx + ix,
-                                                        out_line);
-          const VectorizedArray<Number> f_0 = face_y[0][iz * nx + ix];
-          const VectorizedArray<Number> f_1 = face_y[1][iz * nx + ix];
+                                                        der + i_z * nx + ix,
+                                                        plane + ix);
+          const VectorizedArray<Number> f_0 = face_y[0][i_z * nx + ix];
+          const VectorizedArray<Number> f_1 = face_y[1][i_z * nx + ix];
           for(unsigned int iy = 0; iy < ny; ++iy)
-            out_line[iy * nx] += phi_0[iy] * f_0 + phi_1[iy] * f_1;
+            plane[iy * nx + ix] += phi_0[iy] * f_0 + phi_1[iy] * f_1;
         }
+      };
+
+      if constexpr(c == 0)
+      {
+        for(unsigned int i_z = 0; i_z < n_t; ++i_z)
+        {
+          integrate_plane(i_z);
+          for(unsigned int i_y = 0; i_y < n_t; ++i_y)
+          {
+            const VectorizedArray<Number> * row = plane + i_y * n_n;
+            data_f[0][i_z * n_t + i_y]          = row[0];
+            for(unsigned int i = 0; i < n_t - 1; ++i)
+              data_cell[i_y * (n_t - 1) + i] = row[1 + i];
+            data_f[1][i_z * n_t + i_y] = row[n_t];
+          }
+          add_cell_dofs(data_cell,
+                        dofs_per_plane,
+                        i_z * dofs_per_plane,
+                        dof_indices[2 * dim],
+                        n_filled_lanes,
+                        dst_vector);
+        }
+        for(unsigned int f = 0; f < 2; ++f)
+          add_face_dofs(data_f[f], dof_indices, f, dofs_per_face, n_filled_lanes, dst_vector);
+      }
+      else if constexpr(c == 1)
+      {
+        for(unsigned int i_z = 0; i_z < n_t; ++i_z)
+        {
+          integrate_plane(i_z);
+          for(unsigned int i_x = 0; i_x < n_t; ++i_x)
+          {
+            data_f[0][i_z * n_t + i_x] = plane[i_x];
+            for(unsigned int i = 0; i < n_t - 1; ++i)
+              data_cell[i * n_t + i_x] = plane[(1 + i) * n_t + i_x];
+            data_f[1][i_z * n_t + i_x] = plane[n_t * n_t + i_x];
+          }
+          add_cell_dofs(data_cell,
+                        dofs_per_plane,
+                        cell_dofs_per_comp + i_z * dofs_per_plane,
+                        dof_indices[2 * dim],
+                        n_filled_lanes,
+                        dst_vector);
+        }
+        for(unsigned int f = 0; f < 2; ++f)
+          add_face_dofs(data_f[f], dof_indices, 2 + f, dofs_per_face, n_filled_lanes, dst_vector);
+      }
+      else
+      {
+        for(unsigned int i_z = 0; i_z < n_n; ++i_z)
+        {
+          integrate_plane(i_z);
+          if(i_z == 0 || i_z == n_t)
+            add_face_dofs(
+              plane, dof_indices, i_z == 0 ? 4 : 5, dofs_per_face, n_filled_lanes, dst_vector);
+          else
+            add_cell_dofs(plane,
+                          dofs_per_face,
+                          2 * cell_dofs_per_comp + (i_z - 1) * dofs_per_face,
+                          dof_indices[2 * dim],
+                          n_filled_lanes,
+                          dst_vector);
+        }
+      }
     });
   }
 
@@ -5355,25 +5361,37 @@ private:
     VectorizedArray<Number> values_y[n_layered];
     VectorizedArray<Number> derivatives_y[n_layered];
     VectorizedArray<Number> face_data[2 * dim * (dim + 1) * Utilities::pow(n_q_points_1d, dim - 1)];
-    VectorizedArray<Number> dof_values[dim * Utilities::pow(degree, dim - 1) * (degree + 1)];
-    read_cell_values_layered<degree, n_q_points_1d>(
-      src.begin(), dof_indices[cell], dof_values, values_y, derivatives_y);
+    read_cell_values_layered<degree, n_q_points_1d>(src.begin(),
+                                                    dof_indices[cell],
+                                                    values_y,
+                                                    derivatives_y);
 
     for(unsigned int f = 0; f < 2 * dim; ++f)
-      compute_face_convective<false, degree, n_q_points_1d, true>(
-        shape_data, src, cell, f, factor_convective, nullptr, dof_values, face_data);
+      compute_face_convective<false, degree, n_q_points_1d, FaceInteriorData::layered>(
+        shape_data,
+        src,
+        cell,
+        f,
+        factor_convective,
+        nullptr,
+        nullptr,
+        face_data,
+        values_y,
+        derivatives_y);
 
     Tensor<1, dim, VectorizedArray<Number>> velocity;
     const VectorizedArray<Number>           cfl_velocity =
       compute_cell_convective_layered<CellOperation::convective, degree, n_q_points_1d>(
         cell, values_y, derivatives_y, factor_convective, face_data, velocity);
 
-    integrate_cell_layered<degree, n_q_points_1d>(
-      values_y, factor_convective != Number(1.0) ? derivatives_y : nullptr, face_data, dof_values);
-    scatter_cell_dofs<degree>(dof_indices[cell],
-                              n_active_entries_per_cell_batch(cell),
-                              dof_values,
-                              dst.begin());
+    integrate_scatter_layered<degree, n_q_points_1d>(values_y,
+                                                     factor_convective != Number(1.0) ?
+                                                       derivatives_y :
+                                                       nullptr,
+                                                     face_data,
+                                                     dof_indices[cell],
+                                                     n_active_entries_per_cell_batch(cell),
+                                                     dst.begin());
     return cfl_velocity;
   }
 
@@ -5462,25 +5480,22 @@ private:
     constexpr unsigned int n_pressure    = Utilities::pow(degree, dim);
     const auto &           shape_data    = convective_shape_info.data;
 
-    // TODO: Do all of 'face_data', 'values_y', 'dof_values', 'pressure_y',
-    // 'pressure_dofs' need to live at the same time? We should try to have
-    // 'values_y' and 'dof_values' share the data (it means we need to
-    // slightly rework the 'compute_face_convective' as we have a mix of
-    // collocated/non-collocated setup). The evaluators support the in-place
-    // update, if we manage to sweep through in forward/backward mode
-    // appropriately (check FEEvaluationImplBasisChange in deal.II's
-    // evaluation_kernels.h).
+    // The derivatives in y direction (derivatives_y) are only read by the
+    // faces and the cell integrals, so their memory holds the pressure dofs
+    // afterwards
     VectorizedArray<Number> values_y[n_layered];
     VectorizedArray<Number> derivatives_y[n_layered];
     VectorizedArray<Number> pressure_y[3 * n_q_points_1d * degree * degree];
     VectorizedArray<Number> face_data[2 * dim * (dim + 1) * Utilities::pow(n_q_points_1d, dim - 1)];
-    VectorizedArray<Number> dof_values[dim * Utilities::pow(degree, dim - 1) * (degree + 1)];
-    read_cell_values_layered<degree, n_q_points_1d>(
-      src.begin(), dof_indices[cell], dof_values, values_y, derivatives_y);
+    static_assert(2 * n_pressure <= n_layered, "Pressure dofs must fit into derivatives_y");
+    read_cell_values_layered<degree, n_q_points_1d>(src.begin(),
+                                                    dof_indices[cell],
+                                                    values_y,
+                                                    derivatives_y);
 
     for(unsigned int f = 0; f < 2 * dim; ++f)
-      compute_face_convective<true, degree, n_q_points_1d, true>(
-        shape_data, src, cell, f, 1.0, nullptr, dof_values, face_data);
+      compute_face_convective<true, degree, n_q_points_1d, FaceInteriorData::layered>(
+        shape_data, src, cell, f, 1.0, nullptr, nullptr, face_data, values_y, derivatives_y);
 
     const VectorizedArray<Number> cfl_velocity =
       compute_cell_convective_layered<CellOperation::convective_and_divergence,
@@ -5488,19 +5503,20 @@ private:
                                       n_q_points_1d>(
         cell, values_y, derivatives_y, 1.0, face_data, velocity_integral, pressure_y);
 
-    VectorizedArray<Number> pressure_dofs[2][n_pressure];
+    VectorizedArray<Number> * pressure_dofs = derivatives_y;
     integrate_pressure_layered<degree, n_q_points_1d>(pressure_y,
                                                       face_data,
-                                                      pressure_dofs[0],
-                                                      pressure_dofs[1]);
-    store_pressure_dofs(cell, n_pressure, pressure_dofs[1], divergence);
+                                                      pressure_dofs,
+                                                      pressure_dofs + n_pressure);
+    store_pressure_dofs(cell, n_pressure, pressure_dofs, convective_divergence);
+    store_pressure_dofs(cell, n_pressure, pressure_dofs + n_pressure, divergence);
 
-    integrate_cell_layered<degree, n_q_points_1d>(values_y, nullptr, face_data, dof_values);
-    scatter_cell_dofs<degree>(dof_indices[cell],
-                              n_active_entries_per_cell_batch(cell),
-                              dof_values,
-                              velocity_dst.begin());
-    store_pressure_dofs(cell, n_pressure, pressure_dofs[0], convective_divergence);
+    integrate_scatter_layered<degree, n_q_points_1d>(values_y,
+                                                     nullptr,
+                                                     face_data,
+                                                     dof_indices[cell],
+                                                     n_active_entries_per_cell_batch(cell),
+                                                     velocity_dst.begin());
 
     return cfl_velocity;
   }
@@ -5998,7 +6014,7 @@ private:
   // test functions take the reverse path, overwriting the input of the plane
   // in 'values_y' and, only for factor_convective != 1 (terms tested by
   // gradients), in 'derivatives_y'. The faces in y direction are added by
-  // integrate_cell_layered(). Returns the CFL velocity of the cell.
+  // integrate_scatter_layered(). Returns the CFL velocity of the cell.
   //
   // For the convective term with divergence (factor_convective = 1), the
   // terms tested by the pressure test functions take the same path in the
@@ -8137,14 +8153,17 @@ private:
         }
   }
 
-  // With 'from_cell_dofs', the data on the interior side of the face is
-  // computed from the dofs of the cell ('dof_values'), otherwise from the
-  // values at the cell quadrature points ('quad_values'), see
-  // use_cell_dofs_for_faces().
-  template<bool include_convective_divergence,
-           int  degree,
-           int  n_q_points_1d,
-           bool from_cell_dofs = use_cell_dofs_for_faces(degree)>
+  // The data on the interior side of the face is computed according to
+  // 'interior_data': from the values at the cell quadrature points
+  // ('quad_values'), from the dofs of the cell ('dof_values'), see
+  // use_cell_dofs_for_faces(), or from the layered representation of
+  // read_cell_values_layered() ('values_y' and 'derivatives_y').
+  template<bool             include_convective_divergence,
+           int              degree,
+           int              n_q_points_1d,
+           FaceInteriorData interior_data = use_cell_dofs_for_faces(degree) ?
+                                              FaceInteriorData::cell_dofs :
+                                              FaceInteriorData::quadrature_points>
   void
   compute_face_convective(
     const std::vector<internal::MatrixFreeFunctions::UnivariateShapeData<Number>> & shape_data,
@@ -8154,7 +8173,9 @@ private:
     const Number                    factor_convective,
     const VectorizedArray<Number> * quad_values,
     const VectorizedArray<Number> * dof_values,
-    VectorizedArray<Number> *       face_data) const
+    VectorizedArray<Number> *       face_data,
+    const VectorizedArray<Number> * values_y      = nullptr,
+    const VectorizedArray<Number> * derivatives_y = nullptr) const
   {
     static_assert(dim == 3, "Only implemented for 3D");
 
@@ -8359,8 +8380,193 @@ private:
     // this cell, with the value of the normal component (and its normal
     // derivative including the dofs on the face) after the data of
     // read_face_values(). For low degrees, the interpolation from the
-    // values at the cell quadrature points is faster.
-    if constexpr(from_cell_dofs)
+    // values at the cell quadrature points is faster. The layered kernels
+    // take the data from their layered representation.
+    if constexpr(interior_data == FaceInteriorData::layered)
+    {
+      // Values and normal derivatives of the interior side at the face
+      // points, as for the quadrature points below, from
+      //   A = values_y (values interpolated in y direction) and
+      //   B = derivatives_y (derivatives in y direction),
+      // see read_cell_values_layered(): on the faces in x and z direction,
+      // contract A with the values and derivatives of the 1D shape
+      // functions at the face in the normal direction, then interpolate in
+      // the tangential direction z resp. x (y is at the points already); on
+      // the faces in y direction, interpolate A and B to the face with the
+      // Lagrange polynomials of the points in y direction (exact, as both are
+      // polynomials of lower degree in y), then in x and z direction
+      AssertThrow(values_y != nullptr && derivatives_y != nullptr, ExcInternalError());
+      const unsigned int     side = f % 2;
+      constexpr unsigned int nq   = n_q_points_1d;
+      for_each_component([&](auto component) DEAL_II_ALWAYS_INLINE {
+        constexpr unsigned int          c    = decltype(component)::value;
+        constexpr unsigned int          nx   = c == 0 ? n_n : n_t;
+        constexpr unsigned int          nz   = c == 2 ? n_n : n_t;
+        const auto &                    sh_x = shape_data[c == 0 ? 0 : 1];
+        const auto &                    sh_z = shape_data[c == 2 ? 0 : 1];
+        const VectorizedArray<Number> * a    = values_y + layered_component_offset<n_t, nq>(c);
+        const VectorizedArray<Number> * b    = derivatives_y + layered_component_offset<n_t, nq>(c);
+        VectorizedArray<Number> *       values      = values_face[0][c];
+        VectorizedArray<Number> *       derivatives = grads_face[0][c] + face_direction;
+
+        if(face_direction == 0)
+        {
+          // face points with y running fastest, followed by z
+          const Number * phi = sh_x.shape_data_on_face[side].data();
+          for(unsigned int qy = 0; qy < nq; ++qy)
+          {
+            VectorizedArray<Number> line_val[nz], line_der[nz];
+            for(unsigned int iz = 0; iz < nz; ++iz)
+            {
+              const VectorizedArray<Number> * a_line = a + (qy * nz + iz) * nx;
+              VectorizedArray<Number>         v      = phi[0] * a_line[0];
+              VectorizedArray<Number>         d      = phi[nx] * a_line[0];
+              for(unsigned int ix = 1; ix < nx; ++ix)
+              {
+                v += phi[ix] * a_line[ix];
+                d += phi[nx + ix] * a_line[ix];
+              }
+              line_val[iz] = v;
+              line_der[iz] = d;
+            }
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  nz,
+                                                  nq,
+                                                  1,
+                                                  nq,
+                                                  true,
+                                                  false>(sh_z.shape_values_eo.data(),
+                                                         line_val,
+                                                         values + qy);
+            if constexpr(include_convective_divergence)
+              internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                    internal::EvaluatorQuantity::value,
+                                                    nz,
+                                                    nq,
+                                                    1,
+                                                    nq * dim,
+                                                    true,
+                                                    false>(sh_z.shape_values_eo.data(),
+                                                           line_der,
+                                                           derivatives + qy * dim);
+          }
+        }
+        else if(face_direction == 2)
+        {
+          // face points with x running fastest, followed by y
+          const Number * phi = sh_z.shape_data_on_face[side].data();
+          for(unsigned int qy = 0; qy < nq; ++qy)
+          {
+            const VectorizedArray<Number> * a_plane = a + qy * nz * nx;
+            VectorizedArray<Number>         line_val[nx], line_der[nx];
+            for(unsigned int ix = 0; ix < nx; ++ix)
+            {
+              line_val[ix] = phi[0] * a_plane[ix];
+              line_der[ix] = phi[nz] * a_plane[ix];
+            }
+            for(unsigned int iz = 1; iz < nz; ++iz)
+              for(unsigned int ix = 0; ix < nx; ++ix)
+              {
+                line_val[ix] += phi[iz] * a_plane[iz * nx + ix];
+                line_der[ix] += phi[nz + iz] * a_plane[iz * nx + ix];
+              }
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  nx,
+                                                  nq,
+                                                  1,
+                                                  1,
+                                                  true,
+                                                  false>(sh_x.shape_values_eo.data(),
+                                                         line_val,
+                                                         values + qy * nq);
+            if constexpr(include_convective_divergence)
+              internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                    internal::EvaluatorQuantity::value,
+                                                    nx,
+                                                    nq,
+                                                    1,
+                                                    dim,
+                                                    true,
+                                                    false>(sh_x.shape_values_eo.data(),
+                                                           line_der,
+                                                           derivatives + qy * nq * dim);
+          }
+        }
+        else
+        {
+          // face points with x running fastest, followed by z
+          const std::array<Number, 2> * lagrange =
+            convective_interpolate_quad_to_boundary[side].data();
+          constexpr unsigned int  n_plane = nz * nx;
+          VectorizedArray<Number> plane_val[n_plane], plane_der[n_plane];
+          for(unsigned int i = 0; i < n_plane; ++i)
+          {
+            plane_val[i] = lagrange[0][0] * a[i];
+            if constexpr(include_convective_divergence)
+              plane_der[i] = lagrange[0][0] * b[i];
+          }
+          for(unsigned int qy = 1; qy < nq; ++qy)
+            for(unsigned int i = 0; i < n_plane; ++i)
+            {
+              plane_val[i] += lagrange[qy][0] * a[qy * n_plane + i];
+              if constexpr(include_convective_divergence)
+                plane_der[i] += lagrange[qy][0] * b[qy * n_plane + i];
+            }
+
+          VectorizedArray<Number> tmp[nz * nq];
+          for(unsigned int iz = 0; iz < nz; ++iz)
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  nx,
+                                                  nq,
+                                                  1,
+                                                  1,
+                                                  true,
+                                                  false>(sh_x.shape_values_eo.data(),
+                                                         plane_val + iz * nx,
+                                                         tmp + iz * nq);
+          for(unsigned int qx = 0; qx < nq; ++qx)
+            internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                  internal::EvaluatorQuantity::value,
+                                                  nz,
+                                                  nq,
+                                                  nq,
+                                                  nq,
+                                                  true,
+                                                  false>(sh_z.shape_values_eo.data(),
+                                                         tmp + qx,
+                                                         values + qx);
+          if constexpr(include_convective_divergence)
+          {
+            for(unsigned int iz = 0; iz < nz; ++iz)
+              internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                    internal::EvaluatorQuantity::value,
+                                                    nx,
+                                                    nq,
+                                                    1,
+                                                    1,
+                                                    true,
+                                                    false>(sh_x.shape_values_eo.data(),
+                                                           plane_der + iz * nx,
+                                                           tmp + iz * nq);
+            for(unsigned int qx = 0; qx < nq; ++qx)
+              internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                    internal::EvaluatorQuantity::value,
+                                                    nz,
+                                                    nq,
+                                                    nq,
+                                                    nq * dim,
+                                                    true,
+                                                    false>(sh_z.shape_values_eo.data(),
+                                                           tmp + qx,
+                                                           derivatives + qx * dim);
+          }
+        }
+      });
+    }
+    else if constexpr(interior_data == FaceInteriorData::cell_dofs)
     {
       constexpr unsigned int n_data_own =
         (include_convective_divergence ? 2 * n_t * n_t + 4 * n_t * n_n : n_t * n_t + 2 * n_t * n_n);
