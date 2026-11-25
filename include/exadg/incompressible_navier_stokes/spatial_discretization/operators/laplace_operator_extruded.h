@@ -42,6 +42,7 @@
 #include <map>
 #include <numeric>
 #include <random>
+#include <set>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/extruded_mapping_info.h>
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/face_integral_helper.h>
@@ -680,6 +681,103 @@ public:
       dst.local_element(i) = src.local_element(i);
     timings[t_vmult_count] += 1;
     timings[t_vmult_total] += timer.wall_time();
+  }
+
+  // Print the setup of the data exchange of the FE operator per process:
+  // the neighboring processes in the same and in other shared-memory
+  // domains (nodes), the size of the data per ghost update (received ghost
+  // entries; the compress sends the same amount back) and of the locally
+  // owned entries sent to the other processes (and received in the
+  // compress), split by same and other nodes, the share of cell batches
+  // touching ghost entries, and, with the block-Jacobi preconditioner of
+  // setup_block_batches(), the share of block batches run after the cell
+  // loop and of the unknowns with point Jacobi. Must be called on all
+  // processes.
+  void
+  print_exchange_statistics(const std::string & label) const
+  {
+    const MPI_Comm comm = dof_handler->get_mpi_communicator();
+    const auto &   part = *matrix_free.get_dof_info().vector_partitioner;
+
+    // ranks of the own shared-memory domain
+    std::vector<int> node_ranks;
+    {
+      MPI_Comm  comm_node;
+      const int rank = Utilities::MPI::this_mpi_process(comm);
+      int ierr = MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &comm_node);
+      AssertThrowMPI(ierr);
+      node_ranks.resize(Utilities::MPI::n_mpi_processes(comm_node));
+      ierr = MPI_Allgather(&rank, 1, MPI_INT, node_ranks.data(), 1, MPI_INT, comm_node);
+      AssertThrowMPI(ierr);
+      ierr = MPI_Comm_free(&comm_node);
+      AssertThrowMPI(ierr);
+      std::sort(node_ranks.begin(), node_ranks.end());
+    }
+    const auto on_node = [&](const unsigned int rank) {
+      return std::binary_search(node_ranks.begin(), node_ranks.end(), static_cast<int>(rank));
+    };
+
+    std::set<unsigned int> neighbors;
+    std::array<double, 2>  ghost_bytes = {}, import_bytes = {};
+    for(const auto & [rank, n] : part.ghost_targets())
+    {
+      neighbors.insert(rank);
+      ghost_bytes[on_node(rank) ? 0 : 1] += n * sizeof(Number);
+    }
+    for(const auto & [rank, n] : part.import_targets())
+    {
+      neighbors.insert(rank);
+      import_bytes[on_node(rank) ? 0 : 1] += n * sizeof(Number);
+    }
+    unsigned int n_neighbors_on_node = 0;
+    for(const unsigned int rank : neighbors)
+      if(on_node(rank))
+        ++n_neighbors_on_node;
+
+    // cell batches with ghost entries
+    const unsigned int n_stored  = Utilities::pow(dof_handler->get_fe().degree == 1 ? 2 : 3, dim);
+    const unsigned int n_owned   = part.locally_owned_size();
+    const unsigned int n_batches = matrix_free.n_cell_batches();
+    unsigned int       n_batches_with_ghosts = 0;
+    for(unsigned int cell = 0; cell < n_batches; ++cell)
+    {
+      bool has_ghost = false;
+      for(unsigned int i = 0; i < n_stored * n_lanes && !has_ghost; ++i)
+      {
+        const unsigned int index = compressed_dof_indices[cell * n_stored * n_lanes + i];
+        has_ghost                = index != numbers::invalid_unsigned_int && index >= n_owned;
+      }
+      if(has_ghost)
+        ++n_batches_with_ghosts;
+    }
+
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << "Data exchange of FE Laplace operator <"
+                << (std::is_same_v<Number, double> ? "double" : "float") << "> " << label
+                << ", degree " << dof_handler->get_fe().degree << ", per process:" << std::endl;
+    Helper::print_time(n_neighbors_on_node, "Neighbors on same node", comm);
+    Helper::print_time(neighbors.size() - n_neighbors_on_node, "Neighbors on other nodes", comm);
+    Helper::print_time(ghost_bytes[0] / 1024., "Ghosts from same node [KiB]", comm);
+    Helper::print_time(ghost_bytes[1] / 1024., "Ghosts from other nodes [KiB]", comm);
+    Helper::print_time(import_bytes[0] / 1024., "Owned to same node [KiB]", comm);
+    Helper::print_time(import_bytes[1] / 1024., "Owned to other nodes [KiB]", comm);
+    Helper::print_time(n_batches > 0 ? double(n_batches_with_ghosts) / n_batches : 0.,
+                       "Cell batches with ghosts",
+                       comm);
+    if(Utilities::MPI::max(has_block_batches() ? 1 : 0, comm) == 1)
+    {
+      const unsigned int n_block_batches = block_batch_order.size();
+      const unsigned int n_after_loop =
+        has_block_batches() ? block_batch_index[n_batches + 1] - block_batch_index[n_batches] : 0;
+      Helper::print_time(n_block_batches > 0 ? double(n_after_loop) / n_block_batches : 0.,
+                         "Block batches after loop",
+                         comm);
+      Helper::print_time(n_owned > 0 ? double(leftover_indices.size()) / n_owned : 0.,
+                         "Unknowns with point Jacobi",
+                         comm);
+    }
+    if(Utilities::MPI::this_mpi_process(comm) == 0)
+      std::cout << std::endl;
   }
 
   // Print the collected timings of the phases of vmult_scratch(), which is

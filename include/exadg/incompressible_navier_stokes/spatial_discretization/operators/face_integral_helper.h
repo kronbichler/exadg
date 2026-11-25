@@ -23,6 +23,7 @@
 
 #include <deal.II/base/floating_point_comparator.h>
 #include <deal.II/dofs/dof_handler.h>
+#include <deal.II/fe/fe_raviart_thomas.h>
 #include <deal.II/fe/mapping.h>
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/matrix_free/matrix_free.h>
@@ -31,6 +32,8 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include <type_traits>
+#include <vector>
 
 #ifdef __linux__
 #  include <sched.h>
@@ -404,6 +407,128 @@ compute_vectorization_category(const dealii::Triangulation<dim> & tria)
 
 
 
+namespace internal
+{
+// Detect FE_RaviartThomasNodal::get_lexicographic_numbering(), added to
+// deal.II together with the numbering of the DoFs on faces 2 and 3 in 3d
+// with the z-coordinate running fastest (deal.II commit c514173cf8)
+template<int dim, typename = void>
+struct has_rt_nodal_lexicographic_numbering : std::false_type
+{
+};
+
+template<int dim>
+struct has_rt_nodal_lexicographic_numbering<
+  dim,
+  std::void_t<decltype(dealii::FE_RaviartThomasNodal<dim>::get_lexicographic_numbering(0u))>>
+  : std::true_type
+{
+};
+} // namespace internal
+
+
+
+// Permutation of the DoFs on each face of a Raviart-Thomas element from the
+// numbering of the element to the one assumed by the operators on extruded
+// meshes (RTOperator::RaviartThomasOperator, the postprocessing): in 3d,
+// the DoFs on faces 2 and 3 (normal in y direction) with the x-coordinate
+// running fastest, which is the order of
+// FE_RaviartThomas::get_lexicographic_numbering(). Since deal.II commit
+// c514173cf8, FE_RaviartThomasNodal numbers them with the z-coordinate
+// running fastest; with older versions and for other elements, the
+// permutation is the identity. Entry [f][i] is the index within the face
+// f of the operators for the element's DoF i on face f.
+template<int dim>
+std::vector<std::vector<unsigned int>>
+get_rt_face_permutation(const dealii::FiniteElement<dim> & fe)
+{
+  const unsigned int                     dofs_per_face = fe.n_dofs_per_face();
+  std::vector<std::vector<unsigned int>> face_permutation(2 * dim,
+                                                          std::vector<unsigned int>(dofs_per_face));
+  for(auto & permutation : face_permutation)
+    for(unsigned int i = 0; i < dofs_per_face; ++i)
+      permutation[i] = i;
+  if constexpr(internal::has_rt_nodal_lexicographic_numbering<dim>::value)
+    if(dynamic_cast<const dealii::FE_RaviartThomasNodal<dim> *>(&fe) != nullptr)
+    {
+      const unsigned int              rt_degree = fe.degree - 1;
+      const std::vector<unsigned int> element_numbering =
+        dealii::FE_RaviartThomasNodal<dim>::get_lexicographic_numbering(rt_degree);
+      const std::vector<unsigned int> operator_numbering =
+        dealii::FE_RaviartThomas<dim>::get_lexicographic_numbering(rt_degree);
+      AssertDimension(element_numbering.size(), operator_numbering.size());
+      for(unsigned int i = 0; i < element_numbering.size(); ++i)
+      {
+        const unsigned int element_index  = element_numbering[i];
+        const unsigned int operator_index = operator_numbering[i];
+        if(element_index < 2 * dim * dofs_per_face)
+        {
+          const unsigned int face = element_index / dofs_per_face;
+          AssertThrow(operator_index / dofs_per_face == face, dealii::ExcInternalError());
+          face_permutation[face][element_index % dofs_per_face] = operator_index % dofs_per_face;
+        }
+        else
+          AssertThrow(element_index == operator_index,
+                      dealii::ExcMessage("Expected changes in the numbering on faces only"));
+      }
+    }
+  return face_permutation;
+}
+
+
+
+// Renumber the DoFs on the faces of a dealii::FE_RaviartThomasNodal element
+// to the order of get_rt_face_permutation() assumed by the operators on
+// extruded meshes; with deal.II versions before commit c514173cf8, this
+// function does nothing. The DoFs of each face need to be contiguous, as
+// after dealii::DoFRenumbering::matrix_free_data_locality(), and only their
+// order within the face changes. The mesh is assumed to have faces in
+// standard orientation. Constraints need to be recomputed after the
+// renumbering.
+template<int dim>
+void
+renumber_rt_face_dofs_in_operator_order(dealii::DoFHandler<dim> & dof_handler)
+{
+  const auto & fe = dof_handler.get_fe();
+  AssertThrow(dynamic_cast<const dealii::FE_RaviartThomasNodal<dim> *>(&fe) != nullptr,
+              dealii::ExcMessage("Only implemented for FE_RaviartThomasNodal"));
+  const std::vector<std::vector<unsigned int>> face_permutation = get_rt_face_permutation(fe);
+  const unsigned int                           dofs_per_face    = fe.n_dofs_per_face();
+  bool                                         is_identity      = true;
+  for(const auto & permutation : face_permutation)
+    for(unsigned int i = 0; i < dofs_per_face; ++i)
+      is_identity = is_identity && permutation[i] == i;
+  if(is_identity)
+    return;
+
+  // the new positions within each locally owned face
+  const dealii::IndexSet &                     owned = dof_handler.locally_owned_dofs();
+  std::vector<dealii::types::global_dof_index> new_global(owned.n_elements());
+  for(unsigned int i = 0; i < owned.n_elements(); ++i)
+    new_global[i] = owned.nth_index_in_set(i);
+  std::vector<dealii::types::global_dof_index> dof_indices(fe.n_dofs_per_cell());
+  for(const auto & cell : dof_handler.active_cell_iterators())
+    if(cell->is_locally_owned())
+    {
+      cell->get_dof_indices(dof_indices);
+      for(unsigned int f = 0; f < 2 * dim; ++f)
+      {
+        const dealii::types::global_dof_index first = dof_indices[f * dofs_per_face];
+        if(!owned.is_element(first))
+          continue;
+        for(unsigned int i = 1; i < dofs_per_face; ++i)
+          AssertThrow(dof_indices[f * dofs_per_face + i] == first + i,
+                      dealii::ExcMessage("The DoFs of each face need to be contiguous"));
+        const unsigned int local = owned.index_within_set(first);
+        for(unsigned int i = 0; i < dofs_per_face; ++i)
+          new_global[local + i] = owned.nth_index_in_set(local + face_permutation[f][i]);
+      }
+    }
+  dof_handler.renumber_dofs(new_global);
+}
+
+
+
 // Renumber the locally owned DoFs of a Raviart-Thomas element for the loop
 // of RTOperator::RaviartThomasOperator, which processes the cells in the
 // order given by 'cell_vectorization_category' (as computed by
@@ -448,7 +573,10 @@ renumber_dofs_in_cell_loop_order(dealii::DoFHandler<dim> &                 dof_h
                                            dof_handler.get_triangulation().n_active_cells()));
 
   // first DoF of each of the 2*dim+1 entities, after resolving the
-  // identity constraints of periodic faces, and the number of DoFs
+  // identity constraints of periodic faces, and the number of DoFs; the
+  // DoFs of the faces are contiguous in the order of
+  // get_rt_face_permutation()
+  const std::vector<std::vector<unsigned int>> face_permutation = get_rt_face_permutation(fe);
   std::vector<dealii::types::global_dof_index> dof_indices(dofs_per_cell);
   const auto                                   get_entities = [&](const CellIterator & cell) {
     cell->get_dof_indices(dof_indices);
@@ -457,11 +585,14 @@ renumber_dofs_in_cell_loop_order(dealii::DoFHandler<dim> &                 dof_h
     {
       const unsigned int n_dofs =
         e < 2 * dim ? dofs_per_face : dofs_per_cell - 2 * dim * dofs_per_face;
-      for(unsigned int i = 1; i < n_dofs; ++i)
-        AssertThrow(dof_indices[e * dofs_per_face + i] == dof_indices[e * dofs_per_face] + i,
+      const auto position = [&](const unsigned int i) {
+        return e < 2 * dim ? face_permutation[e][i] : i;
+      };
+      dealii::types::global_dof_index first = dof_indices[e * dofs_per_face] - position(0);
+      for(unsigned int i = 0; i < n_dofs; ++i)
+        AssertThrow(dof_indices[e * dofs_per_face + i] == first + position(i),
                     dealii::ExcMessage("The DoFs of each entity need to be contiguous"));
-      dealii::types::global_dof_index first = dof_indices[e * dofs_per_face];
-      const auto                      line = constraints.get_constraint_entries(first);
+      const auto line = constraints.get_constraint_entries(first);
       if(line != nullptr && line->size() == 1)
         first = (*line)[0].first;
       entities[e] = {first, n_dofs};

@@ -76,6 +76,8 @@ test(const unsigned int degree, const unsigned int n_refinements)
     mf_data.overlap_communication_computation = false;
     dealii::DoFRenumbering::matrix_free_data_locality(dof_handler, constraints, mf_data);
   }
+  // the face DoFs in the order of the RT operator
+  Helper::renumber_rt_face_dofs_in_operator_order(dof_handler);
   make_constraints();
 
   pcout << "Raviart-Thomas degree " << degree << ", " << number_name<Number>() << ", "

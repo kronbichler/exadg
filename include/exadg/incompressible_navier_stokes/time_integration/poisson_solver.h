@@ -2094,7 +2094,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     // EXADG_PMG_FE_BLOCK_JACOBI (block Jacobi on the FE levels: 1 on cells,
     // 2 on patches of 2^dim cells, both basic, 3 on cells vectorized and
     // embedded in the cell loop),
-    // EXADG_PMG_SMOOTHING_RANGE_FE (smoothing range on the FE levels).
+    // EXADG_PMG_SMOOTHING_RANGE_FE (smoothing range on the FE levels),
+    // EXADG_PMG_DEGREE_FE_BLOCK (degree on the FE levels with block Jacobi).
     const auto get_kind = [](const char * name) {
       using PolynomialType = typename SmootherType::PolynomialType;
       static_assert(std::is_same_v<PolynomialType, typename SmootherTypeDG::PolynomialType>);
@@ -2122,6 +2123,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     const unsigned int pressure_degree = dof_handler.get_fe().degree;
     // 1: blocks on single cells, 2: blocks on patches of 2^dim cells
     const unsigned int fe_block_jacobi = get_unsigned("EXADG_PMG_FE_BLOCK_JACOBI", 0);
+    const unsigned int degree_fe_block = get_unsigned("EXADG_PMG_DEGREE_FE_BLOCK", 3);
     const double       range_fe        = std::getenv("EXADG_PMG_SMOOTHING_RANGE_FE") ?
                                            std::atof(std::getenv("EXADG_PMG_SMOOTHING_RANGE_FE")) :
                                            20.;
@@ -2187,9 +2189,15 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         else
           matrix.apply_block_inverse(dst, src);
       };
+      // Chebyshev degree: on block-Jacobi levels from
+      // EXADG_PMG_DEGREE_FE_BLOCK (default 3), otherwise degree_fe or
+      // degree_linear
       smoother_data.degree =
-        mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree > 1 ? degree_fe :
-                                                                                     degree_linear;
+        level_block_jacobi ?
+          degree_fe_block :
+          (mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree > 1 ?
+             degree_fe :
+             degree_linear);
 
       // manually compute the eigenvalue estimate for Chebyshev because we
       // need to be careful with the constrained indices
@@ -2240,9 +2248,15 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
                   << (level_patch_jacobi    ? "patches of 2^dim cells" :
                       level_embedded_jacobi ? "cells, vectorized in the cell loop" :
                                               "cells")
-                  << ", max eigenvalue estimate "
+                  << ", Chebyshev degree " << smoother_data.degree << " range "
+                  << smoother_data.smoothing_range << ", max eigenvalue estimate "
                   << (eigenvalue_tracker.values.empty() ? 0. : eigenvalue_tracker.values.back())
                   << std::endl;
+
+      // setup of the data exchange of the FE levels with higher degree
+      if(not this->is_test &&
+         mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree > 1)
+        mg_matrices[level].print_exchange_statistics("on level " + std::to_string(level));
 
       // For float, we use the bf16 representation
       if constexpr(std::is_same_v<Number, float>)

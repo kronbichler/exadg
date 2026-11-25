@@ -300,6 +300,11 @@ SpatialOperatorBase<dim, Number>::initialize_dof_handler_and_constraints()
 
     if(number_dofs_in_cell_loop_order)
     {
+      // the face DoFs in the order of the RT operator (independent of the
+      // numbering within the faces of the deal.II version), which the cell
+      // loop order below keeps
+      Helper::renumber_rt_face_dofs_in_operator_order(dof_handler_u);
+      make_constraints_u();
       Helper::renumber_dofs_in_cell_loop_order(dof_handler_u, constraint_u, cell_loop_categories);
       make_constraints_u();
     }

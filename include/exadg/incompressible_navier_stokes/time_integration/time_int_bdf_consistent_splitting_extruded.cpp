@@ -295,7 +295,6 @@ template<int dim, typename Number>
 void
 TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
 {
-  dealii::Timer time;
   Base::allocate_vectors();
 
   // The restart of this class serializes the velocity only and recomputes the
@@ -501,9 +500,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
     poisson_preconditioner->get_dg_matrix().initialize_dof_vector(pressure[i]);
   for(unsigned int i = 0; i < pressure_matvec.size(); ++i)
     poisson_preconditioner->get_dg_matrix().initialize_dof_vector(pressure_matvec[i]);
-
-  this->pcout << "Setup time RT operator data structures: " << time.wall_time() << " s"
-              << std::endl;
 }
 
 template<int dim, typename Number>
@@ -2140,7 +2136,6 @@ template<int dim, typename Number>
 void
 TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
 {
-  dealii::Timer time;
   // Restart vectors need to be stored in a format compatible with the
   // DoFHandler, so the vectors written for
   // `RTOperator::RaviartThomasOperator` need to be converted
@@ -2193,8 +2188,6 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::read_restart_vectors()
 
   this->pcout << "Reading restart velocity[0]->norm: " << std::setprecision(8)
               << velocity[0].l2_norm() << std::endl;
-  this->pcout << "Time for restart: " << std::defaultfloat << std::setprecision(3) <<
-    time.wall_time() << " s" << std::endl;
 }
 
 // instantiations

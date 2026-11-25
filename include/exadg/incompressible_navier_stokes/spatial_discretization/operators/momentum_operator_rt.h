@@ -288,7 +288,9 @@ public:
       // number on each entity (face, cell) in global index space, which we
       // later translate to local numbers.
 
-      std::vector<types::global_dof_index> local_dof_indices(fe.dofs_per_cell);
+      std::vector<types::global_dof_index>         local_dof_indices(fe.dofs_per_cell);
+      const std::vector<std::vector<unsigned int>> face_permutation =
+        Helper::get_rt_face_permutation(fe);
       std::vector<dealii::ndarray<types::global_dof_index, 2 * dim + 1, n_lanes>>
                                            dof_indices_per_entity(matrix_free.n_cell_batches());
       std::vector<types::global_dof_index> ghost_indices;
@@ -313,15 +315,20 @@ public:
             if(!locally_owned_dofs.is_element(a) && !constraints.is_constrained(a))
               ghost_indices.push_back(a);
 
+          // the DoFs of each face are contiguous in the order of the
+          // operator, see Helper::get_rt_face_permutation()
           const unsigned int dofs_per_face = fe.dofs_per_face;
           for(unsigned int f = 0; f < 2 * dim; ++f)
           {
+            const types::global_dof_index first =
+              local_dof_indices[f * dofs_per_face] - face_permutation[f][0];
             for(unsigned int i = 0; i < dofs_per_face; ++i)
               AssertThrow(local_dof_indices[f * dofs_per_face + i] ==
-                            local_dof_indices[f * dofs_per_face] + i,
-                          ExcInternalError());
+                            first + face_permutation[f][i],
+                          ExcMessage("The DoFs of each face need to be contiguous in the order "
+                                     "of Helper::get_rt_face_permutation()"));
 
-            dof_indices_per_entity[cell][f][v] = local_dof_indices[f * dofs_per_face];
+            dof_indices_per_entity[cell][f][v] = first;
           }
           const unsigned int start_cell_dofs = 2 * dim * dofs_per_face;
           for(unsigned int i = 0; i < fe.dofs_per_cell - start_cell_dofs; ++i)
