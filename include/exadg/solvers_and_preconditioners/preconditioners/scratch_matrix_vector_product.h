@@ -262,6 +262,24 @@ public:
   }
 
   /**
+   * Start sending the contributions to ghost entries to their owners
+   * within the cell loop, e.g. from 'after_batch' of cell_loop() once all
+   * cell batches writing ghost entities are done, to overlap the exchange
+   * with the remaining cell batches. finish_loop() then only completes the
+   * exchange. Requires 'compress_ghosts' in reinit().
+   */
+  void
+  start_compress() const
+  {
+    Assert(compress_ghosts && !compress_started, dealii::ExcInternalError());
+    Number * scratch = scratch_data.data();
+    Number * mpi_dst = compress_vector.begin();
+    std::copy(scratch + layout.ghost_start, scratch + layout.size, mpi_dst + n_owned);
+    compress_vector.compress_start(0, dealii::VectorOperation::add);
+    compress_started = true;
+  }
+
+  /**
    * Send the contributions to ghost entries to their owners, if enabled,
    * and pass the remaining ranges to 'after_loop'. The function
    * 'work_during_compress' is run while the messages are in flight. The
@@ -289,8 +307,12 @@ public:
     if(compress_ghosts)
     {
       Number * mpi_dst = compress_vector.begin();
-      std::copy(scratch + layout.ghost_start, scratch + layout.size, mpi_dst + n_owned);
-      compress_vector.compress_start(0, dealii::VectorOperation::add);
+      if(!compress_started)
+      {
+        std::copy(scratch + layout.ghost_start, scratch + layout.size, mpi_dst + n_owned);
+        compress_vector.compress_start(0, dealii::VectorOperation::add);
+      }
+      compress_started = false;
       if(work_during_compress)
         work_during_compress();
       record(0);
@@ -363,6 +385,7 @@ private:
 
   unsigned int                          n_owned         = 0;
   bool                                  compress_ghosts = false;
+  mutable bool                          compress_started = false;
   Layout                                layout;
   std::vector<unsigned int>             entity_offset;
   mutable dealii::AlignedVector<Number> scratch_data;

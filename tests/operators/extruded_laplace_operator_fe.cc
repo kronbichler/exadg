@@ -395,6 +395,13 @@ test(const unsigned int degree, const unsigned int n_refinements, const bool car
     dealii::DoFRenumbering::matrix_free_data_locality(dof_handler, constraints, mf_data);
   }
   make_constraints();
+  // numbering in the order of the loop of vmult_scratch(), as on the
+  // multigrid levels
+  LaplaceOperator::renumber_fe_dofs_in_loop_order(dof_handler,
+                                                  constraints,
+                                                  cell_vectorization_category,
+                                                  LaplaceOperator::fe_overlap_split());
+  make_constraints();
 
   pcout << (cartesian ? "Cartesian mesh, " : "") << "FE degree " << degree << ", "
         << number_name<Number>() << ", " << tria.n_global_active_cells() << " cells, "

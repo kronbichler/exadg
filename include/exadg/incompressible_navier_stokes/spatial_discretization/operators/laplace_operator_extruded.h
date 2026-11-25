@@ -23,6 +23,7 @@
 
 #include <deal.II/base/floating_point_comparator.h>
 #include <deal.II/base/memory_space_data.h>
+#include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/timer.h>
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/fe/fe.h>
@@ -392,6 +393,218 @@ get_coarser_fe_degree(const unsigned int degree)
 
 
 
+// Fraction of the interior cell batches run before the cell batches
+// touching ghost entries in LaplaceOperatorFE::vmult_scratch(), see
+// LaplaceOperatorFE::setup_loop_order(), set by EXADG_FE_OVERLAP_SPLIT
+// (default 0.5, negative for the original order without overlap)
+inline double
+fe_overlap_split()
+{
+  return std::getenv("EXADG_FE_OVERLAP_SPLIT") ? std::atof(std::getenv("EXADG_FE_OVERLAP_SPLIT")) :
+                                                 0.5;
+}
+
+
+
+// Order of the cell batches of a MatrixFree object in the loop of
+// LaplaceOperatorFE::vmult_scratch(): the fraction 'split' of the interior
+// cell batches, then the cell batches with an unknown not owned by this
+// process (after resolving the identity constraints of periodic faces), then
+// the remaining interior cell batches, or the original order for 'split' < 0
+template<int dim, typename Number, typename OtherNumber>
+std::vector<unsigned int>
+compute_fe_loop_order(const MatrixFree<dim, Number> &        matrix_free,
+                      const AffineConstraints<OtherNumber> & constraints,
+                      const double                           split)
+{
+  const unsigned int        n_batches = matrix_free.n_cell_batches();
+  std::vector<unsigned int> order(n_batches);
+  std::iota(order.begin(), order.end(), 0u);
+  if(split < 0)
+    return order;
+  const IndexSet &                     owned = matrix_free.get_dof_handler().locally_owned_dofs();
+  std::vector<types::global_dof_index> dof_indices(
+    matrix_free.get_dof_handler().get_fe().dofs_per_cell);
+  std::vector<unsigned int> interior, boundary;
+  for(unsigned int cell = 0; cell < n_batches; ++cell)
+  {
+    bool touches_ghosts = false;
+    for(unsigned int v = 0;
+        v < matrix_free.n_active_entries_per_cell_batch(cell) && !touches_ghosts;
+        ++v)
+    {
+      matrix_free.get_cell_iterator(cell, v)->get_dof_indices(dof_indices);
+      for(types::global_dof_index index : dof_indices)
+      {
+        const auto line = constraints.get_constraint_entries(index);
+        if(line != nullptr && line->size() == 1 && (*line)[0].second == OtherNumber(1.0))
+          index = (*line)[0].first;
+        if(!owned.is_element(index) && !constraints.is_constrained(index))
+          touches_ghosts = true;
+      }
+    }
+    (touches_ghosts ? boundary : interior).push_back(cell);
+  }
+  if(boundary.empty())
+    return order;
+  const unsigned int n_first =
+    static_cast<unsigned int>(std::min(1., split) * interior.size() + 0.5);
+  order.clear();
+  order.insert(order.end(), interior.begin(), interior.begin() + n_first);
+  order.insert(order.end(), boundary.begin(), boundary.end());
+  order.insert(order.end(), interior.begin() + n_first, interior.end());
+  return order;
+}
+
+
+
+// Renumber the locally owned DoFs of a continuous FE_Q space for the loop of
+// LaplaceOperatorFE::vmult_scratch() (as RTOperator's numbering in
+// Helper::renumber_dofs_in_cell_loop_order()): the entities (vertices,
+// lines, quads, hexes) in the order of their last write in the loop of the
+// cell batches of compute_fe_loop_order(), such that the ranges of the
+// vector passed to 'after_loop' are contiguous, then the entities read by
+// cells of other processes, whose result is only complete after the
+// exchange, and finally the constrained DoFs. The DoFs of each entity stay
+// contiguous and in their order. The cell batches are those of a MatrixFree
+// object with the settings of LaplaceOperatorFE::reinit() and the given
+// 'cell_vectorization_category'. The constraints need to be recomputed
+// after the renumbering.
+template<int dim, typename OtherNumber>
+void
+renumber_fe_dofs_in_loop_order(DoFHandler<dim> &                      dof_handler,
+                               const AffineConstraints<OtherNumber> & constraints,
+                               const std::vector<unsigned int> &      cell_vectorization_category,
+                               const double                           split)
+{
+  const FiniteElement<dim> &                            fe     = dof_handler.get_fe();
+  const unsigned int                                    degree = fe.degree;
+  typename MatrixFree<dim, OtherNumber>::AdditionalData mf_data;
+  mf_data.cell_vectorization_category          = cell_vectorization_category;
+  mf_data.cell_vectorization_categories_strict = false;
+  mf_data.overlap_communication_computation    = false;
+  mf_data.initialize_mapping                   = false;
+  MatrixFree<dim, OtherNumber> matrix_free;
+  matrix_free.reinit(MappingQ1<dim>(), dof_handler, constraints, QGauss<1>(degree + 1), mf_data);
+  const std::vector<unsigned int> order = compute_fe_loop_order(matrix_free, constraints, split);
+
+  const IndexSet &   owned   = dof_handler.locally_owned_dofs();
+  const unsigned int n_owned = owned.n_elements();
+  const auto         resolve = [&](types::global_dof_index index) {
+    const auto line = constraints.get_constraint_entries(index);
+    if(line != nullptr && line->size() == 1 && (*line)[0].second == OtherNumber(1.0))
+      index = (*line)[0].first;
+    return index;
+  };
+
+  // entities of a cell: start within the cell's DoFs (hierarchic order) and
+  // number of DoFs
+  std::vector<std::pair<unsigned int, unsigned int>> entities;
+  for(unsigned int v = 0; v < GeometryInfo<dim>::vertices_per_cell; ++v)
+    entities.emplace_back(v * fe.n_dofs_per_vertex(), fe.n_dofs_per_vertex());
+  if(degree > 1)
+  {
+    for(unsigned int l = 0; l < GeometryInfo<dim>::lines_per_cell; ++l)
+      entities.emplace_back(fe.get_first_line_index() + l * fe.n_dofs_per_line(),
+                            fe.n_dofs_per_line());
+    if constexpr(dim == 3)
+    {
+      for(unsigned int q = 0; q < GeometryInfo<dim>::quads_per_cell; ++q)
+        entities.emplace_back(fe.get_first_quad_index(q), fe.n_dofs_per_quad(q));
+      entities.emplace_back(fe.get_first_hex_index(), fe.n_dofs_per_hex());
+    }
+    else
+      entities.emplace_back(fe.get_first_quad_index(0), fe.n_dofs_per_quad(0));
+  }
+
+  // first DoF of an entity, i.e., the smallest index of its DoFs, which
+  // form a contiguous range (in the order of the cell, the DoFs on some
+  // faces are permuted, see LaplaceOperatorFE::reinit())
+  std::vector<types::global_dof_index> dof_indices(fe.dofs_per_cell);
+  const auto entity_first = [&](const unsigned int start, const unsigned int n) {
+    types::global_dof_index first = resolve(dof_indices[start]);
+    types::global_dof_index last  = first;
+    for(unsigned int i = 1; i < n; ++i)
+    {
+      const types::global_dof_index index = resolve(dof_indices[start + i]);
+      first                               = std::min(first, index);
+      last                                = std::max(last, index);
+    }
+    AssertThrow(last - first + 1 == n, ExcMessage("The DoFs of each entity need to be contiguous"));
+    return first;
+  };
+
+  // last position in the loop writing each locally owned entity, given by
+  // the local index of its first DoF
+  std::vector<unsigned int> last_writer(n_owned, numbers::invalid_unsigned_int);
+  for(unsigned int position = 0; position < order.size(); ++position)
+    for(unsigned int v = 0; v < matrix_free.n_active_entries_per_cell_batch(order[position]); ++v)
+    {
+      matrix_free.get_cell_iterator(order[position], v)->get_dof_indices(dof_indices);
+      for(const auto & [start, n] : entities)
+      {
+        const types::global_dof_index first = entity_first(start, n);
+        if(owned.is_element(first) && !constraints.is_constrained(first))
+          last_writer[owned.index_within_set(first)] = position;
+      }
+    }
+
+  // entities read by cells of other processes
+  std::vector<unsigned char> is_imported(n_owned, 0);
+  for(const auto & cell : dof_handler.active_cell_iterators())
+    if(cell->is_ghost())
+    {
+      cell->get_dof_indices(dof_indices);
+      for(const auto & [start, n] : entities)
+      {
+        const types::global_dof_index first = entity_first(start, n);
+        if(owned.is_element(first))
+          is_imported[owned.index_within_set(first)] = 1;
+      }
+    }
+
+  std::vector<types::global_dof_index> new_numbers(n_owned, numbers::invalid_dof_index);
+  std::vector<std::pair<unsigned int, unsigned int>> imported_entities;
+  types::global_dof_index                            counter = 0;
+  for(unsigned int position = 0; position < order.size(); ++position)
+    for(unsigned int v = 0; v < matrix_free.n_active_entries_per_cell_batch(order[position]); ++v)
+    {
+      matrix_free.get_cell_iterator(order[position], v)->get_dof_indices(dof_indices);
+      for(const auto & [start, n] : entities)
+      {
+        const types::global_dof_index first = entity_first(start, n);
+        if(!owned.is_element(first) || constraints.is_constrained(first))
+          continue;
+        const unsigned int local = owned.index_within_set(first);
+        if(last_writer[local] != position || new_numbers[local] != numbers::invalid_dof_index)
+          continue;
+        if(is_imported[local])
+        {
+          imported_entities.emplace_back(local, n);
+          for(unsigned int i = 0; i < n; ++i)
+            new_numbers[local + i] = numbers::invalid_dof_index - 1;
+        }
+        else
+          for(unsigned int i = 0; i < n; ++i)
+            new_numbers[local + i] = counter++;
+      }
+    }
+  for(const auto & [local, n] : imported_entities)
+    for(unsigned int i = 0; i < n; ++i)
+      new_numbers[local + i] = counter++;
+  for(types::global_dof_index & number : new_numbers)
+    if(number == numbers::invalid_dof_index)
+      number = counter++;
+  AssertThrow(counter == n_owned, ExcInternalError());
+
+  std::vector<types::global_dof_index> new_global(n_owned);
+  for(unsigned int i = 0; i < n_owned; ++i)
+    new_global[i] = owned.nth_index_in_set(new_numbers[i]);
+  dof_handler.renumber_dofs(new_global);
+}
+
+
+
 template<int dim, typename Number = double>
 class LaplaceOperatorFE : public EnableObserverPointer
 {
@@ -663,6 +876,14 @@ public:
     factor_laplace = 1.0;
     factor_mass    = 0.0;
 
+    // overlap of the communication with the interior cell batches
+    // (EXADG_FE_OVERLAP_SPLIT: fraction of the interior cell batches before
+    // the cell batches touching ghost entries, negative to disable;
+    // EXADG_FE_MPI_PROGRESS: interval of calls to MPI_Iprobe in the
+    // interior cell batches, 0 to disable)
+    setup_loop_order(fe_overlap_split());
+    mpi_progress_interval =
+      std::getenv("EXADG_FE_MPI_PROGRESS") ? std::atoi(std::getenv("EXADG_FE_MPI_PROGRESS")) : 16;
     setup_scratch();
   }
 
@@ -811,16 +1032,17 @@ public:
                          comm,
                          total_time);
       Helper::print_time(timings[t_ghost_wait] / count, "Wait for ghosts", comm, total_time);
-      Helper::print_time(timings[t_cell_loop] / count,
-                         "Cell loop incl. after_loop",
+      const double cells_total =
+        timings[t_cell_loop] + timings[t_cells_boundary] + timings[t_cells_interior_2];
+      Helper::print_time(timings[t_cell_loop] / count, "Interior cells, part 1", comm, total_time);
+      Helper::print_time(timings[t_cells_boundary] / count, "Boundary cells", comm, total_time);
+      Helper::print_time(timings[t_cells_interior_2] / count,
+                         "Interior cells, part 2",
                          comm,
                          total_time);
-      Helper::print_time_per_node(timings[t_cell_loop] / count,
-                                  "Cell loop, node avg",
-                                  comm,
-                                  total_time);
+      Helper::print_time_per_node(cells_total / count, "All cells, node avg", comm, total_time);
       Helper::print_time(timings[t_compress_send] / count,
-                         "Compress send + zero ghosts",
+                         "Compress start + zero ghosts",
                          comm,
                          total_time);
       Helper::print_time(timings[t_compress_wait] / count, "Compress wait", comm, total_time);
@@ -888,6 +1110,22 @@ public:
                 const BeforeLoop & before_loop,
                 const AfterLoop &  after_loop) const
   {
+    do_vmult_scratch(src, before_loop, after_loop, nullptr);
+  }
+
+  // Implementation of vmult_scratch(), with 'after_batch(position,
+  // scratch_array)' run after each step of the loop if given. The cell
+  // batches run in the order of setup_loop_order(): the ghost update of src
+  // is finished after the first part of the interior cell batches, and the
+  // compress is started after the cell batches touching ghost entries, so
+  // that both overlap with the interior cell batches.
+  template<typename BeforeLoop, typename AfterLoop, typename AfterBatch>
+  void
+  do_vmult_scratch(const VectorType & src,
+                   const BeforeLoop & before_loop,
+                   const AfterLoop &  after_loop,
+                   const AfterBatch & after_batch) const
+  {
     Timer      total_timer, timer;
     const auto record = [&](const unsigned int phase) {
       timings[phase] += timer.wall_time();
@@ -921,7 +1159,7 @@ public:
       src.update_ghost_values_start();
     scratch.prepare_loop();
     record(t_ghost_start);
-    if(!src_has_ghosts)
+    if(n_before_ghosts == 0 && !src_has_ghosts)
       src.update_ghost_values_finish();
     record(t_ghost_wait);
 
@@ -929,13 +1167,14 @@ public:
       [&](const unsigned int begin, const unsigned int end, Number * values) {
         std::copy(src.begin() + begin, src.begin() + end, values);
       };
-
+    const MPI_Comm     comm   = dof_handler->get_mpi_communicator();
     const unsigned int degree = matrix_free.get_shape_info().data[0].fe_degree;
     scratch.cell_loop(
-      [&](const unsigned int cell, Number * scratch_array) {
+      [&](const unsigned int position, Number * scratch_array) {
         if constexpr(has_before_loop)
           if(use_pre_list)
-            run_pre_list(cell);
+            run_pre_list(position);
+        const unsigned int                                       cell = loop_order[position];
         typename ExaDG::ScratchMatrixVectorProduct<Number>::View dst{scratch_array};
         if(degree == 1)
           apply_cell_operation<1>(cell, src, scratch_dof_indices, dst);
@@ -959,8 +1198,36 @@ public:
           AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
       },
       after_loop,
-      copy_constrained);
-    record(t_cell_loop);
+      copy_constrained,
+      [&](const unsigned int position, const Number * scratch_array) {
+        if constexpr(!std::is_same_v<AfterBatch, std::nullptr_t>)
+          after_batch(position, scratch_array);
+        if(position + 1 == n_before_ghosts)
+        {
+          record(t_cell_loop);
+          if(!src_has_ghosts)
+            src.update_ghost_values_finish();
+          record(t_ghost_wait);
+        }
+        if(position + 1 == n_before_compress && n_before_compress < n_cell_batches)
+        {
+          record(t_cells_boundary);
+          scratch.start_compress();
+          record(t_compress_send);
+        }
+        // let MPI progress with the messages in flight during the interior
+        // cell batches
+        if(mpi_progress_interval > 0 && position % mpi_progress_interval == 0 &&
+           (position < n_before_ghosts || position >= n_before_compress))
+        {
+          int flag;
+          MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, comm, &flag, MPI_STATUS_IGNORE);
+        }
+      });
+    if(n_before_compress < n_cell_batches)
+      record(t_cells_interior_2);
+    else
+      record(n_before_ghosts > 0 ? t_cells_boundary : t_cell_loop);
 
     scratch.finish_loop(
       after_loop,
@@ -973,6 +1240,53 @@ public:
 
     timings[t_scratch_count] += 1;
     timings[t_scratch_total] += total_timer.wall_time();
+  }
+
+  // Order of the cell batches in vmult_scratch(), see do_vmult_scratch():
+  // first the fraction 'split' of the interior cell batches, which do not
+  // touch ghost entries, then the cell batches touching ghost entries, then
+  // the remaining interior cell batches, each part in the original order.
+  // With 'split' < 0, the original order without overlap. Must be called
+  // before setup_scratch().
+  void
+  setup_loop_order(const double split)
+  {
+    const unsigned int n_batches = matrix_free.n_cell_batches();
+    loop_order.resize(n_batches);
+    std::iota(loop_order.begin(), loop_order.end(), 0u);
+    n_before_ghosts   = 0;
+    n_before_compress = n_batches;
+    if(split < 0)
+      return;
+    const unsigned int n_stored = Utilities::pow(dof_handler->get_fe().degree == 1 ? 2 : 3, dim);
+    const unsigned int n_owned =
+      matrix_free.get_dof_info().vector_partitioner->locally_owned_size();
+    std::vector<unsigned int> interior, boundary;
+    for(unsigned int cell = 0; cell < n_batches; ++cell)
+    {
+      bool touches_ghosts = false;
+      for(unsigned int i = 0; i < n_stored * n_lanes && !touches_ghosts; ++i)
+      {
+        const unsigned int index = compressed_dof_indices[cell * n_stored * n_lanes + i];
+        touches_ghosts           = index != numbers::invalid_unsigned_int && index >= n_owned;
+      }
+      (touches_ghosts ? boundary : interior).push_back(cell);
+    }
+    const unsigned int n_first =
+      static_cast<unsigned int>(std::min(1., split) * interior.size() + 0.5);
+    loop_order.clear();
+    loop_order.insert(loop_order.end(), interior.begin(), interior.begin() + n_first);
+    loop_order.insert(loop_order.end(), boundary.begin(), boundary.end());
+    loop_order.insert(loop_order.end(), interior.begin() + n_first, interior.end());
+    n_before_ghosts   = n_first;
+    n_before_compress = n_first + boundary.size();
+    // without cell batches touching ghost entries, there is nothing to
+    // overlap with
+    if(boundary.empty())
+    {
+      n_before_ghosts   = 0;
+      n_before_compress = n_batches;
+    }
   }
 
   // Set the minimal number of locally owned entries for which the variant
@@ -1874,68 +2188,19 @@ public:
                                   const Number       factor) const
   {
     Assert(has_block_batches(), ExcMessage("Call setup_block_batches() first"));
-    Timer      total_timer, timer;
-    const auto record = [&](const unsigned int phase) {
-      timings[phase] += timer.wall_time();
-      timer.restart();
-    };
-    const bool         src_has_ghosts = src.has_ghost_elements();
-    const unsigned int n_batches      = matrix_free.n_cell_batches();
-
-    if(!src_has_ghosts)
-      src.update_ghost_values_start();
-    scratch.prepare_loop();
-    record(t_ghost_start);
-    if(!src_has_ghosts)
-      src.update_ghost_values_finish();
-    record(t_ghost_wait);
-
-    const auto copy_constrained =
-      [&](const unsigned int begin, const unsigned int end, Number * values) {
-        std::copy(src.begin() + begin, src.begin() + end, values);
-      };
-    const unsigned int degree = matrix_free.get_shape_info().data[0].fe_degree;
-    scratch.cell_loop(
-      [&](const unsigned int cell, Number * scratch_array) {
-        typename ExaDG::ScratchMatrixVectorProduct<Number>::View dst{scratch_array};
-        if(degree == 2)
-          apply_cell_operation<2>(cell, src, scratch_dof_indices, dst);
-        else if(degree == 3)
-          apply_cell_operation<3>(cell, src, scratch_dof_indices, dst);
-        else if(degree == 4)
-          apply_cell_operation<4>(cell, src, scratch_dof_indices, dst);
-#ifndef DEBUG
-        else if(degree == 5)
-          apply_cell_operation<5>(cell, src, scratch_dof_indices, dst);
-        else if(degree == 6)
-          apply_cell_operation<6>(cell, src, scratch_dof_indices, dst);
-        else if(degree == 7)
-          apply_cell_operation<7>(cell, src, scratch_dof_indices, dst);
-        else if(degree == 8)
-          apply_cell_operation<8>(cell, src, scratch_dof_indices, dst);
-#endif
-        else
-          AssertThrow(false, ExcMessage("Degree " + std::to_string(degree) + " not instantiated"));
-      },
-      after_loop,
-      copy_constrained,
-      [&](const unsigned int cell, const Number * scratch_array) {
-        for(unsigned int i = block_batch_index[cell]; i < block_batch_index[cell + 1]; ++i)
+    Timer              total_timer;
+    const unsigned int n_batches = matrix_free.n_cell_batches();
+    do_vmult_scratch(
+      src, nullptr, after_loop, [&](const unsigned int position, const Number * scratch_array) {
+        for(unsigned int i = block_batch_index[position]; i < block_batch_index[position + 1]; ++i)
           if(block_from_scratch)
             dispatch_block_batch<true>(block_batch_order[i], scratch_array, rhs, target, factor);
           else
             dispatch_block_batch<false>(block_batch_order[i], nullptr, residual, target, factor);
       });
-    record(t_cell_loop);
-
-    scratch.finish_loop(
-      after_loop,
-      [&]() {
-        if(!src_has_ghosts)
-          src.zero_out_ghost_values();
-      },
-      copy_constrained,
-      &timings[t_compress_send]);
+    // do_vmult_scratch() counts the product, so only add the time below
+    timings[t_scratch_count] -= 1;
+    timings[t_scratch_total] -= total_timer.wall_time();
 
     // interface batches and leftovers; the blocks also write into ghost
     // entries of 'target', which get discarded
@@ -2369,12 +2634,13 @@ private:
     scratch.reinit(
       matrix_free.get_dof_info().vector_partitioner,
       n_cell_batches,
-      [&](const unsigned int cell, const auto & add) {
+      [&](const unsigned int position, const auto & add) {
+        const unsigned int cell = loop_order[position];
         for(unsigned int i = 0; i < n_stored; ++i)
           for(unsigned int v = 0; v < n_lanes; ++v)
             add(compressed_dof_indices[(cell * n_stored + i) * n_lanes + v], entity_length[i]);
         if(extra_entities)
-          extra_entities(cell, add);
+          extra_entities(position, add);
       },
       true);
 
@@ -2432,14 +2698,16 @@ private:
           first_touch[j] = std::min(first_touch[j], cell);
       };
 
-    // reads by the cells, which coincide with the entities they write
-    for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
+    // reads by the cells, which coincide with the entities they write, at
+    // their position in the loop
+    for(unsigned int position = 0; position < n_cell_batches; ++position)
       for(unsigned int i = 0; i < n_stored; ++i)
         for(unsigned int v = 0; v < n_lanes; ++v)
         {
-          const unsigned int idx = compressed_dof_indices[(cell * n_stored + i) * n_lanes + v];
+          const unsigned int idx =
+            compressed_dof_indices[(loop_order[position] * n_stored + i) * n_lanes + v];
           if(idx < n_owned)
-            touch(cell, idx, idx + entity_length[i]);
+            touch(position, idx, idx + entity_length[i]);
         }
 
     // results passed on in the cell loop, including the constrained entries
@@ -3671,6 +3939,8 @@ private:
     t_ghost_start,
     t_ghost_wait,
     t_cell_loop,
+    t_cells_boundary,
+    t_cells_interior_2,
     t_compress_send,
     t_compress_wait,
     t_finish_ranges,
@@ -3682,6 +3952,14 @@ private:
   };
   static_assert(t_compress_wait == t_compress_send + 1 && t_finish_ranges == t_compress_send + 2);
   mutable std::array<double, n_timings> timings = {};
+
+  // order of the cell batches in vmult_scratch() (position -> cell batch)
+  // and the positions after which the ghost update is finished and the
+  // compress started, see setup_loop_order(); interval of MPI_Iprobe calls
+  std::vector<unsigned int> loop_order;
+  unsigned int              n_before_ghosts       = 0;
+  unsigned int              n_before_compress     = 0;
+  unsigned int              mpi_progress_interval = 16;
 
   mutable std::vector<unsigned int> scalar_entity_start;
   mutable std::vector<unsigned int> scalar_entity_node;

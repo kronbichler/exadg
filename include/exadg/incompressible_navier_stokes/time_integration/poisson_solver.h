@@ -1755,10 +1755,16 @@ public:
       else
         dof_h.distribute_dofs(*fe_hierarchy[level - coarse_triangulations.size() + 1]);
 
+      // categories of the cell batches of the level operator below
+      const std::vector<unsigned int> operator_categories =
+        (level < coarse_triangulations.size() && level + 1 < coarse_triangulations.size()) ?
+          std::vector<unsigned int>() :
+          cell_vectorization_category;
       reinit_level_constraints(dof_h,
                                level >= coarse_triangulations.size() ? cell_vectorization_category :
                                                                        std::vector<unsigned int>(),
-                               level_constraints[level]);
+                               level_constraints[level],
+                               &operator_categories);
 
       if(level < coarse_triangulations.size())
       {
@@ -2018,10 +2024,16 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     reinit_smoothers_and_dg(mapping_fine, dof_handler, ip_factor, cell_vectorization_category);
   }
 
+  // Set up the constraints of a level, after renumbering the DoFs with
+  // dealii::DoFRenumbering::matrix_free_data_locality() and then in the
+  // order of the loop of LaplaceOperatorFE::vmult_scratch() with the cell
+  // batches given by 'operator_categories' (or 'cell_vectorization_category'
+  // if not given), unless EXADG_FE_LOOP_ORDER_NUMBERING=0
   void
   reinit_level_constraints(DoFHandler<dim> &                 dof_h,
                            const std::vector<unsigned int> & cell_vectorization_category,
-                           AffineConstraints<Number> &       level_constraints)
+                           AffineConstraints<Number> &       level_constraints,
+                           const std::vector<unsigned int> * operator_categories = nullptr)
   {
     level_constraints.reinit(dof_h.locally_owned_dofs(),
                              dealii::DoFTools::extract_locally_relevant_dofs(dof_h));
@@ -2065,17 +2077,31 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     // renumber Dofs to minimize the number of partitions in import
     // indices of partitioner
     dealii::DoFRenumbering::matrix_free_data_locality(dof_h, level_constraints, mf_data);
-    level_constraints.reinit(dof_h.locally_owned_dofs(),
-                             dealii::DoFTools::extract_locally_relevant_dofs(dof_h));
-    if(has_hanging_nodes)
-      dealii::DoFTools::make_hanging_node_constraints(dof_h, level_constraints);
-    for(const auto & face_pair : periodic_faces)
-      ExaDG::Periodicity::make_periodicity_constraints_recursively(
-        face_pair.cell[0]->face(face_pair.face_idx[0]),
-        face_pair.cell[1]->face(face_pair.face_idx[1]),
-        level_constraints);
+    const auto make_constraints = [&]() {
+      level_constraints.reinit(dof_h.locally_owned_dofs(),
+                               dealii::DoFTools::extract_locally_relevant_dofs(dof_h));
+      if(has_hanging_nodes)
+        dealii::DoFTools::make_hanging_node_constraints(dof_h, level_constraints);
+      for(const auto & face_pair : periodic_faces)
+        ExaDG::Periodicity::make_periodicity_constraints_recursively(
+          face_pair.cell[0]->face(face_pair.face_idx[0]),
+          face_pair.cell[1]->face(face_pair.face_idx[1]),
+          level_constraints);
+      level_constraints.close();
+    };
+    make_constraints();
 
-    level_constraints.close();
+    if(std::getenv("EXADG_FE_LOOP_ORDER_NUMBERING") == nullptr ||
+       std::atoi(std::getenv("EXADG_FE_LOOP_ORDER_NUMBERING")) != 0)
+    {
+      LaplaceOperator::renumber_fe_dofs_in_loop_order(dof_h,
+                                                      level_constraints,
+                                                      operator_categories ?
+                                                        *operator_categories :
+                                                        cell_vectorization_category,
+                                                      LaplaceOperator::fe_overlap_split());
+      make_constraints();
+    }
   }
 
   void
