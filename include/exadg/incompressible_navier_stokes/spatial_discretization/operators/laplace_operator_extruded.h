@@ -39,6 +39,7 @@
 #include <deal.II/matrix_free/matrix_free.h>
 #include <deal.II/matrix_free/tensor_product_kernels.h>
 #include <deal.II/matrix_free/vector_access_internal.h>
+#include <deal.II/matrix_free/vector_data_exchange.h>
 
 #include <map>
 #include <numeric>
@@ -393,19 +394,6 @@ get_coarser_fe_degree(const unsigned int degree)
 
 
 
-// Fraction of the interior cell batches run before the cell batches
-// touching ghost entries in LaplaceOperatorFE::vmult_scratch(), see
-// LaplaceOperatorFE::setup_loop_order(), set by EXADG_FE_OVERLAP_SPLIT
-// (default 0.5, negative for the original order without overlap)
-inline double
-fe_overlap_split()
-{
-  return std::getenv("EXADG_FE_OVERLAP_SPLIT") ? std::atof(std::getenv("EXADG_FE_OVERLAP_SPLIT")) :
-                                                 0.5;
-}
-
-
-
 // Order of the cell batches of a MatrixFree object in the loop of
 // LaplaceOperatorFE::vmult_scratch(): the fraction 'split' of the interior
 // cell batches, then the cell batches with an unknown not owned by this
@@ -623,7 +611,7 @@ public:
          const Quadrature<1> &                  quadrature,
          const MPI_Comm                         communicator_shared = MPI_COMM_SELF)
   {
-    (void)communicator_shared; // TODO: not yet implemented
+    (void)communicator_shared; // see set_shared_memory()
     this->dof_handler                                   = &dof_handler;
     const FiniteElement<dim> &                       fe = dof_handler.get_fe();
     typename MatrixFree<dim, Number>::AdditionalData mf_data;
@@ -876,21 +864,23 @@ public:
     factor_laplace = 1.0;
     factor_mass    = 0.0;
 
-    // overlap of the communication with the interior cell batches
-    // (EXADG_FE_OVERLAP_SPLIT: fraction of the interior cell batches before
-    // the cell batches touching ghost entries, negative to disable;
-    // EXADG_FE_MPI_PROGRESS: interval of calls to MPI_Iprobe in the
-    // interior cell batches, 0 to disable)
-    setup_loop_order(fe_overlap_split());
-    mpi_progress_interval =
-      std::getenv("EXADG_FE_MPI_PROGRESS") ? std::atoi(std::getenv("EXADG_FE_MPI_PROGRESS")) : 16;
+    // overlap of the communication with the interior cell batches, see
+    // set_loop_settings()
+    setup_loop_order(overlap_split);
+    setup_shared_memory();
     setup_scratch();
   }
 
+  // Vectors of the operator; with the shared-memory exchange of
+  // set_shared_memory(), they are allocated in the shared memory of the
+  // node, which vmult_scratch() needs for the source vector
   void
   initialize_dof_vector(VectorType & vec) const
   {
-    matrix_free.initialize_dof_vector(vec);
+    if(comm_sm)
+      vec.reinit(matrix_free.get_dof_info().vector_partitioner, *comm_sm);
+    else
+      matrix_free.initialize_dof_vector(vec);
   }
 
   void
@@ -1155,12 +1145,24 @@ public:
     }
     record(t_before_loop);
 
-    if(!src_has_ghosts)
+    // with the shared-memory exchange, the ghost update is always run, as
+    // it also orders the compress steps of successive products, see
+    // ScratchMatrixVectorProduct::set_shared_memory_exchange()
+    const bool update_ghosts       = sm_exchange || !src_has_ghosts;
+    const auto ghost_update_finish = [&]() {
+      if(sm_exchange)
+        sm_ghost_update_finish(src);
+      else if(!src_has_ghosts)
+        src.update_ghost_values_finish();
+    };
+    if(sm_exchange)
+      sm_ghost_update_start(src);
+    else if(!src_has_ghosts)
       src.update_ghost_values_start();
     scratch.prepare_loop();
     record(t_ghost_start);
-    if(n_before_ghosts == 0 && !src_has_ghosts)
-      src.update_ghost_values_finish();
+    if(n_before_ghosts == 0 && update_ghosts)
+      ghost_update_finish();
     record(t_ghost_wait);
 
     const auto copy_constrained =
@@ -1205,8 +1207,7 @@ public:
         if(position + 1 == n_before_ghosts)
         {
           record(t_cell_loop);
-          if(!src_has_ghosts)
-            src.update_ghost_values_finish();
+          ghost_update_finish();
           record(t_ghost_wait);
         }
         if(position + 1 == n_before_compress && n_before_compress < n_cell_batches)
@@ -1240,6 +1241,48 @@ public:
 
     timings[t_scratch_count] += 1;
     timings[t_scratch_total] += total_timer.wall_time();
+  }
+
+  // Exchange of vmult_scratch() within the shared-memory domain (node), to
+  // be set before reinit(): if enabled, the ghost update reads the entries
+  // owned by the processes of the same node directly from their memory, and
+  // the owners add the contributions to their entries in the compress
+  // directly from the memory of the writing processes, using the zero-byte
+  // signals of deal.II's VectorDataExchange::Full. Only the processes on
+  // other nodes exchange messages. The vectors of initialize_dof_vector()
+  // are then allocated in shared memory, and the source vectors of
+  // vmult_scratch() must be such vectors. With 'ranks_per_node' > 0, the
+  // node is split into groups of that many consecutive ranks, to emulate
+  // several nodes on one machine.
+  void
+  set_shared_memory(const bool use_shared_memory, const unsigned int ranks_per_node = 0)
+  {
+    shared_memory           = use_shared_memory;
+    emulated_ranks_per_node = ranks_per_node;
+  }
+
+  // Settings of the loop of vmult_scratch(), to be set before reinit():
+  // the fraction 'split' of the interior cell batches run before the cell
+  // batches touching ghost entries (negative for the original order without
+  // overlap of the communication), and the interval of cell batches between
+  // calls to MPI_Iprobe in the interior cell batches (0 to disable)
+  void
+  set_loop_settings(const double split, const unsigned int progress_interval)
+  {
+    overlap_split         = split;
+    mpi_progress_interval = progress_interval;
+  }
+
+  // For the block-Jacobi preconditioner of setup_block_batches(), to be set
+  // before that function: the blocks of the cell loop compute the residual
+  // from the result of the operator still in the scratch array instead of
+  // reading the residual stored by 'after_loop'. This avoids the residual
+  // vector but extends the lifetime of the entities in the scratch array
+  // and was slower in tests.
+  void
+  set_block_from_scratch(const bool from_scratch)
+  {
+    block_from_scratch = from_scratch;
   }
 
   // Order of the cell batches in vmult_scratch(), see do_vmult_scratch():
@@ -1287,6 +1330,93 @@ public:
       n_before_ghosts   = 0;
       n_before_compress = n_batches;
     }
+  }
+
+  // Set up the communicators and the exchange object of the shared-memory
+  // exchange, see set_shared_memory(). The exchange runs on duplicates of
+  // the communicators, so its messages cannot match others.
+  void
+  setup_shared_memory()
+  {
+    sm_exchange.reset();
+    comm_sm.reset();
+    if(!shared_memory)
+    {
+      scratch.set_shared_memory_exchange(nullptr, MPI_COMM_SELF);
+      return;
+    }
+    const auto make_comm = [](const MPI_Comm comm) {
+      return std::shared_ptr<MPI_Comm>(new MPI_Comm(comm), [](MPI_Comm * c) {
+        int finalized = 0;
+        MPI_Finalized(&finalized);
+        if(!finalized)
+          MPI_Comm_free(c);
+        delete c;
+      });
+    };
+    const MPI_Comm     comm = dof_handler->get_mpi_communicator();
+    const unsigned int rank = Utilities::MPI::this_mpi_process(comm);
+    MPI_Comm           node;
+    int ierr = MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node);
+    AssertThrowMPI(ierr);
+    if(emulated_ranks_per_node > 0)
+    {
+      MPI_Comm group;
+      ierr = MPI_Comm_split(node, rank / emulated_ranks_per_node, rank, &group);
+      AssertThrowMPI(ierr);
+      ierr = MPI_Comm_free(&node);
+      AssertThrowMPI(ierr);
+      node = group;
+    }
+    comm_sm = make_comm(node);
+    MPI_Comm dup;
+    ierr = MPI_Comm_dup(comm, &dup);
+    AssertThrowMPI(ierr);
+    comm_exchange = make_comm(dup);
+    ierr          = MPI_Comm_dup(node, &dup);
+    AssertThrowMPI(ierr);
+    comm_exchange_sm = make_comm(dup);
+
+    const auto & part = *matrix_free.get_dof_info().vector_partitioner;
+    const auto   part_exchange =
+      std::make_shared<Utilities::MPI::Partitioner>(part.locally_owned_range(),
+                                                    part.ghost_indices(),
+                                                    *comm_exchange);
+    sm_exchange =
+      std::make_shared<internal::MatrixFreeFunctions::VectorDataExchange::Full>(part_exchange,
+                                                                                *comm_exchange_sm);
+    ghost_temporary.resize_fast(sm_exchange->n_import_indices());
+    n_sm_processes = Utilities::MPI::n_mpi_processes(*comm_sm);
+    scratch.set_shared_memory_exchange(sm_exchange, *comm_sm);
+  }
+
+  void
+  sm_ghost_update_start(const VectorType & src) const
+  {
+    AssertThrow(src.shared_vector_data().size() == n_sm_processes,
+                ExcMessage("The source vector must be allocated in shared memory, see "
+                           "initialize_dof_vector()"));
+    const unsigned int n_owned = src.locally_owned_size();
+    Number *           ghosts  = const_cast<Number *>(src.begin()) + n_owned;
+    sm_exchange->export_to_ghosted_array_start(
+      ghost_channel,
+      ArrayView<const Number>(src.begin(), n_owned),
+      src.shared_vector_data(),
+      ArrayView<Number>(ghosts, sm_exchange->n_ghost_indices()),
+      ArrayView<Number>(ghost_temporary.data(), ghost_temporary.size()),
+      ghost_requests);
+  }
+
+  void
+  sm_ghost_update_finish(const VectorType & src) const
+  {
+    const unsigned int n_owned = src.locally_owned_size();
+    Number *           ghosts  = const_cast<Number *>(src.begin()) + n_owned;
+    sm_exchange->export_to_ghosted_array_finish(ArrayView<const Number>(src.begin(), n_owned),
+                                                src.shared_vector_data(),
+                                                ArrayView<Number>(ghosts,
+                                                                  sm_exchange->n_ghost_indices()),
+                                                ghost_requests);
   }
 
   // Set the minimal number of locally owned entries for which the variant
@@ -1746,7 +1876,7 @@ public:
   // cell batch T_b at which the result of the operator on all its unknowns
   // has been passed to 'after_loop', reading the residual stored by
   // 'after_loop' for the chunks flagged in get_block_residual_chunks().
-  // Optionally (EXADG_FE_BLOCK_FROM_SCRATCH=1), the batches compute the
+  // Optionally (set_block_from_scratch()), the batches compute the
   // residual from the result of the operator still available in the
   // scratch array instead, with artificial writes of the entities of the
   // blocks by cell batch T_b in the scratch layout, determined by a
@@ -1774,12 +1904,8 @@ public:
     const MPI_Comm     comm   = dof_handler->get_mpi_communicator();
     const unsigned int degree = matrix_free.get_shape_info().data[0].fe_degree;
     // the blocks of the cell loop read the residual stored by 'after_loop'
-    // (default), or the result of the operator from the scratch array
-    // (EXADG_FE_BLOCK_FROM_SCRATCH=1), which avoids the residual vector but
-    // extends the lifetime of the entities in the scratch array and was
-    // slower in tests
-    block_from_scratch = std::getenv("EXADG_FE_BLOCK_FROM_SCRATCH") != nullptr &&
-                         std::atoi(std::getenv("EXADG_FE_BLOCK_FROM_SCRATCH")) != 0;
+    // (default), or the result of the operator from the scratch array, see
+    // set_block_from_scratch()
     setup_scratch();
     if(Utilities::MPI::max(has_hanging_nodes() || degree < 2 ? 1 : 0, comm) == 1)
       return false;
@@ -3960,6 +4086,23 @@ private:
   unsigned int              n_before_ghosts       = 0;
   unsigned int              n_before_compress     = 0;
   unsigned int              mpi_progress_interval = 16;
+  double                    overlap_split         = 0.5;
+
+  // shared-memory exchange, see set_shared_memory(): the communicator of
+  // the node for the allocation of the vectors, duplicates of the
+  // communicators for the messages, and the exchange object with its
+  // buffers; empty without shared memory. The compress uses channel 2, see
+  // ScratchMatrixVectorProduct.
+  static constexpr unsigned int ghost_channel           = 0;
+  bool                          shared_memory           = false;
+  unsigned int                  emulated_ranks_per_node = 0;
+  unsigned int                  n_sm_processes          = 1;
+  std::shared_ptr<MPI_Comm>     comm_sm;
+  std::shared_ptr<MPI_Comm>     comm_exchange;
+  std::shared_ptr<MPI_Comm>     comm_exchange_sm;
+  std::shared_ptr<const internal::MatrixFreeFunctions::VectorDataExchange::Full> sm_exchange;
+  mutable AlignedVector<Number>                                                  ghost_temporary;
+  mutable std::vector<MPI_Request>                                               ghost_requests;
 
   mutable std::vector<unsigned int> scalar_entity_start;
   mutable std::vector<unsigned int> scalar_entity_node;
@@ -4569,6 +4712,17 @@ public:
     timings[9] += total_timer.wall_time();
   }
 
+  // Settings of the prolongation within the DG smoother of
+  // vmult_scratch_with_prolongation(), to be set before its first call: per
+  // cell batch and lane instead of batches of arbitrary cells ordered by the
+  // consumers, and the look-ahead in cell batches when filling those batches
+  void
+  set_prolongation_settings(const bool lane_wise, const unsigned int lookahead)
+  {
+    prolongation_lane_wise = lane_wise;
+    prolongation_lookahead = lookahead;
+  }
+
   void
   set_penalty_parameters(const Number additional_factor)
   {
@@ -4829,7 +4983,7 @@ public:
       // cell batches is used
       use_prolongation_batches =
         Utilities::MPI::max(fe_operator.has_hanging_nodes() ? 1 : 0, MPI_COMM_WORLD) == 0 &&
-        std::getenv("EXADG_PROLONGATION_LANE_WISE") == nullptr;
+        !prolongation_lane_wise;
       if(use_prolongation_batches)
         setup_prolongation_batches(fe_operator);
       else
@@ -5414,6 +5568,8 @@ private:
   // the range of batches run before each cell batch (the batches before
   // prolongation_batch_index[0] are run with the packing of face data)
   mutable bool                                           prolongation_setup_done  = false;
+  bool                                                   prolongation_lane_wise   = false;
+  unsigned int                                           prolongation_lookahead   = 2;
   mutable bool                                           use_prolongation_batches = false;
   mutable std::vector<unsigned int>                      prolongation_fe_indices;
   mutable std::vector<unsigned char>                     prolongation_fe_unconstrained;
@@ -6039,9 +6195,7 @@ private:
     const unsigned int                degree         = shape_info.data[0].fe_degree;
     const unsigned int                n_stored = Utilities::pow(degree <= 2 ? degree + 1 : 3, dim);
     const std::vector<unsigned int> & fe_indices = fe_operator.get_compressed_dof_indices();
-    unsigned int                      look_ahead = 2;
-    if(const char * value = std::getenv("EXADG_PROLONGATION_LOOKAHEAD"))
-      look_ahead = std::atoi(value);
+    const unsigned int                look_ahead = prolongation_lookahead;
 
     prolongation_fe_indices.clear();
     prolongation_dg_starts.clear();

@@ -175,13 +175,11 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::TimeIntBDFConsistentSplittin
 {
   op_rt = std::make_shared<RTOperator::RaviartThomasOperator<dim, Number>>();
 
-  if(const char * interval = std::getenv("EXADG_INITIAL_GUESS_DIAGNOSTIC"))
-    ig_diagnostic_interval = std::max(0, std::atoi(interval));
-  if(std::getenv("EXADG_NO_FUSED_MOMENTUM_RHS"))
-    fused_momentum_rhs = false;
-  if(const char * interval = std::getenv("EXADG_MOMENTUM_RHS_NORM_INTERVAL"))
-    momentum_rhs_norm_interval = std::max(1, std::atoi(interval));
-  check_fused_momentum_rhs = std::getenv("EXADG_CHECK_FUSED_MOMENTUM_RHS") != nullptr;
+  const SolverSettingsExtruded & settings = this->param.solver_settings_extruded;
+  ig_diagnostic_interval                  = settings.initial_guess_diagnostic_interval;
+  fused_momentum_rhs                      = settings.fused_momentum_rhs;
+  momentum_rhs_norm_interval              = std::max(1u, settings.momentum_rhs_norm_interval);
+  check_fused_momentum_rhs                = settings.check_fused_momentum_rhs;
 
   pressure_first_vcycle_bins = {0.25, 0.5, 0.75, 1., 1.25, 1.5, 2., 3., 5., 10.};
   pressure_first_vcycle_histogram.resize(pressure_first_vcycle_bins.size() + 1);
@@ -320,9 +318,9 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
 
   // Communicator of the processes in the same shared-memory domain, used by
   // the RT operators to exchange face data via shared memory used during
-  // setup. TODO: Change environment variable to parameter in input file.
+  // setup, unless disabled by SolverSettingsExtruded::rt_shared_memory
   MPI_Comm comm_sm = MPI_COMM_SELF;
-  if(std::getenv("EXADG_RT_NO_SHARED_MEMORY") == nullptr)
+  if(this->param.solver_settings_extruded.rt_shared_memory)
   {
     const MPI_Comm comm = pde_operator->get_dof_handler_u().get_mpi_communicator();
     const int      ierr = MPI_Comm_split_type(comm,
@@ -482,7 +480,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
       this->param.IP_factor_pressure,
       this->is_test,
       this->param.multigrid_data_pressure_poisson.smoother_data.preconditioner ==
-        PreconditionerSmoother::BlockJacobi);
+        PreconditionerSmoother::BlockJacobi,
+      this->param.solver_settings_extruded);
   else
     poisson_preconditioner = std::make_shared<LaplaceOperator::PoissonPreconditionerMG<dim, float>>(
       *pde_operator->get_mapping(),
@@ -494,7 +493,8 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::allocate_vectors()
       this->param.IP_factor_pressure,
       this->is_test,
       this->param.multigrid_data_pressure_poisson.smoother_data.preconditioner ==
-        PreconditionerSmoother::BlockJacobi);
+        PreconditionerSmoother::BlockJacobi,
+      this->param.solver_settings_extruded);
 
   for(unsigned int i = 0; i < pressure.size(); ++i)
     poisson_preconditioner->get_dg_matrix().initialize_dof_vector(pressure[i]);

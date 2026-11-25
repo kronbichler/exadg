@@ -804,6 +804,11 @@ Parameters::print(dealii::ConditionalOStream const & pcout, std::string const & 
   if(temporal_discretization == TemporalDiscretization::BDFPressureCorrection)
     print_parameters_pressure_correction(pcout);
 
+  // SOLVERS ON EXTRUDED MESHES
+  if(temporal_discretization == TemporalDiscretization::BDFDualSplittingExtruded or
+     temporal_discretization == TemporalDiscretization::BDFConsistentSplittingExtruded)
+    solver_settings_extruded.print(pcout);
+
   // COUPLED NAVIER-STOKES SOLVER
   if(solver_type == SolverType::Steady or
      (solver_type == SolverType::Unsteady and

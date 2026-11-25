@@ -400,7 +400,7 @@ test(const unsigned int degree, const unsigned int n_refinements, const bool car
   LaplaceOperator::renumber_fe_dofs_in_loop_order(dof_handler,
                                                   constraints,
                                                   cell_vectorization_category,
-                                                  LaplaceOperator::fe_overlap_split());
+                                                  0.5);
   make_constraints();
 
   pcout << (cartesian ? "Cartesian mesh, " : "") << "FE degree " << degree << ", "
@@ -481,6 +481,22 @@ test(const unsigned int degree, const unsigned int n_refinements, const bool car
   check_chebyshev(
     pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
   check_chebyshev_fourth_kind(
+    pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
+
+  // exchange within the shared-memory domain, split into groups of two
+  // processes to combine shared memory and messages; the block-Jacobi
+  // checks below also run with it
+  op.set_shared_memory(true, 2);
+  op.reinit(
+    *mapping, dof_handler, constraints, cell_vectorization_category, dealii::QGauss<1>(degree + 1));
+  op.set_min_size_for_pre_list(0);
+  pcout << "  with shared-memory exchange" << std::endl;
+  op.initialize_dof_vector(src);
+  op.initialize_dof_vector(dst);
+  fill_vector(src, 0);
+  op.vmult(dst, src);
+  check_vmult_scratch(pcout, op, src, dst, tolerance<Number>());
+  check_chebyshev(
     pcout, op, inverse_diagonal, tolerance<Number>(), op.get_matrix_free().get_constrained_dofs());
 
   // block-Jacobi preconditioner with fast diagonalization

@@ -314,12 +314,12 @@ private:
   std::vector<double>            momentum_residual_end_history;
 
   // Compute the right-hand side and the residual of the initial guess in
-  // extrapolation mode with one cell loop (disabled by the environment
-  // variable EXADG_NO_FUSED_MOMENTUM_RHS). Every 'momentum_rhs_norm_interval'
-  // steps (EXADG_MOMENTUM_RHS_NORM_INTERVAL), the separate computation
-  // updates the norm of the right-hand side 'momentum_rhs_norm_last' used for
-  // the solver tolerance. With EXADG_CHECK_FUSED_MOMENTUM_RHS, each fused
-  // step is compared against the separate computation.
+  // extrapolation mode with one cell loop (SolverSettingsExtruded::
+  // fused_momentum_rhs). Every 'momentum_rhs_norm_interval' steps, the
+  // separate computation updates the norm of the right-hand side
+  // 'momentum_rhs_norm_last' used for the solver tolerance. With
+  // 'check_fused_momentum_rhs', each fused step is compared against the
+  // separate computation.
   bool                           fused_momentum_rhs         = true;
   unsigned int                   momentum_rhs_norm_interval = 16;
   double                         momentum_rhs_norm_last     = 0.;
@@ -342,8 +342,8 @@ private:
 
   // Diagnostic of alternative initial guesses for the momentum solver, see
   // initial_guess_diagnostic(): run every 'ig_diagnostic_interval' time
-  // steps (0 = disabled, set by the environment variable
-  // EXADG_INITIAL_GUESS_DIAGNOSTIC), with the last solutions in single
+  // steps (0 = disabled, SolverSettingsExtruded::
+  // initial_guess_diagnostic_interval), with the last solutions in single
   // precision (newest first) and their times
   void
   initial_guess_diagnostic(std::vector<Number> const & factors_initial_guess,

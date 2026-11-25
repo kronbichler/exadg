@@ -27,6 +27,7 @@
 #include <deal.II/base/partitioner.h>
 #include <deal.II/base/timer.h>
 #include <deal.II/lac/la_parallel_vector.h>
+#include <deal.II/matrix_free/vector_data_exchange.h>
 
 #include <algorithm>
 #include <array>
@@ -110,6 +111,29 @@ public:
 
     Number * data;
   };
+
+  /**
+   * Use the given exchange object for the compress of the contributions to
+   * ghost entries instead of the MPI exchange of the vector: the owners of
+   * ghost entries within the shared-memory domain of 'communicator_sm' add
+   * the contributions directly from the shared memory of the writing
+   * process, and only the processes in other domains send messages. Must be
+   * called before reinit(). The exchange object must have been set up with
+   * the same locally owned and ghost indices as the partitioner of reinit().
+   * The writing process overwrites its ghost range in the next compress, so
+   * the caller must ensure that the owners have finished reading by then,
+   * e.g. by a ghost update of the source vector between two compress steps,
+   * which waits for a signal sent by the owner after its compress.
+   */
+  void
+  set_shared_memory_exchange(
+    const std::shared_ptr<const dealii::internal::MatrixFreeFunctions::VectorDataExchange::Full> &
+                   exchange,
+    const MPI_Comm communicator_sm)
+  {
+    sm_exchange = exchange;
+    comm_sm     = communicator_sm;
+  }
 
   /**
    * Compute the layout of the scratch array. The function
@@ -275,7 +299,7 @@ public:
     Number * scratch = scratch_data.data();
     Number * mpi_dst = compress_vector.begin();
     std::copy(scratch + layout.ghost_start, scratch + layout.size, mpi_dst + n_owned);
-    compress_vector.compress_start(0, dealii::VectorOperation::add);
+    send_compress();
     compress_started = true;
   }
 
@@ -310,13 +334,13 @@ public:
       if(!compress_started)
       {
         std::copy(scratch + layout.ghost_start, scratch + layout.size, mpi_dst + n_owned);
-        compress_vector.compress_start(0, dealii::VectorOperation::add);
+        send_compress();
       }
       compress_started = false;
       if(work_during_compress)
         work_during_compress();
       record(0);
-      compress_vector.compress_finish(dealii::VectorOperation::add);
+      receive_compress();
       record(1);
 
       // add the local contributions to the ones received from the other
@@ -346,6 +370,48 @@ public:
   }
 
 private:
+  // Start and finish the compress of the ghost range of compress_vector,
+  // with the shared-memory exchange if set
+  void
+  send_compress() const
+  {
+    if(sm_exchange)
+    {
+      Number *           values  = compress_vector.begin();
+      const unsigned int n_ghost = compress_vector.get_partitioner()->n_ghost_indices();
+      compress_temporary.resize_fast(sm_exchange->n_import_indices());
+      sm_exchange->import_from_ghosted_array_start(
+        dealii::VectorOperation::add,
+        compress_channel,
+        dealii::ArrayView<const Number>(values, n_owned),
+        compress_vector.shared_vector_data(),
+        dealii::ArrayView<Number>(values + n_owned, n_ghost),
+        dealii::ArrayView<Number>(compress_temporary.data(), compress_temporary.size()),
+        compress_requests);
+    }
+    else
+      compress_vector.compress_start(0, dealii::VectorOperation::add);
+  }
+
+  void
+  receive_compress() const
+  {
+    if(sm_exchange)
+    {
+      Number *           values  = compress_vector.begin();
+      const unsigned int n_ghost = compress_vector.get_partitioner()->n_ghost_indices();
+      sm_exchange->import_from_ghosted_array_finish(
+        dealii::VectorOperation::add,
+        dealii::ArrayView<Number>(values, n_owned),
+        compress_vector.shared_vector_data(),
+        dealii::ArrayView<Number>(values + n_owned, n_ghost),
+        dealii::ArrayView<const Number>(compress_temporary.data(), compress_temporary.size()),
+        compress_requests);
+    }
+    else
+      compress_vector.compress_finish(dealii::VectorOperation::add);
+  }
+
   // Layout of the scratch array, see the class description
   struct Layout
   {
@@ -383,13 +449,22 @@ private:
     unsigned int size        = 0;
   };
 
-  unsigned int                          n_owned         = 0;
-  bool                                  compress_ghosts = false;
+  unsigned int                          n_owned          = 0;
+  bool                                  compress_ghosts  = false;
   mutable bool                          compress_started = false;
   Layout                                layout;
   std::vector<unsigned int>             entity_offset;
   mutable dealii::AlignedVector<Number> scratch_data;
   mutable VectorType                    compress_vector;
+
+  // shared-memory exchange of the compress, see
+  // set_shared_memory_exchange(), with the channel for its MPI tags
+  static constexpr unsigned int compress_channel = 2;
+  std::shared_ptr<const dealii::internal::MatrixFreeFunctions::VectorDataExchange::Full>
+                                        sm_exchange;
+  MPI_Comm                              comm_sm = MPI_COMM_SELF;
+  mutable dealii::AlignedVector<Number> compress_temporary;
+  mutable std::vector<MPI_Request>      compress_requests;
 };
 
 
@@ -832,7 +907,14 @@ ScratchMatrixVectorProduct<Number>::reinit(
   layout.gap_list_index[n_cell_batches] = layout.gap_list.size();
 
   scratch_data.resize_fast(layout.size);
-  if(compress_ghosts)
+  if(compress_ghosts && sm_exchange)
+  {
+    AssertThrow(sm_exchange->locally_owned_size() == partitioner->locally_owned_size() &&
+                  sm_exchange->n_ghost_indices() == partitioner->n_ghost_indices(),
+                dealii::ExcMessage("Exchange object does not match the partitioner"));
+    compress_vector.reinit(partitioner, comm_sm);
+  }
+  else if(compress_ghosts)
     compress_vector.reinit(partitioner);
   else
     compress_vector.reinit(0);

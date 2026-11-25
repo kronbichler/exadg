@@ -28,6 +28,7 @@
 // ExaDG
 #include <exadg/grid/grid_data.h>
 #include <exadg/incompressible_navier_stokes/user_interface/enum_types.h>
+#include <exadg/incompressible_navier_stokes/user_interface/solver_settings_extruded.h>
 #include <exadg/incompressible_navier_stokes/user_interface/viscosity_model_data.h>
 #include <exadg/operators/inverse_mass_parameters.h>
 #include <exadg/solvers_and_preconditioners/multigrid/multigrid_parameters.h>
@@ -707,6 +708,17 @@ public:
   // solver data for Schur complement
   // (only relevant if iterative_solve_of_pressure_block == true)
   SolverData solver_data_pressure_block;
+
+  /**************************************************************************/
+  /*                                                                        */
+  /*                  SOLVERS OF THE SCHEMES ON EXTRUDED MESHES             */
+  /*                                                                        */
+  /**************************************************************************/
+
+  // settings of the solvers of BDFConsistentSplittingExtruded and
+  // BDFDualSplittingExtruded, read from the subsection
+  // "SolverSettingsExtruded" of the input file
+  SolverSettingsExtruded solver_settings_extruded;
 };
 
 } // namespace IncNS

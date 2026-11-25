@@ -50,6 +50,7 @@
 #include <set>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/laplace_operator_extruded.h>
+#include <exadg/incompressible_navier_stokes/user_interface/solver_settings_extruded.h>
 #include <exadg/operators/constraints.h>
 #include <exadg/solvers_and_preconditioners/preconditioners/chebyshev_scratch.h>
 #include <exadg/utilities/mpi_shared_memory.h>
@@ -458,11 +459,16 @@ public:
   MGTwoLevelTransferAnisotropicNested(
     const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_fine,
     const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_coarse,
-    const bool                                              print_statistics = false)
+    const bool                                              print_statistics = false,
+    const bool                                              profile_barrier  = false,
+    const bool                                              shared_memory    = true,
+    const unsigned int                                      ranks_per_node   = 0)
     : operator_fine(operator_fine),
       operator_coarse(operator_coarse),
       print_timings(print_statistics),
-      barrier_before_transfer(std::getenv("EXADG_TRANSFER_PROFILE_BARRIER") != nullptr)
+      barrier_before_transfer(profile_barrier),
+      use_shared_memory(shared_memory),
+      emulated_ranks_per_node(ranks_per_node)
   {
     // find unique indices of prolongation to identify the actual read
     // pattern; on cells with hanging nodes, only the DoFs actually owned by
@@ -1003,11 +1009,8 @@ private:
     ierr = MPI_Comm_free(&comm_shared);
     AssertThrowMPI(ierr);
     // emulate a layout with several nodes on a single machine
-    if(const char * env = std::getenv("EXADG_RANKS_PER_NODE"))
-    {
-      const unsigned int ranks_per_node = std::max(1, std::atoi(env));
-      node_id                           = my_rank / ranks_per_node * ranks_per_node;
-    }
+    if(emulated_ranks_per_node > 0)
+      node_id = my_rank / emulated_ranks_per_node * emulated_ranks_per_node;
     const std::vector<unsigned int> node_of_rank = Utilities::MPI::all_gather(comm, node_id);
     const std::size_t               n_nodes =
       std::set<unsigned int>(node_of_rank.begin(), node_of_rank.end()).size();
@@ -1155,11 +1158,15 @@ private:
   const LaplaceOperator::LaplaceOperatorFE<dim, Number> & operator_coarse;
 
   // Accumulated wall time of the phases of prolongation and restriction,
-  // printed at destruction; with EXADG_TRANSFER_PROFILE_BARRIER, a barrier
+  // printed at destruction; with 'barrier_before_transfer', a barrier
   // before each transfer separates the waiting for late processes (phase 0)
   // from the transfer itself
-  const bool                     print_timings;
-  const bool                     barrier_before_transfer;
+  const bool print_timings;
+  const bool barrier_before_transfer;
+  // use shared memory within a node, and the number of processes of an
+  // emulated node (0: actual nodes), see SolverSettingsExtruded
+  const bool                     use_shared_memory;
+  const unsigned int             emulated_ranks_per_node;
   mutable std::array<double, 7>  time_prolongation = {};
   mutable std::array<double, 6>  time_restriction  = {};
   mutable unsigned long long int n_prolongations   = 0;
@@ -1306,8 +1313,8 @@ private:
 
   /**
    * Allocate the communication buffers and set up the access to the data of
-   * the partners. Shared memory is used unless the environment variable
-   * EXADG_TRANSFER_NO_SHARED_MEMORY is set. Collective over the communicator
+   * the partners. Shared memory is used unless disabled by
+   * 'use_shared_memory'. Collective over the communicator
    * of the coarse cells.
    */
   void
@@ -1324,7 +1331,7 @@ private:
 
     MPI_Comm comm_sm = MPI_COMM_NULL;
     int      ierr;
-    if(std::getenv("EXADG_TRANSFER_NO_SHARED_MEMORY") == nullptr)
+    if(use_shared_memory)
     {
       ierr = MPI_Comm_split_type(comm,
                                  MPI_COMM_TYPE_SHARED,
@@ -1335,10 +1342,10 @@ private:
 
       // emulate a layout with several nodes on a single machine, for testing
       // the combination of shared memory and messages
-      if(const char * env = std::getenv("EXADG_RANKS_PER_NODE"))
+      if(emulated_ranks_per_node > 0)
       {
         const unsigned int rank           = Utilities::MPI::this_mpi_process(comm);
-        const unsigned int ranks_per_node = std::max(1, std::atoi(env));
+        const unsigned int ranks_per_node = emulated_ranks_per_node;
         MPI_Comm           comm_node;
         ierr = MPI_Comm_split(comm_sm, rank / ranks_per_node, rank, &comm_node);
         AssertThrowMPI(ierr);
@@ -1720,7 +1727,8 @@ public:
                                                         typename dealii::Triangulation<dim>::cell_iterator const)> & mapping_function,
                           const Number ip_factor,
                           const bool is_test,
-                          const bool dg_block_jacobi = false)
+                          const bool dg_block_jacobi = false,
+                          const ExaDG::IncNS::SolverSettingsExtruded & settings = {})
     : coarse_triangulations(
         dealii::MGTransferGlobalCoarseningTools::create_geometric_coarsening_sequence(
           dof_handler.get_triangulation()/*,
@@ -1730,12 +1738,22 @@ public:
       max_level(dof_handler.get_triangulation().n_global_levels() - 1 + fe_hierarchy.max_level()),
       is_test(is_test),
       dg_block_jacobi(dg_block_jacobi),
+      settings(settings),
       factor_for_zero_mean_with_constraints_l0(1.0)
   {
     dof_handler_hierarchy.resize(min_level, max_level);
 
     level_constraints.resize(min_level, max_level);
     mg_matrices.resize(min_level, max_level);
+    // settings of the FE operators needed in their reinit()
+    for(unsigned int level = min_level; level <= max_level; ++level)
+    {
+      mg_matrices[level].set_loop_settings(settings.fe_overlap_split,
+                                           settings.fe_mpi_progress_interval);
+      mg_matrices[level].set_block_from_scratch(settings.fe_block_from_scratch);
+      mg_matrices[level].set_shared_memory(settings.fe_shared_memory,
+                                           settings.transfer_ranks_per_node);
+    }
     mg_smoother.resize(min_level, max_level);
     mg_transfers.resize(min_level, max_level);
     rhs.resize(min_level, max_level);
@@ -1835,7 +1853,8 @@ public:
       typename dealii::Triangulation<dim>::cell_iterator const)> & mapping_function,
     const Number                                                   ip_factor,
     const bool                                                     is_test,
-    const bool                                                     dg_block_jacobi = false)
+    const bool                                                     dg_block_jacobi = false,
+    const ExaDG::IncNS::SolverSettingsExtruded &                   settings        = {})
     : coarse_triangulations(
         dealii::
           MGTransferGlobalCoarseningTools::create_geometric_coarsening_sequence(coarser_triangulations
@@ -1851,12 +1870,22 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
                 1 + fe_hierarchy.max_level()),
       is_test(is_test),
       dg_block_jacobi(dg_block_jacobi),
+      settings(settings),
       factor_for_zero_mean_with_constraints_l0(1.0)
   {
     dof_handler_hierarchy.resize(min_level, max_level);
 
     level_constraints.resize(min_level, max_level);
     mg_matrices.resize(min_level, max_level);
+    // settings of the FE operators needed in their reinit()
+    for(unsigned int level = min_level; level <= max_level; ++level)
+    {
+      mg_matrices[level].set_loop_settings(settings.fe_overlap_split,
+                                           settings.fe_mpi_progress_interval);
+      mg_matrices[level].set_block_from_scratch(settings.fe_block_from_scratch);
+      mg_matrices[level].set_shared_memory(settings.fe_shared_memory,
+                                           settings.transfer_ranks_per_node);
+    }
     mg_smoother.resize(min_level, max_level);
     mg_transfers.resize(min_level, max_level);
     rhs.resize(min_level, max_level);
@@ -1973,7 +2002,12 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         else if(level > max_level - n_final_geometric_levels)
         {
           auto transfer = std::make_unique<MGTwoLevelTransferAnisotropicNested<dim, Number>>(
-            mg_matrices[level], mg_matrices[level - 1], not is_test);
+            mg_matrices[level],
+            mg_matrices[level - 1],
+            not is_test,
+            settings.transfer_profile_barrier,
+            settings.transfer_shared_memory,
+            settings.transfer_ranks_per_node);
           // Compare the nested anisotropic transfer result with the output of
           // the (more general) non-nested transfer of deal.II to ensure
           // correctness of the result.
@@ -2025,10 +2059,11 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
   }
 
   // Set up the constraints of a level, after renumbering the DoFs with
-  // dealii::DoFRenumbering::matrix_free_data_locality() and then in the
-  // order of the loop of LaplaceOperatorFE::vmult_scratch() with the cell
-  // batches given by 'operator_categories' (or 'cell_vectorization_category'
-  // if not given), unless EXADG_FE_LOOP_ORDER_NUMBERING=0
+  // dealii::DoFRenumbering::matrix_free_data_locality() and, with
+  // SolverSettingsExtruded::fe_loop_order_numbering, then in the order of the loop of
+  // LaplaceOperatorFE::vmult_scratch() with the cell batches given by
+  // 'operator_categories' (or 'cell_vectorization_category' if not given);
+  // the latter was 2-3% slower on the periodic hill with 12 processes
   void
   reinit_level_constraints(DoFHandler<dim> &                 dof_h,
                            const std::vector<unsigned int> & cell_vectorization_category,
@@ -2091,15 +2126,14 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     };
     make_constraints();
 
-    if(std::getenv("EXADG_FE_LOOP_ORDER_NUMBERING") == nullptr ||
-       std::atoi(std::getenv("EXADG_FE_LOOP_ORDER_NUMBERING")) != 0)
+    if(settings.fe_loop_order_numbering)
     {
       LaplaceOperator::renumber_fe_dofs_in_loop_order(dof_h,
                                                       level_constraints,
                                                       operator_categories ?
                                                         *operator_categories :
                                                         cell_vectorization_category,
-                                                      LaplaceOperator::fe_overlap_split());
+                                                      settings.fe_overlap_split);
       make_constraints();
     }
   }
@@ -2110,58 +2144,44 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
                           const Number                      ip_factor,
                           const std::vector<unsigned int> & cell_vectorization_category)
   {
-    // Settings of the Chebyshev smoothers, with overrides by environment
-    // variables for parameter studies:
-    // EXADG_PMG_CHEBYSHEV_KIND_DG / _FE = first | fourth | opt_fourth,
-    // EXADG_PMG_DEGREE_DG / _FE (FE levels of degree > 1) / _LINEAR,
-    // EXADG_PMG_EIG_FACTOR (safety factor on the eigenvalue estimate),
-    // EXADG_PMG_SMOOTHING_RANGE_DG (smoothing range on the DG level),
-    // EXADG_PMG_BLOCK_ITERATIONS (correction steps of the block inverse),
-    // EXADG_PMG_FE_BLOCK_JACOBI (block Jacobi on the FE levels: 1 on cells,
-    // 2 on patches of 2^dim cells, both basic, 3 on cells vectorized and
-    // embedded in the cell loop),
-    // EXADG_PMG_SMOOTHING_RANGE_FE (smoothing range on the FE levels),
-    // EXADG_PMG_DEGREE_FE_BLOCK (degree on the FE levels with block Jacobi).
-    const auto get_kind = [](const char * name) {
+    // Settings of the Chebyshev smoothers from SolverSettingsExtruded
+    const auto get_kind = [](const std::string & value) {
       using PolynomialType = typename SmootherType::PolynomialType;
       static_assert(std::is_same_v<PolynomialType, typename SmootherTypeDG::PolynomialType>);
-      const char * value = std::getenv(name);
-      if(value == nullptr || std::string(value) == "first")
+      if(value == "first")
         return PolynomialType::first_kind;
-      else if(std::string(value) == "fourth")
+      else if(value == "fourth")
         return PolynomialType::fourth_kind;
-      else if(std::string(value) == "opt_fourth")
+      else if(value == "opt_fourth")
         return PolynomialType::fourth_kind_optimized;
-      AssertThrow(false,
-                  ExcMessage(std::string("Unknown Chebyshev kind '") + value + "' in " + name));
+      AssertThrow(false, ExcMessage("Unknown Chebyshev kind '" + value + "'"));
       return PolynomialType::first_kind;
     };
-    const auto get_unsigned = [](const char * name, const unsigned int default_value) {
-      const char * value = std::getenv(name);
-      return value == nullptr ? default_value : static_cast<unsigned int>(std::atoi(value));
-    };
-    const auto kind_dg = get_kind("EXADG_PMG_CHEBYSHEV_KIND_DG");
-    const auto kind_fe = get_kind("EXADG_PMG_CHEBYSHEV_KIND_FE");
+    const auto kind_dg = get_kind(settings.chebyshev_kind_dg);
+    const auto kind_fe = get_kind(settings.chebyshev_kind_fe);
     // Defaults on the DG level from a parameter study on the periodic hill
     // (pressure degrees 4, 5, 7): with point Jacobi degree 4 and smoothing
     // range 20; with block Jacobi degree 2 up to pressure degree 5 and
     // degree 3 above, and smoothing range 6
     const unsigned int pressure_degree = dof_handler.get_fe().degree;
-    // 1: blocks on single cells, 2: blocks on patches of 2^dim cells
-    const unsigned int fe_block_jacobi = get_unsigned("EXADG_PMG_FE_BLOCK_JACOBI", 0);
-    const unsigned int degree_fe_block = get_unsigned("EXADG_PMG_DEGREE_FE_BLOCK", 3);
-    const double       range_fe        = std::getenv("EXADG_PMG_SMOOTHING_RANGE_FE") ?
-                                           std::atof(std::getenv("EXADG_PMG_SMOOTHING_RANGE_FE")) :
-                                           20.;
-    const auto         degree_dg =
-      get_unsigned("EXADG_PMG_DEGREE_DG", dg_block_jacobi ? (pressure_degree <= 5 ? 2 : 3) : 4);
-    const double range_dg      = std::getenv("EXADG_PMG_SMOOTHING_RANGE_DG") ?
-                                   std::atof(std::getenv("EXADG_PMG_SMOOTHING_RANGE_DG")) :
-                                   (dg_block_jacobi ? 6. : 20.);
-    const auto   degree_fe     = get_unsigned("EXADG_PMG_DEGREE_FE", 5);
-    const auto   degree_linear = get_unsigned("EXADG_PMG_DEGREE_LINEAR", 3);
-    const double eig_factor =
-      std::getenv("EXADG_PMG_EIG_FACTOR") ? std::atof(std::getenv("EXADG_PMG_EIG_FACTOR")) : 1.05;
+    // block Jacobi on the FE levels: 1 on single cells and 2 on patches of
+    // 2^dim cells (both basic), 3 on single cells vectorized and embedded in
+    // the cell loop
+    const unsigned int fe_block_jacobi =
+      settings.fe_smoother_preconditioner == "BlockJacobiBasic"      ? 1 :
+      settings.fe_smoother_preconditioner == "PatchBlockJacobiBasic" ? 2 :
+      settings.fe_smoother_preconditioner == "BlockJacobi"           ? 3 :
+                                                                       0;
+    const unsigned int degree_fe_block = settings.chebyshev_degree_fe_block;
+    const double       range_fe        = settings.smoothing_range_fe;
+    const unsigned int degree_dg       = settings.chebyshev_degree_dg > 0 ?
+                                           settings.chebyshev_degree_dg :
+                                           (dg_block_jacobi ? (pressure_degree <= 5 ? 2 : 3) : 4);
+    const double       range_dg =
+      settings.smoothing_range_dg > 0 ? settings.smoothing_range_dg : (dg_block_jacobi ? 6. : 20.);
+    const unsigned int degree_fe     = settings.chebyshev_degree_fe;
+    const unsigned int degree_linear = settings.chebyshev_degree_linear;
+    const double       eig_factor    = settings.eigenvalue_factor;
     if(not this->is_test && Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
     {
       const auto name = [](const auto kind) {
@@ -2195,7 +2215,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
 
       // basic block-Jacobi preconditioner with fast diagonalization on the
       // FE levels of degree > 1 without hanging nodes, applied on whole
-      // vectors (EXADG_PMG_FE_BLOCK_JACOBI)
+      // vectors (SolverSettingsExtruded::fe_smoother_preconditioner)
       const bool try_block_jacobi =
         fe_block_jacobi > 0 &&
         mg_matrices[level].get_matrix_free().get_dof_handler().get_fe().degree > 1;
@@ -2216,8 +2236,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
           matrix.apply_block_inverse(dst, src);
       };
       // Chebyshev degree: on block-Jacobi levels from
-      // EXADG_PMG_DEGREE_FE_BLOCK (default 3), otherwise degree_fe or
-      // degree_linear
+      // SolverSettingsExtruded::chebyshev_degree_fe_block, otherwise
+      // degree_fe or degree_linear
       smoother_data.degree =
         level_block_jacobi ?
           degree_fe_block :
@@ -2328,6 +2348,8 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
                      dealii::QGauss<1>(dof_handler.get_fe().degree + 1),
                      this->is_test);
     dg_matrix.set_penalty_parameters(ip_factor);
+    dg_matrix.set_prolongation_settings(settings.dg_prolongation_lane_wise,
+                                        settings.dg_prolongation_lookahead);
     {
       typename SmootherTypeDG::AdditionalData smoother_data_dg;
       smoother_data_dg.preconditioner = std::make_shared<SmootherPreconditionerType>();
@@ -2365,7 +2387,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
         dg_matrix.setup_block_inverse();
         // optional correction of the inverse of the Cartesian surrogate by
         // Richardson steps with the actual cell block
-        dg_matrix.set_block_inverse_iterations(get_unsigned("EXADG_PMG_BLOCK_ITERATIONS", 0));
+        dg_matrix.set_block_inverse_iterations(settings.dg_block_iterations);
         if(not this->is_test)
         {
           std::array<double, 3> defects;
@@ -2374,7 +2396,7 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
           if(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
             std::cout << "Block inverse defect |r - A_K B r| / |r| with 0/1/2 correction steps: "
                       << defects[0] << " / " << defects[1] << " / " << defects[2] << ", using "
-                      << get_unsigned("EXADG_PMG_BLOCK_ITERATIONS", 0) << std::endl;
+                      << settings.dg_block_iterations << std::endl;
         }
         struct BlockInverse
         {
@@ -2590,16 +2612,16 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
 
 private:
   // Find the transfers that can compute the residual within the restriction,
-  // unless disabled by the environment variable EXADG_NO_FUSED_RESIDUAL. If
-  // EXADG_CHECK_FUSED_RESIDUAL is set, compare to the separate computation
-  // on random vectors.
+  // unless disabled by SolverSettingsExtruded::fused_residual_restriction.
+  // With 'check_fused_residual_restriction', compare to the separate
+  // computation on random vectors.
   void
   setup_residual_restriction() const
   {
     residual_restriction.assign(max_level + 1, nullptr);
     for(unsigned int level = min_level; level < max_level; ++level)
     {
-      if(std::getenv("EXADG_NO_FUSED_RESIDUAL") != nullptr)
+      if(!settings.fused_residual_restriction)
         continue;
       const auto * transfer =
         dynamic_cast<const MGTwoLevelTransferResidualRestriction<dim, Number> *>(
@@ -2610,7 +2632,7 @@ private:
                   ExcMessage("The fine operator of the transfer must be the level operator"));
       residual_restriction[level] = transfer;
 
-      if(std::getenv("EXADG_CHECK_FUSED_RESIDUAL") != nullptr)
+      if(settings.check_fused_residual_restriction)
       {
         VectorType u, b, r, coarse_separate, coarse_fused;
         mg_matrices[level + 1].initialize_dof_vector(u);
@@ -2653,7 +2675,7 @@ private:
     {
       setup_residual_restriction();
       setup_fused_dg_prolongation();
-      if(std::getenv("EXADG_BENCHMARK_DG_PROLONGATION") != nullptr)
+      if(settings.benchmark_dg_prolongation > 0)
         benchmark_dg_prolongation();
     }
     ++count_times;
@@ -2764,15 +2786,15 @@ private:
 
   // Time the kernels of the DG prolongation over all cells, see
   // LaplaceOperatorDG::benchmark_prolongation_kernel(), with the number of
-  // repetitions given by EXADG_BENCHMARK_DG_PROLONGATION, and check that
+  // repetitions given by SolverSettingsExtruded::benchmark_dg_prolongation,
+  // and check that
   // they give the same result
   void
   benchmark_dg_prolongation() const
   {
-    const MPI_Comm     comm = MPI_COMM_WORLD;
-    const unsigned int n_repetitions =
-      std::max(1, std::atoi(std::getenv("EXADG_BENCHMARK_DG_PROLONGATION")));
-    const auto & fe = mg_matrices[max_level];
+    const MPI_Comm     comm          = MPI_COMM_WORLD;
+    const unsigned int n_repetitions = std::max(1u, settings.benchmark_dg_prolongation);
+    const auto &       fe            = mg_matrices[max_level];
     AssertThrow(Utilities::MPI::max(fe.has_hanging_nodes() ? 1 : 0, comm) == 0,
                 ExcMessage("The scalar variant does not support hanging nodes"));
     VectorType e, dg_initial, dg;
@@ -2827,14 +2849,14 @@ private:
   }
 
   // Use the DG prolongation within the first product of the DG smoother
-  // unless the environment variable EXADG_NO_FUSED_DG_PROLONGATION is set;
-  // with EXADG_CHECK_FUSED_DG_PROLONGATION, compare to the separate
-  // computation on random vectors
+  // unless disabled by SolverSettingsExtruded::fused_dg_prolongation; with
+  // 'check_fused_dg_prolongation', compare to the separate computation on
+  // random vectors
   void
   setup_fused_dg_prolongation() const
   {
-    fused_dg_prolongation = std::getenv("EXADG_NO_FUSED_DG_PROLONGATION") == nullptr;
-    if(!fused_dg_prolongation || std::getenv("EXADG_CHECK_FUSED_DG_PROLONGATION") == nullptr)
+    fused_dg_prolongation = settings.fused_dg_prolongation;
+    if(!fused_dg_prolongation || !settings.check_fused_dg_prolongation)
       return;
 
     VectorType x_separate, x_fused, b, e;
@@ -2890,6 +2912,9 @@ private:
   // use the block-Jacobi preconditioner with fast diagonalization of
   // LaplaceOperatorDG instead of the diagonal in the smoother of the DG level
   bool const dg_block_jacobi;
+
+  // settings of the solvers on extruded meshes, see SolverSettingsExtruded
+  const ExaDG::IncNS::SolverSettingsExtruded settings;
 
   dealii::MGLevelObject<dealii::DoFHandler<dim>> dof_handler_hierarchy;
 
