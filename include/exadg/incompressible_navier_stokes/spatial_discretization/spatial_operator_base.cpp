@@ -41,6 +41,7 @@
 // deal.II
 #include <deal.II/dofs/dof_renumbering.h>
 #include <deal.II/dofs/dof_tools.h>
+#include <deal.II/fe/fe_dgq.h>
 #include <deal.II/fe/fe_values.h>
 
 namespace ExaDG
@@ -206,10 +207,22 @@ template<int dim, typename Number>
 void
 SpatialOperatorBase<dim, Number>::initialize_dof_handler_and_constraints()
 {
-  fe_p = create_finite_element<dim>(param.grid.element_type,
-                                    true /* is_dg */,
-                                    1 /* n_components */,
-                                    param.get_degree_p(param.degree_u));
+  // The pressure Poisson solver of the extruded consistent-splitting scheme
+  // can use the Lagrange basis in the Gauss points, which is collocated with
+  // the quadrature of its DG Laplace operator
+  if(param.temporal_discretization == TemporalDiscretization::BDFConsistentSplittingExtruded and
+     param.solver_settings_extruded.pressure_gauss_basis)
+  {
+    AssertThrow(param.grid.element_type == ElementType::Hypercube,
+                dealii::ExcMessage("The Gauss basis for the pressure needs hypercube elements"));
+    const unsigned int degree_p = param.get_degree_p(param.degree_u);
+    fe_p = std::make_shared<dealii::FE_DGQArbitraryNodes<dim>>(dealii::QGauss<1>(degree_p + 1));
+  }
+  else
+    fe_p = create_finite_element<dim>(param.grid.element_type,
+                                      true /* is_dg */,
+                                      1 /* n_components */,
+                                      param.get_degree_p(param.degree_u));
 
   fe_u_scalar = create_finite_element<dim>(param.grid.element_type,
                                            true /* is_dg */,

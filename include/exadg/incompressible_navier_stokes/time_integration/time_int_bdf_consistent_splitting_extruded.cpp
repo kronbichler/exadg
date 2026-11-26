@@ -46,6 +46,101 @@ namespace IncNS
 {
 namespace
 {
+// Least-squares fit of the projection of the pressure solutions of previous
+// time steps in 'pressure', with the products with the matrix in
+// 'pressure_matvec', onto the right-hand side 'rhs', see
+// compute_least_squares_fit(): computes the coefficients 'alpha' of the
+// linear combination, applied by extrapolate_pressure_range(). The copy of
+// the right-hand side to pressure_matvec.back(), which becomes the product
+// of the new solution in the history, is fused into the sweep computing the
+// inner products, block by block while still in cache. Returns the norm of
+// the right-hand side and of the residual of the fit.
+template<typename VectorType, typename VectorTypeFloat>
+std::pair<double, double>
+fit_pressure_history(std::vector<VectorTypeFloat> & pressure_matvec,
+                     VectorType const &             rhs,
+                     std::vector<double> &          alpha)
+{
+  using Number                 = typename VectorTypeFloat::value_type;
+  unsigned int const n_vectors = pressure_matvec.size();
+  AssertThrow(n_vectors >= 1 && n_vectors <= 5, dealii::ExcNotImplemented());
+  unsigned int const n_owned = rhs.locally_owned_size();
+
+  // inner products, block by block followed by the copy of the right-hand
+  // side; the blocks start at multiples of the unroll length of the kernel,
+  // so the summation is the same as in a single call
+  std::array<Number const *, 5> matvec_ptrs = {};
+  for(unsigned int j = 0; j < n_vectors; ++j)
+    matvec_ptrs[j] = pressure_matvec[j].begin();
+  dealii::ndarray<dealii::VectorizedArray<double>, 5, 6> local_sums     = {};
+  std::array<double, 6> const                            unused_factors = {};
+  constexpr unsigned int                                 block_size     = 2048;
+  static_assert(block_size % (4 * dealii::VectorizedArray<double>::size()) == 0);
+  double const * rhs_ptr    = rhs.begin();
+  Number *       matvec_new = pressure_matvec.back().begin();
+  for(unsigned int begin = 0; begin < n_owned; begin += block_size)
+  {
+    unsigned int const end = std::min(begin + block_size, n_owned);
+    do_compute_inner_products_range<false>(
+      begin, end, n_vectors, unused_factors, matvec_ptrs, rhs_ptr, local_sums);
+    DEAL_II_OPENMP_SIMD_PRAGMA
+    for(unsigned int i = begin; i < end; ++i)
+      matvec_new[i] = rhs_ptr[i];
+  }
+
+  alpha.resize(n_vectors);
+  return do_compute_least_squares_fit(rhs.get_mpi_communicator(), local_sums, alpha);
+}
+
+// Linear combination of the pressure history with the coefficients 'alpha'
+// of fit_pressure_history() on the entries [begin, end): the previous
+// solution is read from pressure_np, stored in pressure[0] in single
+// precision, and that value is used in the combination, so the result is
+// the same as with a separate copy of the previous solution into the
+// history before the projection.
+template<typename VectorType, typename VectorTypeFloat>
+void
+extrapolate_pressure_range(unsigned int const             begin,
+                           unsigned int const             end,
+                           std::vector<double> const &    alpha,
+                           std::vector<VectorTypeFloat> & pressure,
+                           VectorType &                   pressure_np)
+{
+  using Number                            = typename VectorTypeFloat::value_type;
+  unsigned int const            n_vectors = alpha.size();
+  Number *                      previous  = pressure[0].begin();
+  double *                      result    = pressure_np.begin();
+  std::array<Number const *, 5> p         = {};
+  for(unsigned int j = 0; j < n_vectors; ++j)
+    p[j] = pressure[j].begin();
+  auto const combine = [&](auto n_tag) {
+    constexpr unsigned int n = decltype(n_tag)::value;
+    std::array<double, 5>  a = {};
+    for(unsigned int j = 0; j < n; ++j)
+      a[j] = alpha[j];
+    DEAL_II_OPENMP_SIMD_PRAGMA
+    for(unsigned int i = begin; i < end; ++i)
+    {
+      Number const old = result[i];
+      previous[i]      = old;
+      double sum       = a[0] * old;
+      for(unsigned int j = 1; j < n; ++j)
+        sum += a[j] * p[j][i];
+      result[i] = sum;
+    }
+  };
+  if(n_vectors == 1)
+    combine(std::integral_constant<unsigned int, 1>());
+  else if(n_vectors == 2)
+    combine(std::integral_constant<unsigned int, 2>());
+  else if(n_vectors == 3)
+    combine(std::integral_constant<unsigned int, 3>());
+  else if(n_vectors == 4)
+    combine(std::integral_constant<unsigned int, 4>());
+  else
+    combine(std::integral_constant<unsigned int, 5>());
+}
+
 // Square of the l2 norm of the entries [begin, end) of a vector, as a sum of
 // SIMD lanes
 template<typename VectorType>
@@ -706,16 +801,17 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
   std::pair<double, double> extrapolate_accuracy(0., 0.);
   if(this->use_extrapolation)
   {
-    pressure[0].copy_locally_owned_data_from(pressure_np);
-
     // In first time step, need to get the right-hand side from the mat-vec,
     // as it is not in restart data, later just retrieve it from the old
     // right-hand side vectors.
     if(this->get_time_step_number() == 1)
+    {
+      pressure[0].copy_locally_owned_data_from(pressure_np);
       poisson_preconditioner->get_dg_matrix().vmult(pressure_matvec[0], pressure[0]);
-    extrapolate_accuracy =
-      compute_least_squares_fit(pressure_matvec, pressure_rhs, pressure, pressure_np);
-    pressure_matvec.back().copy_locally_owned_data_from(pressure_rhs);
+    }
+    // the right-hand side is stored in pressure_matvec.back() within the
+    // fit; the linear combination is computed within the residual below
+    extrapolate_accuracy = fit_pressure_history(pressure_matvec, pressure_rhs, pressure_alpha);
   }
   const double t_extrapol = timer2.wall_time();
   stat_pressure_time_projection.add_sample(t_extrapol);
@@ -728,12 +824,51 @@ TimeIntBDFConsistentSplittingExtruded<dim, Number>::pressure_step()
   std::pair<unsigned int, double> n_iter{0, 1.};
   const double                    target_residual =
     extrapolate_accuracy.first * this->param.solver_data_pressure_poisson.rel_tol;
-  n_iter = poisson_preconditioner->solve(*laplace_op,
-                                         pressure_rhs,
-                                         pressure_np,
-                                         4 /* n_max_iterations */,
-                                         target_residual,
-                                         &pressure_residual_history);
+  {
+    const auto & dg_matrix = poisson_preconditioner->get_dg_matrix();
+    if(pressure_residual_cg.size() != pressure_rhs.size())
+    {
+      dg_matrix.initialize_dof_vector(pressure_residual_cg);
+      dg_matrix.initialize_dof_vector(pressure_update_cg);
+    }
+
+    // Residual of the initial guess in double precision, converted to single
+    // precision as the right-hand side of CG. The initial guess of the
+    // projection is computed right before the cell loop reads the entries,
+    // with the previous solution stored in pressure[0] at the same time, to
+    // benefit from data locality, as for the momentum step.
+    const bool extrapolate = this->use_extrapolation;
+    laplace_op->vmult_scratch(
+      pressure_np,
+      [&](const unsigned int begin, const unsigned int end) {
+        if(extrapolate)
+          extrapolate_pressure_range(begin, end, pressure_alpha, pressure, pressure_np);
+      },
+      [&](const unsigned int begin, const unsigned int end, const Number * matvec) {
+        DEAL_II_OPENMP_SIMD_PRAGMA
+        for(unsigned int i = begin; i < end; ++i)
+        {
+          pressure_residual_cg.local_element(i) = pressure_rhs.local_element(i) - matvec[i - begin];
+          pressure_update_cg.local_element(i)   = 0.f;
+        }
+      });
+
+    // CG in single precision with the multigrid V-cycle as preconditioner,
+    // recording the (unpreconditioned) residual norm of every CG step, with
+    // entry 0 the initial residual
+    dealii::IterationNumberControl    control(4 /* n_max_iterations */, target_residual);
+    dealii::SolverCG<VectorTypeFloat> solver_cg(control);
+    pressure_residual_history.clear();
+    solver_cg.connect([&](const unsigned int, const double check_value, const VectorTypeFloat &) {
+      pressure_residual_history.push_back(check_value);
+      return dealii::SolverControl::success;
+    });
+    solver_cg.solve(dg_matrix, pressure_update_cg, pressure_residual_cg, *poisson_preconditioner);
+    DEAL_II_OPENMP_SIMD_PRAGMA
+    for(unsigned int i = 0; i < pressure_update_cg.locally_owned_size(); ++i)
+      pressure_np.local_element(i) += pressure_update_cg.local_element(i);
+    n_iter = {control.last_step(), control.last_value()};
+  }
 
   // How close does a single V-cycle get to the tolerance? Entry 0 of the
   // history is the initial residual, entry 1 the residual after the first

@@ -2,20 +2,20 @@
  *
  *  ExaDG - High-Order Discontinuous Galerkin for the Exa-Scale
  *
- *  Copyright (C) 2025 by Martin Kronbichler, Shubham Goswami,
- *  Richard Schussnig
+ *  Copyright (C) 2026 by the ExaDG authors
  *
- *  This file is dual-licensed under the Apache-2.0 with LLVM Exception (see
- *  https://spdx.org/licenses/Apache-2.0.html and
- *  https://spdx.org/licenses/LLVM-exception.html) and the GNU General Public
- *  License as published by the Free Software Foundation, either version 3 of
- *  the License, or (at your option) any later version.
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License in the top-level LICENSE file for
- *  more details.
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  *  ______________________________________________________________________
  */
 
@@ -47,6 +47,12 @@ struct SolverSettingsExtruded
   // compute the right-hand side and the residual of the momentum step in one
   // loop
   bool fused_momentum_rhs = true;
+
+  // Lagrange basis in the Gauss points for the pressure (only with
+  // BDFConsistentSplittingExtruded), which is collocated with the
+  // quadrature of the DG Laplace operator of the pressure Poisson solver,
+  // instead of FE_DGQ with Gauss-Lobatto points
+  bool pressure_gauss_basis = false;
 
   // compare the fused right-hand side and residual with the separate
   // computation in each time step (for debugging)
@@ -177,6 +183,10 @@ struct SolverSettingsExtruded
   {
     prm.enter_subsection(subsection_name);
     {
+      prm.add_parameter("PressureGaussBasis",
+                        pressure_gauss_basis,
+                        "Lagrange basis in the Gauss points for the pressure");
+
       prm.add_parameter("FusedMomentumRhs",
                         fused_momentum_rhs,
                         "Compute right-hand side and residual of the momentum step in one loop");
@@ -305,6 +315,7 @@ struct SolverSettingsExtruded
       pcout << "  " << std::left << std::setw(46) << name << value << std::endl;
     };
     pcout << std::endl << "Solver settings for extruded meshes:" << std::endl;
+    line("Pressure Gauss basis:", str(pressure_gauss_basis));
     line("Fused momentum rhs:", str(fused_momentum_rhs));
     line("Check fused momentum rhs:", str(check_fused_momentum_rhs));
     line("Momentum rhs norm interval:", str(momentum_rhs_norm_interval));

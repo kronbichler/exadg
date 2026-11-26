@@ -56,6 +56,9 @@ DG degree 1, double, 768 cells, 6144 DoFs
   Chebyshev block 4th kind degree 4 vmult       : OK
   Chebyshev block 4th kind degree 4 step        : OK
   Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : no
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
 
 DG degree 1, float, 768 cells, 6144 DoFs
  factor mass 0, factor Laplace 1
@@ -115,6 +118,9 @@ DG degree 1, float, 768 cells, 6144 DoFs
   Chebyshev block 4th kind degree 4 vmult       : OK
   Chebyshev block 4th kind degree 4 step        : OK
   Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : no
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
 
 DG degree 2, double, 768 cells, 20736 DoFs
  factor mass 0, factor Laplace 1
@@ -174,6 +180,9 @@ DG degree 2, double, 768 cells, 20736 DoFs
   Chebyshev block 4th kind degree 4 vmult       : OK
   Chebyshev block 4th kind degree 4 step        : OK
   Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : no
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
 
 DG degree 2, float, 768 cells, 20736 DoFs
  factor mass 0, factor Laplace 1
@@ -233,6 +242,9 @@ DG degree 2, float, 768 cells, 20736 DoFs
   Chebyshev block 4th kind degree 4 vmult       : OK
   Chebyshev block 4th kind degree 4 step        : OK
   Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : no
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
 
 DG degree 3, double, 768 cells, 49152 DoFs
  factor mass 0, factor Laplace 1
@@ -292,6 +304,9 @@ DG degree 3, double, 768 cells, 49152 DoFs
   Chebyshev block 4th kind degree 4 vmult       : OK
   Chebyshev block 4th kind degree 4 step        : OK
   Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : no
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
 
 DG degree 3, float, 768 cells, 49152 DoFs
  factor mass 0, factor Laplace 1
@@ -351,6 +366,381 @@ DG degree 3, float, 768 cells, 49152 DoFs
   Chebyshev block 4th kind degree 4 vmult       : OK
   Chebyshev block 4th kind degree 4 step        : OK
   Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : no
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
+
+Gauss basis, DG degree 1, double, 768 cells, 6144 DoFs
+ factor mass 0, factor Laplace 1
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+ factor mass 2.5, factor Laplace 0.3
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : yes
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
+
+Gauss basis, DG degree 1, float, 768 cells, 6144 DoFs
+ factor mass 0, factor Laplace 1
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+ factor mass 2.5, factor Laplace 0.3
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : yes
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
+
+Gauss basis, DG degree 2, double, 768 cells, 20736 DoFs
+ factor mass 0, factor Laplace 1
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+ factor mass 2.5, factor Laplace 0.3
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : yes
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
+
+Gauss basis, DG degree 2, float, 768 cells, 20736 DoFs
+ factor mass 0, factor Laplace 1
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+ factor mass 2.5, factor Laplace 0.3
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : yes
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
+
+Gauss basis, DG degree 3, double, 768 cells, 49152 DoFs
+ factor mass 0, factor Laplace 1
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+ factor mass 2.5, factor Laplace 0.3
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : yes
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
+
+Gauss basis, DG degree 3, float, 768 cells, 49152 DoFs
+ factor mass 0, factor Laplace 1
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+ factor mass 2.5, factor Laplace 0.3
+  vmult vs. Poisson::LaplaceOperator            : OK
+  vmult_scratch: entries not finalized once     : 0
+  vmult_scratch: misaligned ranges              : 0
+  vmult_scratch vs. vmult                       : OK
+  inverse diagonal vs. Poisson::LaplaceOperator : OK
+  Chebyshev degree 1 vmult                      : OK
+  Chebyshev degree 1 step                       : OK
+  Chebyshev degree 1 vmult_with_residual        : OK
+  Chebyshev degree 1 last residual norm         : OK
+  Chebyshev degree 2 vmult                      : OK
+  Chebyshev degree 2 step                       : OK
+  Chebyshev degree 2 vmult_with_residual        : OK
+  Chebyshev degree 2 last residual norm         : OK
+  Chebyshev degree 4 vmult                      : OK
+  Chebyshev degree 4 step                       : OK
+  Chebyshev degree 4 vmult_with_residual        : OK
+  Chebyshev degree 4 last residual norm         : OK
+  Chebyshev 4th kind degree 1 vmult             : OK
+  Chebyshev 4th kind degree 1 step              : OK
+  Chebyshev 4th kind degree 2 vmult             : OK
+  Chebyshev 4th kind degree 2 step              : OK
+  Chebyshev 4th kind degree 5 vmult             : OK
+  Chebyshev 4th kind degree 5 step              : OK
+  Chebyshev opt. 4th kind degree 1 vmult        : OK
+  Chebyshev opt. 4th kind degree 1 step         : OK
+  Chebyshev opt. 4th kind degree 2 vmult        : OK
+  Chebyshev opt. 4th kind degree 2 step         : OK
+  Chebyshev opt. 4th kind degree 5 vmult        : OK
+  Chebyshev opt. 4th kind degree 5 step         : OK
+  block inverse defect reduced by corrections   : OK
+  block inverse symmetric                       : OK
+  block inverse positive                        : OK
+  Chebyshev block 1st kind degree 1 vmult       : OK
+  Chebyshev block 1st kind degree 1 step        : OK
+  Chebyshev block 1st kind degree 1 last residual norm: OK
+  Chebyshev block 1st kind degree 2 vmult       : OK
+  Chebyshev block 1st kind degree 2 step        : OK
+  Chebyshev block 1st kind degree 2 last residual norm: OK
+  Chebyshev block 1st kind degree 4 vmult       : OK
+  Chebyshev block 1st kind degree 4 step        : OK
+  Chebyshev block 1st kind degree 4 last residual norm: OK
+  Chebyshev block 4th kind degree 1 vmult       : OK
+  Chebyshev block 4th kind degree 1 step        : OK
+  Chebyshev block 4th kind degree 1 last residual norm: OK
+  Chebyshev block 4th kind degree 2 vmult       : OK
+  Chebyshev block 4th kind degree 2 step        : OK
+  Chebyshev block 4th kind degree 2 last residual norm: OK
+  Chebyshev block 4th kind degree 4 vmult       : OK
+  Chebyshev block 4th kind degree 4 step        : OK
+  Chebyshev block 4th kind degree 4 last residual norm: OK
+  collocated basis                              : yes
+  prolongation vs. FE function in DG points     : OK
+  restriction is transpose of prolongation      : OK
 
 Cartesian mesh, DG degree 1, double, 96 cells, 768 DoFs
   block inverse (0 corrections) vs. Poisson::LaplaceOperator: OK
@@ -368,6 +758,26 @@ Cartesian mesh, DG degree 3, double, 96 cells, 6144 DoFs
   cell block times block inverse = identity     : OK
 
 Cartesian mesh, DG degree 3, float, 96 cells, 6144 DoFs
+  block inverse (0 corrections) vs. Poisson::LaplaceOperator: OK
+  block inverse (1 corrections) vs. Poisson::LaplaceOperator: OK
+  cell block times block inverse = identity     : OK
+
+Cartesian mesh, Gauss basis, DG degree 1, double, 96 cells, 768 DoFs
+  block inverse (0 corrections) vs. Poisson::LaplaceOperator: OK
+  block inverse (1 corrections) vs. Poisson::LaplaceOperator: OK
+  cell block times block inverse = identity     : OK
+
+Cartesian mesh, Gauss basis, DG degree 1, float, 96 cells, 768 DoFs
+  block inverse (0 corrections) vs. Poisson::LaplaceOperator: OK
+  block inverse (1 corrections) vs. Poisson::LaplaceOperator: OK
+  cell block times block inverse = identity     : OK
+
+Cartesian mesh, Gauss basis, DG degree 3, double, 96 cells, 6144 DoFs
+  block inverse (0 corrections) vs. Poisson::LaplaceOperator: OK
+  block inverse (1 corrections) vs. Poisson::LaplaceOperator: OK
+  cell block times block inverse = identity     : OK
+
+Cartesian mesh, Gauss basis, DG degree 3, float, 96 cells, 6144 DoFs
   block inverse (0 corrections) vs. Poisson::LaplaceOperator: OK
   block inverse (1 corrections) vs. Poisson::LaplaceOperator: OK
   cell block times block inverse = identity     : OK

@@ -1667,7 +1667,21 @@ public:
     const FiniteElement<dim> & fe = dof_handler->get_fe();
     QGauss<1>                  quad(fe.degree + 1);
     pressure_shape_info.reinit(quad, fe_pressure);
+    pressure_convective_shape_info.reinit(QGauss<1>(convective_shape_info.data[0].n_q_points_1d),
+                                          fe_pressure);
     this->pressure_dof_indices = &pressure_dof_indices;
+  }
+
+  // Shape data of the pressure basis in the quadrature points of the
+  // convective term, for testing the divergence and the convective
+  // divergence. Before initialize_coupling_pressure(), the tangential basis
+  // of the Raviart-Thomas space (FE_DGQ of the pressure degree) is used.
+  const internal::MatrixFreeFunctions::UnivariateShapeData<Number> &
+  pressure_convective_shape_data() const
+  {
+    if(pressure_convective_shape_info.data.empty())
+      return convective_shape_info.data[1];
+    return pressure_convective_shape_info.data[0];
   }
 
   std::size_t
@@ -2333,6 +2347,7 @@ private:
   std::array<std::vector<std::array<Number, 2>>, 2> interpolate_quad_to_boundary;
 
   internal::MatrixFreeFunctions::ShapeInfo<Number>       pressure_shape_info;
+  internal::MatrixFreeFunctions::ShapeInfo<Number>       pressure_convective_shape_info;
   const std::vector<std::array<unsigned int, n_lanes>> * pressure_dof_indices;
 
   internal::MatrixFreeFunctions::ShapeInfo<Number>  convective_shape_info;
@@ -5598,9 +5613,10 @@ private:
     }
 
     // integrate divergence
-    integrate_pressure_field<degree, n_q_points_1d>(shape_data[1].shape_values_eo.data(),
-                                                    pressure_values + 2 * n_points_plane,
-                                                    pressure_dofs);
+    integrate_pressure_field<degree, n_q_points_1d>(
+      pressure_convective_shape_data().shape_values_eo.data(),
+      pressure_values + 2 * n_points_plane,
+      pressure_dofs);
 
     const std::array<unsigned int, n_lanes> pressure_indices      = (*pressure_dof_indices)[cell];
     bool                                    all_indices_available = true;
@@ -5628,9 +5644,10 @@ private:
                                                   velocity_dst.begin());
 
     // integrate convective divergence
-    integrate_pressure_field<degree, n_q_points_1d>(shape_data[1].shape_values_eo.data(),
-                                                    pressure_values + n_points_plane,
-                                                    pressure_dofs);
+    integrate_pressure_field<degree, n_q_points_1d>(
+      pressure_convective_shape_data().shape_values_eo.data(),
+      pressure_values + n_points_plane,
+      pressure_dofs);
     store_pressure(convective_divergence);
 
     for(unsigned int d = 0; d < dim; ++d)
@@ -6083,7 +6100,7 @@ private:
     VectorizedArray<Number> plane_p_dx[n_pressure_plane];
     VectorizedArray<Number> plane_p_dy[n_pressure_plane];
     VectorizedArray<Number> plane_p_div[n_pressure_plane];
-    const auto &            sh_p = shape_data[1];
+    const auto &            sh_p = pressure_convective_shape_data();
 
     VectorizedArray<Number>                 cfl_velocity = 0;
     Tensor<1, dim, VectorizedArray<Number>> velocity_integral_cell;
@@ -6504,7 +6521,7 @@ private:
     constexpr unsigned int n_q_points_2d  = nq * nq;
     constexpr unsigned int face_data_size = (dim + 1) * n_q_points_2d;
     constexpr unsigned int n_p_plane      = n_t * n_t;
-    const auto &           sh_p           = convective_shape_info.data[1];
+    const auto &           sh_p           = pressure_convective_shape_data();
 
     // face terms of the faces in y direction (face points with x running
     // fastest, followed by z), integrated in x and z direction

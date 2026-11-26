@@ -2563,47 +2563,6 @@ dealii::RepartitioningPolicyTools::MinimalGranularityPolicy<dim>(64)*/)),
     }
   }
 
-  template<typename VectorTypeOuter, typename MatrixTypeOuter>
-  std::pair<unsigned int, double>
-  solve(const MatrixTypeOuter & matrix,
-        const VectorTypeOuter & rhs,
-        VectorTypeOuter &       sol,
-        const unsigned int      n_max_iterations,
-        const double            target_residual,
-        std::vector<double> *   residual_history = nullptr) const
-  {
-    using Number2 = typename VectorTypeOuter::value_type;
-    matrix.vmult_scratch(
-      sol, [&](const unsigned int begin, const unsigned int end, const Number2 * matvec) {
-        DEAL_II_OPENMP_SIMD_PRAGMA
-        for(unsigned int i = begin; i < end; ++i)
-        {
-          rhs_dg.local_element(i)             = rhs.local_element(i) - matvec[i - begin];
-          solution_update_dg.local_element(i) = 0.;
-        }
-      });
-
-    dealii::IterationNumberControl control(n_max_iterations, target_residual);
-    dealii::SolverCG<VectorType>   solver_cg(control);
-    // optionally record the (unpreconditioned) residual norm of every CG
-    // step, with entry 0 the initial residual
-    if(residual_history != nullptr)
-    {
-      residual_history->clear();
-      solver_cg.connect(
-        [residual_history](const unsigned int, const double check_value, const VectorType &) {
-          residual_history->push_back(check_value);
-          return dealii::SolverControl::success;
-        });
-    }
-    solver_cg.solve(dg_matrix, solution_update_dg, rhs_dg, *this);
-    DEAL_II_OPENMP_SIMD_PRAGMA
-    for(unsigned int i = 0; i < solution_update_dg.locally_owned_size(); ++i)
-      sol.local_element(i) += solution_update_dg.local_element(i);
-
-    return {control.last_step(), control.last_value()};
-  }
-
   const MatrixTypeDG &
   get_dg_matrix() const
   {

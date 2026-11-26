@@ -237,11 +237,17 @@ private:
   VectorType pressure_np;  // mf vector
   VectorType pressure_rhs; // mf vector, do not serialize
 
-  std::vector<VectorTypeFloat> pressure;                  // `dg_matrix` vector
-  std::vector<VectorTypeFloat> pressure_matvec;           // `dg_matrix` vector
-  std::vector<VectorType>      convective_divergence_rhs; // mf vector
-  std::vector<VectorType>      divergences;               // mf vector
-  std::vector<VectorType>      pressure_nbc_rhs;          // vector only living on boundary
+  std::vector<VectorTypeFloat> pressure;        // `dg_matrix` vector
+  std::vector<VectorTypeFloat> pressure_matvec; // `dg_matrix` vector
+
+  // coefficients of the projection of the pressure history and the vectors
+  // of CG in single precision in the pressure step
+  std::vector<double>     pressure_alpha;
+  VectorTypeFloat         pressure_residual_cg;
+  VectorTypeFloat         pressure_update_cg;
+  std::vector<VectorType> convective_divergence_rhs; // mf vector
+  std::vector<VectorType> divergences;               // mf vector
+  std::vector<VectorType> pressure_nbc_rhs;          // vector only living on boundary
 
   std::shared_ptr<RTOperator::RaviartThomasOperator<dim, Number>>       op_rt;
   std::shared_ptr<RTOperator::RaviartThomasOperator<dim, float>>        op_rt_float;

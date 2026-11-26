@@ -28,7 +28,10 @@
 // vmult() and the Chebyshev iteration based on vmult_scratch() against
 // dealii::PreconditionChebyshev.
 
+#include <deal.II/dofs/dof_renumbering.h>
 #include <deal.II/fe/fe_dgq.h>
+#include <deal.II/fe/fe_q.h>
+#include <deal.II/fe/fe_values.h>
 
 #include <exadg/incompressible_navier_stokes/spatial_discretization/operators/laplace_operator_extruded.h>
 #include <exadg/operators/mass_operator.h>
@@ -155,9 +158,111 @@ check_chebyshev_block_inverse(dealii::ConditionalOStream & pcout, const Operator
   }
 }
 
+// The DG basis: FE_DGQ or the Lagrange basis in the Gauss points, which is
+// collocated with the quadrature of the operator
+std::unique_ptr<dealii::FiniteElement<dim>>
+create_dg_fe(const unsigned int degree, const bool gauss_basis)
+{
+  if(gauss_basis)
+    return std::make_unique<dealii::FE_DGQArbitraryNodes<dim>>(dealii::QGauss<1>(degree + 1));
+  return std::make_unique<dealii::FE_DGQ<dim>>(degree);
+}
+
+// Compare the prolongation from the FE space of the same degree (FE_Q,
+// without constraints) to the values of the FE function in the support
+// points of the DG basis, and check that the restriction within
+// vmult_residual_and_restrict_to_fe() is its transpose
 template<typename Number>
 void
-test(const unsigned int degree, const unsigned int n_refinements)
+check_prolongation(dealii::ConditionalOStream &                            pcout,
+                   const LaplaceOperator::LaplaceOperatorDG<dim, Number> & op,
+                   const dealii::Mapping<dim> &                            mapping,
+                   const dealii::DoFHandler<dim> &                         dof_handler)
+{
+  using VectorType               = dealii::LinearAlgebra::distributed::Vector<Number>;
+  const auto &            tria   = dof_handler.get_triangulation();
+  const auto &            fe_dg  = dof_handler.get_fe();
+  const unsigned int      degree = fe_dg.degree;
+  const MPI_Comm          comm   = dof_handler.get_mpi_communicator();
+  dealii::FE_Q<dim>       fe_q(degree);
+  dealii::DoFHandler<dim> dof_fe(tria);
+  dof_fe.distribute_dofs(fe_q);
+  dealii::AffineConstraints<Number> constraints_fe;
+  constraints_fe.close();
+  {
+    typename dealii::MatrixFree<dim, Number>::AdditionalData mf_data;
+    mf_data.cell_vectorization_category = Helper::compute_vectorization_category(tria);
+    dealii::DoFRenumbering::matrix_free_data_locality(dof_fe, constraints_fe, mf_data);
+  }
+  LaplaceOperator::LaplaceOperatorFE<dim, Number> op_fe;
+  op_fe.reinit(mapping,
+               dof_fe,
+               constraints_fe,
+               Helper::compute_vectorization_category(tria),
+               dealii::QGauss<1>(degree + 1));
+
+  VectorType u_fe, dg, b, r_fe;
+  op_fe.initialize_dof_vector(u_fe);
+  op_fe.initialize_dof_vector(r_fe);
+  op.initialize_dof_vector(dg);
+  op.initialize_dof_vector(b);
+  fill_vector(u_fe, 1);
+  fill_vector(b, 2);
+  op.prolongate_and_add(dg, u_fe, op_fe);
+  u_fe.zero_out_ghost_values();
+
+  // reference: the FE function in the support points of the DG basis
+  VectorType u_ghosted(dof_fe.locally_owned_dofs(),
+                       dealii::DoFTools::extract_locally_relevant_dofs(dof_fe),
+                       comm);
+  u_ghosted.copy_locally_owned_data_from(u_fe);
+  u_ghosted.update_ghost_values();
+  VectorType reference(dg);
+  reference = 0;
+  dealii::FEValues<dim>                        fe_values(mapping,
+                                  fe_q,
+                                  dealii::Quadrature<dim>(fe_dg.get_unit_support_points()),
+                                  dealii::update_values);
+  std::vector<Number>                          values(fe_dg.n_dofs_per_cell());
+  std::vector<dealii::types::global_dof_index> dg_indices(fe_dg.n_dofs_per_cell());
+  const auto &                                 owned = dof_handler.locally_owned_dofs();
+  for(const auto & cell : dof_fe.active_cell_iterators())
+    if(cell->is_locally_owned())
+    {
+      fe_values.reinit(cell);
+      fe_values.get_function_values(u_ghosted, values);
+      typename dealii::DoFHandler<dim>::active_cell_iterator cell_dg(&tria,
+                                                                     cell->level(),
+                                                                     cell->index(),
+                                                                     &dof_handler);
+      cell_dg->get_dof_indices(dg_indices);
+      for(unsigned int i = 0; i < values.size(); ++i)
+        reference.local_element(owned.index_within_set(dg_indices[i])) = values[i];
+    }
+  VectorType difference(dg);
+  difference -= reference;
+  print_check(pcout,
+              "prolongation vs. FE function in DG points",
+              difference.linfty_norm(),
+              reference.linfty_norm(),
+              tolerance<Number>());
+
+  // restriction of b - A 0 = b
+  VectorType zero(dg);
+  zero = 0;
+  op.vmult_residual_and_restrict_to_fe(b, zero, op_fe, r_fe);
+  const double dg_b = dg * b;
+  const double u_r  = u_fe * r_fe;
+  print_check(pcout,
+              "restriction is transpose of prolongation",
+              std::abs(dg_b - u_r),
+              std::abs(dg_b),
+              tolerance<Number>());
+}
+
+template<typename Number>
+void
+test(const unsigned int degree, const unsigned int n_refinements, const bool gauss_basis = false)
 {
   using VectorType = dealii::LinearAlgebra::distributed::Vector<Number>;
 
@@ -169,15 +274,15 @@ test(const unsigned int degree, const unsigned int n_refinements)
   create_grid(tria, periodic_faces, n_refinements);
   const auto mapping = create_mapping(tria, 3);
 
-  dealii::FE_DGQ<dim>     fe(degree);
+  const auto              fe = create_dg_fe(degree, gauss_basis);
   dealii::DoFHandler<dim> dof_handler(tria);
-  dof_handler.distribute_dofs(fe);
+  dof_handler.distribute_dofs(*fe);
   dealii::AffineConstraints<Number> constraints;
   constraints.close();
 
-  pcout << "DG degree " << degree << ", " << number_name<Number>() << ", "
-        << tria.n_global_active_cells() << " cells, " << dof_handler.n_dofs() << " DoFs"
-        << std::endl;
+  pcout << (gauss_basis ? "Gauss basis, " : "") << "DG degree " << degree << ", "
+        << number_name<Number>() << ", " << tria.n_global_active_cells() << " cells, "
+        << dof_handler.n_dofs() << " DoFs" << std::endl;
 
   LaplaceOperator::LaplaceOperatorDG<dim, Number> op;
   op.reinit(*mapping,
@@ -288,6 +393,9 @@ test(const unsigned int degree, const unsigned int n_refinements)
   }
   check_block_inverse_properties(pcout, op);
   check_chebyshev_block_inverse(pcout, op);
+  pcout << "  " << std::left << std::setw(46) << "collocated basis"
+        << ": " << (op.is_collocated() ? "yes" : "no") << std::endl;
+  check_prolongation(pcout, op, *mapping, dof_handler);
   pcout << std::endl;
 }
 
@@ -297,7 +405,9 @@ test(const unsigned int degree, const unsigned int n_refinements)
 // Poisson::LaplaceOperator
 template<typename Number>
 void
-test_block_inverse_cartesian(const unsigned int degree, const unsigned int n_refinements)
+test_block_inverse_cartesian(const unsigned int degree,
+                             const unsigned int n_refinements,
+                             const bool         gauss_basis = false)
 {
   using VectorType = dealii::LinearAlgebra::distributed::Vector<Number>;
 
@@ -309,15 +419,15 @@ test_block_inverse_cartesian(const unsigned int degree, const unsigned int n_ref
   create_grid(tria, periodic_faces, n_refinements);
   const dealii::MappingQ<dim> mapping(1);
 
-  dealii::FE_DGQ<dim>     fe(degree);
+  const auto              fe = create_dg_fe(degree, gauss_basis);
   dealii::DoFHandler<dim> dof_handler(tria);
-  dof_handler.distribute_dofs(fe);
+  dof_handler.distribute_dofs(*fe);
   dealii::AffineConstraints<Number> constraints;
   constraints.close();
 
-  pcout << "Cartesian mesh, DG degree " << degree << ", " << number_name<Number>() << ", "
-        << tria.n_global_active_cells() << " cells, " << dof_handler.n_dofs() << " DoFs"
-        << std::endl;
+  pcout << "Cartesian mesh, " << (gauss_basis ? "Gauss basis, " : "") << "DG degree " << degree
+        << ", " << number_name<Number>() << ", " << tria.n_global_active_cells() << " cells, "
+        << dof_handler.n_dofs() << " DoFs" << std::endl;
 
   LaplaceOperator::LaplaceOperatorDG<dim, Number> op;
   op.reinit(mapping,
@@ -395,17 +505,19 @@ main(int argc, char ** argv)
 {
   dealii::Utilities::MPI::MPI_InitFinalize mpi(argc, argv, 1);
 
-  for(const unsigned int degree : {1, 2, 3})
-  {
-    test<double>(degree, 2);
-    test<float>(degree, 2);
-  }
+  for(const bool gauss_basis : {false, true})
+    for(const unsigned int degree : {1, 2, 3})
+    {
+      test<double>(degree, 2, gauss_basis);
+      test<float>(degree, 2, gauss_basis);
+    }
   // the matrix-based block diagonal of the reference operator is only
   // available in serial
   if(dealii::Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) == 1)
-    for(const unsigned int degree : {1, 3})
-    {
-      test_block_inverse_cartesian<double>(degree, 1);
-      test_block_inverse_cartesian<float>(degree, 1);
-    }
+    for(const bool gauss_basis : {false, true})
+      for(const unsigned int degree : {1, 3})
+      {
+        test_block_inverse_cartesian<double>(degree, 1, gauss_basis);
+        test_block_inverse_cartesian<float>(degree, 1, gauss_basis);
+      }
 }

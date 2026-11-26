@@ -27,6 +27,7 @@
 #include <deal.II/base/timer.h>
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/fe/fe.h>
+#include <deal.II/fe/fe_dgq.h>
 #include <deal.II/fe/fe_nothing.h>
 #include <deal.II/fe/fe_tools.h>
 #include <deal.II/fe/fe_values.h>
@@ -4346,6 +4347,7 @@ public:
     }
 
     shape_info = matrix_free.get_shape_info();
+    setup_basis(quadrature);
 
     detect_dependencies_of_face_integrals();
 
@@ -4407,6 +4409,15 @@ public:
   {
     return *dof_handler;
   }
+
+  // Whether the DG basis is collocated in the quadrature points, see
+  // setup_basis()
+  bool
+  is_collocated() const
+  {
+    return collocated;
+  }
+
 
   const MatrixFree<dim, Number> &
   get_matrix_free() const
@@ -5195,6 +5206,7 @@ public:
                                                                        {},
                                                                        true,
                                                                        values);
+          fe_to_dg<degree + 1>(values);
           vectorized_transpose_and_store(
             true, dofs_per_cell, values, benchmark_dg_starts[cell].data(), dg.begin());
         }
@@ -5203,6 +5215,9 @@ public:
         AssertThrow(false, ExcNotImplemented());
     }
     else
+    {
+      AssertThrow(!fe_basis_change,
+                  ExcNotImplemented("The scalar variant needs the FE basis in the DG space"));
       for(unsigned int cell = 0; cell < n_cell_batches; ++cell)
         for(unsigned int v = 0; v < n_active_entries_per_cell_batch(cell); ++v)
         {
@@ -5213,6 +5228,7 @@ public:
           for(unsigned int i = 0; i < dofs_per_cell; ++i)
             dst[i] += values[i];
         }
+    }
   }
 
   void
@@ -5525,6 +5541,13 @@ private:
   internal::MatrixFreeFunctions::ShapeInfo<Number>  shape_info;
   std::array<std::vector<std::array<Number, 2>>, 2> interpolate_quad_to_boundary;
 
+  // relation of the DG basis to the quadrature and the FE basis, see
+  // setup_basis(), with the FE basis (FE_DGQ of the same degree) evaluated
+  // in the quadrature points
+  bool                                             collocated      = false;
+  bool                                             fe_basis_change = false;
+  internal::MatrixFreeFunctions::ShapeInfo<Number> fe_basis_shape_info;
+
   std::shared_ptr<const Utilities::MPI::Partitioner>           partitioner;
   std::vector<std::array<unsigned int, n_lanes>>               dof_indices;
   std::vector<dealii::ndarray<unsigned int, 2 * dim, n_lanes>> neighbor_cells;
@@ -5802,6 +5825,73 @@ private:
 #endif
   }
 
+  // Determine the relation of the DG basis to the quadrature and to the
+  // basis of the FE space on the finest FE level (FE_Q with Gauss-Lobatto
+  // support points of the same degree): either the DG basis is the
+  // Lagrange basis in the Gauss-Lobatto points (FE_DGQ), where the
+  // prolongation from the FE space copies the values, or the Lagrange
+  // basis in the quadrature points (FE_DGQArbitraryNodes with the points
+  // of 'quadrature'), where the interpolation to the quadrature points is
+  // the identity and the prolongation interpolates from the Gauss-Lobatto
+  // points to the quadrature points.
+  void
+  setup_basis(const Quadrature<1> & quadrature)
+  {
+    const unsigned int degree = shape_info.data[0].fe_degree;
+    const unsigned int n_q    = shape_info.data[0].n_q_points_1d;
+    const auto         equal  = [](const auto & a, const auto & b) {
+      if(a.size() != b.size())
+        return false;
+      for(unsigned int i = 0; i < a.size(); ++i)
+        if(std::abs(a[i] - b[i]) > 1e-6 * (1. + std::abs(b[i])))
+          return false;
+      return true;
+    };
+    std::vector<double> identity(n_q * n_q, 0.);
+    for(unsigned int i = 0; i < n_q; ++i)
+      identity[i * n_q + i] = 1.;
+    collocated = n_q == degree + 1 && equal(shape_info.data[0].shape_values, identity);
+
+    fe_basis_shape_info.reinit(quadrature, FE_DGQ<dim>(degree));
+    fe_basis_change =
+      !equal(shape_info.data[0].shape_values, fe_basis_shape_info.data[0].shape_values);
+    AssertThrow(!fe_basis_change || collocated,
+                ExcNotImplemented("The DG Laplace operator needs either FE_DGQ or the Lagrange "
+                                  "basis in the quadrature points"));
+  }
+
+  // Interpolate the values of a cell batch from the FE basis of the finest
+  // FE level to the DG basis, in place, see setup_basis()
+  template<int nn>
+  void
+  fe_to_dg(VectorizedArray<Number> * values) const
+  {
+    if(fe_basis_change)
+      dealii::internal::FEEvaluationImplBasisChange<dealii::internal::evaluate_evenodd,
+                                                    dealii::internal::EvaluatorQuantity::value,
+                                                    dim,
+                                                    nn,
+                                                    nn>::do_forward(1,
+                                                                    fe_basis_shape_info.data[0]
+                                                                      .shape_values_eo,
+                                                                    values,
+                                                                    values);
+  }
+
+  // Transpose of fe_to_dg(), for the restriction of a residual
+  template<int nn>
+  void
+  dg_to_fe_transpose(VectorizedArray<Number> * values) const
+  {
+    if(fe_basis_change)
+      dealii::internal::FEEvaluationImplBasisChange<
+        dealii::internal::evaluate_evenodd,
+        dealii::internal::EvaluatorQuantity::value,
+        dim,
+        nn,
+        nn>::do_backward(1, fe_basis_shape_info.data[0].shape_values_eo, false, values, values);
+  }
+
   template<int nn, int n_points_1d>
   void
   read_cell_values(const Number *                            src_vector,
@@ -5813,6 +5903,19 @@ private:
     constexpr unsigned int          n_points_2d    = n_points_1d * n_points_1d;
     VectorizedArray<Number>         cell_data[dofs_per_plane];
     const Number * DEAL_II_RESTRICT shape_data = shape_info.data[0].shape_values_eo.data();
+
+    // the values in the collocated basis are the ones in the quadrature
+    // points
+    if constexpr(nn == n_points_1d)
+      if(collocated)
+      {
+        for(unsigned int i_z = 0; i_z < (dim > 2 ? nn : 1); ++i_z)
+          vectorized_load_and_transpose(dofs_per_plane,
+                                        src_vector + i_z * dofs_per_plane,
+                                        dof_indices.data(),
+                                        out + i_z * n_points_2d);
+        return;
+      }
 
     for(unsigned int i_z = 0; i_z < (dim > 2 ? nn : 1); ++i_z)
     {
@@ -5874,6 +5977,25 @@ private:
     VectorizedArray<Number> cell_data[n_points_2d];
 
     const Number * DEAL_II_RESTRICT shape_data = shape_info.data[0].shape_values_eo.data();
+    if constexpr(nn == n_points_1d)
+      if(collocated)
+      {
+        for(unsigned int i_z = 0; i_z < (dim > 2 ? nn : 1); ++i_z)
+        {
+          VectorizedArray<Number> * in_z = quad_values + i_z * n_points_2d;
+          if(n_filled_lanes == n_lanes)
+            vectorized_transpose_and_store(
+              true, dofs_per_plane, in_z, dof_indices.data(), dst_vector + i_z * dofs_per_plane);
+          else
+            for(unsigned int v = 0; v < n_filled_lanes; ++v)
+            {
+              Number * dst_ptr = dst_vector + dof_indices[v] + i_z * dofs_per_plane;
+              for(unsigned int i = 0; i < dofs_per_plane; ++i)
+                dst_ptr[i] += in_z[i][v];
+            }
+        }
+        return;
+      }
     if constexpr(dim == 3)
       for(unsigned int i = 0; i < n_points_1d * n_points_1d; ++i)
       {
@@ -6064,6 +6186,7 @@ private:
     constexpr unsigned int  dofs_per_cell = Utilities::pow(degree + 1, dim);
     VectorizedArray<Number> values_dofs[dofs_per_cell];
     fe_operator.template read_dof_values<degree>(cell, fe_correction, values_dofs);
+    fe_to_dg<degree + 1>(values_dofs);
     for(unsigned int v = 0; v < n_active; ++v)
       if(lanes & (1u << v))
       {
@@ -6170,6 +6293,7 @@ private:
     else
       LaplaceOperatorFE<dim, Number>::template read_dof_values_compressed<degree, degree + 1, 1>(
         fe_correction, prolongation_fe_indices, prolongation_fe_unconstrained, p, {}, true, values);
+    fe_to_dg<degree + 1>(values);
     const unsigned int mask = prolongation_mask_index[p];
     if(mask != numbers::invalid_unsigned_int)
       for(unsigned int i = 0; i < dofs_per_cell; ++i)
@@ -6539,18 +6663,21 @@ private:
       for(unsigned int f = 0; f < 2 * dim; ++f)
         compute_face<degree, true>(shape_data, solution, cell, f, quad_values, out_values);
 
-    dealii::internal::FEEvaluationImplBasisChange<
-      dealii::internal::evaluate_evenodd,
-      dealii::internal::EvaluatorQuantity::value,
-      dim,
-      degree + 1,
-      n_q_points_1d>::do_backward(1, shape_data.shape_values_eo, false, out_values, out_values);
+    if(!collocated)
+      dealii::internal::FEEvaluationImplBasisChange<
+        dealii::internal::evaluate_evenodd,
+        dealii::internal::EvaluatorQuantity::value,
+        dim,
+        degree + 1,
+        n_q_points_1d>::do_backward(1, shape_data.shape_values_eo, false, out_values, out_values);
     vectorized_load_and_transpose(dofs_per_cell,
                                   rhs.begin(),
                                   dof_indices[cell].data(),
                                   quad_values);
     for(unsigned int i = 0; i < dofs_per_cell; ++i)
       quad_values[i] -= out_values[i];
+    // restriction as the transpose of the prolongation
+    dg_to_fe_transpose<degree + 1>(quad_values);
     fe_operator.template distribute_local_to_global<degree>(cell, quad_values, dst);
   }
 
@@ -6627,6 +6754,8 @@ private:
     constexpr unsigned int          n_points_2d = n_points_1d * n_points_1d;
     VectorizedArray<Number>         plane[n_points_2d];
     const Number * DEAL_II_RESTRICT shape_data = shape_info.data[0].shape_values_eo.data();
+    if(collocated)
+      return;
     if constexpr(dim == 3)
       for(unsigned int i = 0; i < n_points_2d; ++i)
         internal::apply_matrix_vector_product<internal::evaluate_evenodd,
@@ -6903,7 +7032,10 @@ private:
 
     // interpolate to the quadrature points as in read_cell_values()
     VectorizedArray<Number> quad_values[n_points], out_values[n_points];
-    for(unsigned int i_z = 0; i_z < (dim > 2 ? nn : 1); ++i_z)
+    if(collocated)
+      for(unsigned int i = 0; i < n_points; ++i)
+        quad_values[i] = in[i];
+    for(unsigned int i_z = 0; i_z < (collocated ? 0 : (dim > 2 ? nn : 1)); ++i_z)
     {
       const VectorizedArray<Number> * in_z  = in + i_z * nn * nn;
       VectorizedArray<Number> *       out_z = quad_values + i_z * n_points_2d;
@@ -6929,15 +7061,16 @@ private:
                                               false>(shape, out_z + i_x, out_z + i_x);
     }
     if constexpr(dim == 3)
-      for(unsigned int i = 0; i < n_points_2d; ++i)
-        internal::apply_matrix_vector_product<internal::evaluate_evenodd,
-                                              internal::EvaluatorQuantity::value,
-                                              nn,
-                                              n_q_points_1d,
-                                              n_points_2d,
-                                              n_points_2d,
-                                              true,
-                                              false>(shape, quad_values + i, quad_values + i);
+      if(!collocated)
+        for(unsigned int i = 0; i < n_points_2d; ++i)
+          internal::apply_matrix_vector_product<internal::evaluate_evenodd,
+                                                internal::EvaluatorQuantity::value,
+                                                nn,
+                                                n_q_points_1d,
+                                                n_points_2d,
+                                                n_points_2d,
+                                                true,
+                                                false>(shape, quad_values + i, quad_values + i);
 
     compute_cell_lapl<n_q_points_1d>(
       shape_data, mapping_info, cell, factor_mass, factor_laplace, quad_values, out_values);
@@ -7228,10 +7361,19 @@ private:
             face_array[i][v] = import_values[mpi_exchange_data_on_faces[cell][f][v] + i];
           }
 
-      eval.template values<0, true, false>(face_array, scratch_data);
-      eval.template values<1, true, false>(scratch_data, values_face[1]);
-      eval.template values<0, true, false>(face_array + nn * nn, scratch_data);
-      eval.template values<1, true, false, dim>(scratch_data, grads_face[1] + face_direction);
+      if(collocated)
+        for(unsigned int i = 0; i < n_q_points_face; ++i)
+        {
+          values_face[1][i]                       = face_array[i];
+          grads_face[1][i * dim + face_direction] = face_array[n_q_points_face + i];
+        }
+      else
+      {
+        eval.template values<0, true, false>(face_array, scratch_data);
+        eval.template values<1, true, false>(scratch_data, values_face[1]);
+        eval.template values<0, true, false>(face_array + nn * nn, scratch_data);
+        eval.template values<1, true, false, dim>(scratch_data, grads_face[1] + face_direction);
+      }
     }
 
     // interpolate from interior to face
@@ -7511,6 +7653,7 @@ private:
     constexpr unsigned int  dofs_per_cell = Utilities::pow(degree + 1, dim);
     VectorizedArray<Number> values_dofs[dofs_per_cell];
     fe_operator.template read_dof_values<degree>(cell, fe_correction, values_dofs);
+    fe_to_dg<degree + 1>(values_dofs);
     vectorized_transpose_and_store(
       true, dofs_per_cell, values_dofs, dof_indices[cell].data(), dg_solution.begin());
   }
