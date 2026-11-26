@@ -312,7 +312,7 @@ struct SolverSettingsExtruded
       return stream.str();
     };
     const auto line = [&](const std::string & name, const std::string & value) {
-      pcout << "  " << std::left << std::setw(46) << name << value << std::endl;
+      pcout << "  " << std::left << std::setw(43) << name << value << std::endl;
     };
     pcout << std::endl << "Solver settings for extruded meshes:" << std::endl;
     line("Pressure Gauss basis:", str(pressure_gauss_basis));
